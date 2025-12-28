@@ -45,6 +45,34 @@ interface IAerodromePair {
     ) external;
 }
 
+// Lending protocol interfaces for liquidations
+interface IMoonwellComptroller {
+    function liquidateBorrow(
+        address borrower,
+        uint256 repayAmount,
+        address cTokenCollateral
+    ) external returns (uint256);
+}
+
+interface IAaveV3Pool {
+    function liquidationCall(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool receiveAToken
+    ) external;
+}
+
+interface ISeamlessPool {
+    function liquidate(
+        address borrower,
+        address collateralAsset,
+        address debtAsset,
+        uint256 debtAmount
+    ) external returns (uint256);
+}
+
 // Uniswap V3 tick math library (simplified)
 library TickMath {
     uint160 internal constant MIN_SQRT_RATIO = 4295128739;
@@ -69,8 +97,27 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         uint256 gasUsed
     );
     
+    event LiquidationExecuted(
+        address indexed caller,
+        address indexed borrower,
+        address indexed protocol,
+        address collateralAsset,
+        address debtAsset,
+        uint256 debtAmount,
+        uint256 collateralReceived,
+        uint256 profit,
+        uint256 gasUsed
+    );
+    
     event ArbitrageFailed(
         address indexed caller,
+        string reason,
+        uint256 gasUsed
+    );
+    
+    event LiquidationFailed(
+        address indexed caller,
+        address indexed borrower,
         string reason,
         uint256 gasUsed
     );
@@ -104,9 +151,13 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
     error DeadlineExceeded();
     error InvalidRoute();
     error ContractPaused();
+    error LiquidationFailed(string reason);
+    error UnsupportedProtocol(string protocol);
+    error InvalidLiquidationData();
 
     // State variables
     mapping(address => bool) public authorizedPools;
+    mapping(address => bool) public authorizedProtocols;
     uint256 public minProfit;
     uint256 public constant MAX_ROUTES = 3;
     
@@ -116,6 +167,19 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         bool[] directions;
         uint256 minProfit;
         uint256 deadline;
+    }
+
+    // Liquidation data structure
+    struct LiquidationData {
+        string protocol; // "moonwell", "aave_v3", "seamless"
+        address borrower;
+        address protocolAddress;
+        address collateralAsset;
+        address debtAsset;
+        uint256 debtAmount;
+        uint256 minProfit;
+        uint256 deadline;
+        address[] swapRoute; // Route to convert collateral to debt asset
     }
 
     constructor(uint256 _minProfit) {
@@ -190,10 +254,84 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
     }
 
     /**
+     * @dev Execute liquidation using Uniswap V3 flash loan
+     * @param flashPool The Uniswap V3 pool to flash loan from
+     * @param amount0 Amount of token0 to flash loan
+     * @param amount1 Amount of token1 to flash loan
+     * @param liquidationData Encoded liquidation data
+     */
+    function executeLiquidation(
+        address flashPool,
+        uint256 amount0,
+        uint256 amount1,
+        bytes calldata liquidationData
+    ) external nonReentrant whenNotPaused {
+        if (!authorizedPools[flashPool]) {
+            revert UnauthorizedCallback();
+        }
+
+        // Decode liquidation data
+        LiquidationData memory liquidation = abi.decode(liquidationData, (LiquidationData));
+        
+        // Validate liquidation data
+        if (bytes(liquidation.protocol).length == 0 || liquidation.borrower == address(0)) {
+            revert InvalidLiquidationData();
+        }
+        
+        if (!authorizedProtocols[liquidation.protocolAddress]) {
+            revert UnsupportedProtocol(liquidation.protocol);
+        }
+        
+        if (block.timestamp > liquidation.deadline) {
+            revert DeadlineExceeded();
+        }
+
+        // Store initial balance for profit calculation
+        uint256 initialBalance = address(this).balance;
+        
+        // Store borrowed amounts for repayment calculation
+        uint256 borrowedAmount0 = amount0;
+        uint256 borrowedAmount1 = amount1;
+        
+        // Encode borrowed amounts with liquidation data for callback
+        bytes memory callbackData = abi.encode(liquidation, borrowedAmount0, borrowedAmount1, "liquidation");
+        
+        // Initiate flash loan
+        IUniswapV3Pool(flashPool).flash(
+            address(this),
+            amount0,
+            amount1,
+            callbackData
+        );
+        
+        // Calculate actual profit
+        uint256 finalBalance = address(this).balance;
+        uint256 actualProfit = finalBalance > initialBalance ? 
+            finalBalance - initialBalance : 0;
+        
+        // Validate minimum profit
+        if (actualProfit < liquidation.minProfit || actualProfit < minProfit) {
+            revert InsufficientProfit(actualProfit, liquidation.minProfit);
+        }
+
+        emit LiquidationExecuted(
+            msg.sender,
+            liquidation.borrower,
+            liquidation.protocolAddress,
+            liquidation.collateralAsset,
+            liquidation.debtAsset,
+            liquidation.debtAmount,
+            0, // Will be calculated in callback
+            actualProfit,
+            gasleft()
+        );
+    }
+
+    /**
      * @dev Uniswap V3 flash callback implementation
      * @param fee0 Fee for token0
      * @param fee1 Fee for token1
-     * @param data Encoded route data
+     * @param data Encoded route or liquidation data
      */
     function uniswapV3FlashCallback(
         uint256 fee0,
@@ -206,6 +344,47 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
             revert UnauthorizedCallback();
         }
 
+        // Check if this is arbitrage or liquidation
+        // Try to decode as liquidation first (has operation type marker)
+        try this._handleLiquidationCallback(fee0, fee1, data) {
+            return;
+        } catch {
+            // Fall back to arbitrage callback
+            _handleArbitrageCallback(fee0, fee1, data);
+        }
+    }
+
+    /**
+     * @dev Handle liquidation callback (external for try/catch)
+     */
+    function _handleLiquidationCallback(
+        uint256 fee0,
+        uint256 fee1,
+        bytes calldata data
+    ) external {
+        require(msg.sender == address(this), "Only self-call allowed");
+        
+        // Decode liquidation data
+        (LiquidationData memory liquidation, uint256 borrowedAmount0, uint256 borrowedAmount1, string memory operationType) = 
+            abi.decode(data, (LiquidationData, uint256, uint256, string));
+        
+        // Verify this is a liquidation operation
+        if (keccak256(bytes(operationType)) != keccak256(bytes("liquidation"))) {
+            revert InvalidLiquidationData();
+        }
+        
+        // Execute liquidation
+        _executeLiquidation(liquidation, fee0, fee1, borrowedAmount0, borrowedAmount1);
+    }
+
+    /**
+     * @dev Handle arbitrage callback
+     */
+    function _handleArbitrageCallback(
+        uint256 fee0,
+        uint256 fee1,
+        bytes calldata data
+    ) internal {
         // Decode route data and borrowed amounts
         (RouteData memory route, uint256 borrowedAmount0, uint256 borrowedAmount1) = 
             abi.decode(data, (RouteData, uint256, uint256));
@@ -248,12 +427,315 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         
         // Repay flash loan
         if (amount0Owed > 0) {
-            IERC20(token0).safeTransfer(msg.sender, amount0Owed);
+            IERC20(IUniswapV3Pool(msg.sender).token0()).safeTransfer(msg.sender, amount0Owed);
         }
         
         if (amount1Owed > 0) {
+            IERC20(IUniswapV3Pool(msg.sender).token1()).safeTransfer(msg.sender, amount1Owed);
+        }
+    }
+
+    /**
+     * @dev Execute liquidation with flash loan
+     * @param liquidation Liquidation data
+     * @param fee0 Flash loan fee for token0
+     * @param fee1 Flash loan fee for token1
+     * @param borrowedAmount0 Borrowed amount of token0
+     * @param borrowedAmount1 Borrowed amount of token1
+     */
+    function _executeLiquidation(
+        LiquidationData memory liquidation,
+        uint256 fee0,
+        uint256 fee1,
+        uint256 borrowedAmount0,
+        uint256 borrowedAmount1
+    ) internal {
+        // Get flash loan pool tokens
+        address token0 = IUniswapV3Pool(msg.sender).token0();
+        address token1 = IUniswapV3Pool(msg.sender).token1();
+        
+        // Store initial balances
+        uint256 initialBalance0 = IERC20(token0).balanceOf(address(this));
+        uint256 initialBalance1 = IERC20(token1).balanceOf(address(this));
+        
+        // Determine which token is the debt asset
+        address debtToken = liquidation.debtAsset;
+        uint256 debtAmount = liquidation.debtAmount;
+        
+        // Ensure we have the debt token from flash loan
+        require(debtToken == token0 || debtToken == token1, "Debt token not in flash loan");
+        
+        // Execute protocol-specific liquidation
+        uint256 collateralReceived = _executeProtocolLiquidation(liquidation);
+        
+        // If collateral asset is different from debt asset, swap it
+        if (liquidation.collateralAsset != liquidation.debtAsset) {
+            _swapCollateralToDebt(
+                liquidation.collateralAsset,
+                liquidation.debtAsset,
+                collateralReceived,
+                liquidation.swapRoute
+            );
+        }
+        
+        // Calculate final balances
+        uint256 finalBalance0 = IERC20(token0).balanceOf(address(this));
+        uint256 finalBalance1 = IERC20(token1).balanceOf(address(this));
+        
+        // Calculate repayment amounts
+        uint256 amount0Owed = borrowedAmount0 + fee0;
+        uint256 amount1Owed = borrowedAmount1 + fee1;
+        
+        // Ensure we have enough to repay
+        if (finalBalance0 < amount0Owed) {
+            revert InsufficientRepayment(amount0Owed, finalBalance0);
+        }
+        if (finalBalance1 < amount1Owed) {
+            revert InsufficientRepayment(amount1Owed, finalBalance1);
+        }
+        
+        // Calculate profit after repayment
+        uint256 profit0 = finalBalance0 - amount0Owed - initialBalance0;
+        uint256 profit1 = finalBalance1 - amount1Owed - initialBalance1;
+        uint256 totalProfit = profit0 + profit1;
+        
+        // Validate minimum profit
+        if (totalProfit < liquidation.minProfit) {
+            revert InsufficientProfit(totalProfit, liquidation.minProfit);
+        }
+        
+        // Repay flash loan
+        if (amount0Owed > 0) {
+            IERC20(token0).safeTransfer(msg.sender, amount0Owed);
+        }
+        if (amount1Owed > 0) {
             IERC20(token1).safeTransfer(msg.sender, amount1Owed);
         }
+    }
+
+    /**
+     * @dev Execute protocol-specific liquidation
+     * @param liquidation Liquidation data
+     * @return collateralReceived Amount of collateral received
+     */
+    function _executeProtocolLiquidation(
+        LiquidationData memory liquidation
+    ) internal returns (uint256 collateralReceived) {
+        bytes32 protocolHash = keccak256(bytes(liquidation.protocol));
+        
+        if (protocolHash == keccak256(bytes("moonwell"))) {
+            collateralReceived = _executeMoonwellLiquidation(liquidation);
+        } else if (protocolHash == keccak256(bytes("aave_v3"))) {
+            collateralReceived = _executeAaveV3Liquidation(liquidation);
+        } else if (protocolHash == keccak256(bytes("seamless"))) {
+            collateralReceived = _executeSeamlessLiquidation(liquidation);
+        } else {
+            revert UnsupportedProtocol(liquidation.protocol);
+        }
+    }
+
+    /**
+     * @dev Execute Moonwell liquidation
+     */
+    function _executeMoonwellLiquidation(
+        LiquidationData memory liquidation
+    ) internal returns (uint256 collateralReceived) {
+        // Approve debt token for liquidation
+        IERC20(liquidation.debtAsset).safeApprove(liquidation.protocolAddress, liquidation.debtAmount);
+        
+        // Get initial collateral balance
+        uint256 initialCollateralBalance = IERC20(liquidation.collateralAsset).balanceOf(address(this));
+        
+        // Execute Moonwell liquidation
+        IMoonwellComptroller(liquidation.protocolAddress).liquidateBorrow(
+            liquidation.borrower,
+            liquidation.debtAmount,
+            liquidation.collateralAsset // cToken address
+        );
+        
+        // Calculate collateral received
+        uint256 finalCollateralBalance = IERC20(liquidation.collateralAsset).balanceOf(address(this));
+        collateralReceived = finalCollateralBalance - initialCollateralBalance;
+        
+        if (collateralReceived == 0) {
+            revert LiquidationFailed("No collateral received from Moonwell");
+        }
+    }
+
+    /**
+     * @dev Execute Aave V3 liquidation
+     */
+    function _executeAaveV3Liquidation(
+        LiquidationData memory liquidation
+    ) internal returns (uint256 collateralReceived) {
+        // Approve debt token for liquidation
+        IERC20(liquidation.debtAsset).safeApprove(liquidation.protocolAddress, liquidation.debtAmount);
+        
+        // Get initial collateral balance
+        uint256 initialCollateralBalance = IERC20(liquidation.collateralAsset).balanceOf(address(this));
+        
+        // Execute Aave V3 liquidation
+        IAaveV3Pool(liquidation.protocolAddress).liquidationCall(
+            liquidation.collateralAsset,
+            liquidation.debtAsset,
+            liquidation.borrower,
+            liquidation.debtAmount,
+            false // Don't receive aTokens
+        );
+        
+        // Calculate collateral received
+        uint256 finalCollateralBalance = IERC20(liquidation.collateralAsset).balanceOf(address(this));
+        collateralReceived = finalCollateralBalance - initialCollateralBalance;
+        
+        if (collateralReceived == 0) {
+            revert LiquidationFailed("No collateral received from Aave V3");
+        }
+    }
+
+    /**
+     * @dev Execute Seamless liquidation
+     */
+    function _executeSeamlessLiquidation(
+        LiquidationData memory liquidation
+    ) internal returns (uint256 collateralReceived) {
+        // Approve debt token for liquidation
+        IERC20(liquidation.debtAsset).safeApprove(liquidation.protocolAddress, liquidation.debtAmount);
+        
+        // Get initial collateral balance
+        uint256 initialCollateralBalance = IERC20(liquidation.collateralAsset).balanceOf(address(this));
+        
+        // Execute Seamless liquidation
+        collateralReceived = ISeamlessPool(liquidation.protocolAddress).liquidate(
+            liquidation.borrower,
+            liquidation.collateralAsset,
+            liquidation.debtAsset,
+            liquidation.debtAmount
+        );
+        
+        if (collateralReceived == 0) {
+            revert LiquidationFailed("No collateral received from Seamless");
+        }
+    }
+
+    /**
+     * @dev Swap collateral to debt asset using optimal route
+     * @param collateralAsset Collateral token address
+     * @param debtAsset Debt token address
+     * @param collateralAmount Amount of collateral to swap
+     * @param swapRoute Array of pool addresses for optimal route
+     */
+    function _swapCollateralToDebt(
+        address collateralAsset,
+        address debtAsset,
+        uint256 collateralAmount,
+        address[] memory swapRoute
+    ) internal {
+        if (swapRoute.length == 0) {
+            revert InvalidRoute();
+        }
+        
+        uint256 currentAmount = collateralAmount;
+        address currentToken = collateralAsset;
+        
+        // Execute swaps through the route
+        for (uint256 i = 0; i < swapRoute.length; i++) {
+            address pool = swapRoute[i];
+            
+            if (_isUniswapV3Pool(pool)) {
+                currentAmount = _swapThroughUniswapV3(pool, currentToken, currentAmount);
+            } else {
+                currentAmount = _swapThroughAerodrome(pool, currentToken, currentAmount);
+            }
+            
+            // Update current token for next iteration
+            if (i < swapRoute.length - 1) {
+                // Determine output token for next swap
+                if (_isUniswapV3Pool(pool)) {
+                    IUniswapV3Pool uniPool = IUniswapV3Pool(pool);
+                    currentToken = (currentToken == uniPool.token0()) ? uniPool.token1() : uniPool.token0();
+                } else {
+                    IAerodromePair aeroPair = IAerodromePair(pool);
+                    currentToken = (currentToken == aeroPair.token0()) ? aeroPair.token1() : aeroPair.token0();
+                }
+            }
+        }
+        
+        // Verify we ended up with the debt asset
+        require(currentToken == debtAsset, "Swap route did not end with debt asset");
+    }
+
+    /**
+     * @dev Swap through Uniswap V3 pool
+     */
+    function _swapThroughUniswapV3(
+        address pool,
+        address tokenIn,
+        uint256 amountIn
+    ) internal returns (uint256 amountOut) {
+        IUniswapV3Pool uniPool = IUniswapV3Pool(pool);
+        
+        bool zeroForOne = tokenIn == uniPool.token0();
+        
+        // Calculate sqrt price limit (allow 5% slippage)
+        uint160 sqrtPriceLimitX96 = zeroForOne ? 
+            TickMath.MIN_SQRT_RATIO + 1 : 
+            TickMath.MAX_SQRT_RATIO - 1;
+        
+        // Get initial balance of output token
+        address tokenOut = zeroForOne ? uniPool.token1() : uniPool.token0();
+        uint256 initialBalance = IERC20(tokenOut).balanceOf(address(this));
+        
+        // Execute swap
+        uniPool.swap(
+            address(this),
+            zeroForOne,
+            int256(amountIn),
+            sqrtPriceLimitX96,
+            ""
+        );
+        
+        // Calculate amount received
+        uint256 finalBalance = IERC20(tokenOut).balanceOf(address(this));
+        amountOut = finalBalance - initialBalance;
+    }
+
+    /**
+     * @dev Swap through Aerodrome pool
+     */
+    function _swapThroughAerodrome(
+        address pool,
+        address tokenIn,
+        uint256 amountIn
+    ) internal returns (uint256 amountOut) {
+        IAerodromePair aeroPair = IAerodromePair(pool);
+        
+        bool zeroForOne = tokenIn == aeroPair.token0();
+        address tokenOut = zeroForOne ? aeroPair.token1() : aeroPair.token0();
+        
+        // Get initial balance of output token
+        uint256 initialBalance = IERC20(tokenOut).balanceOf(address(this));
+        
+        // Transfer tokens to pair
+        IERC20(tokenIn).safeTransfer(pool, amountIn);
+        
+        // Get reserves and calculate output amount
+        (uint256 reserve0, uint256 reserve1,) = aeroPair.getReserves();
+        uint256 reserveIn = zeroForOne ? reserve0 : reserve1;
+        uint256 reserveOut = zeroForOne ? reserve1 : reserve0;
+        
+        // Calculate amount out
+        uint256 calculatedAmountOut = _getAerodromeAmountOut(amountIn, reserveIn, reserveOut, aeroPair.stable());
+        
+        // Execute swap
+        if (zeroForOne) {
+            aeroPair.swap(0, calculatedAmountOut, address(this), "");
+        } else {
+            aeroPair.swap(calculatedAmountOut, 0, address(this), "");
+        }
+        
+        // Calculate actual amount received
+        uint256 finalBalance = IERC20(tokenOut).balanceOf(address(this));
+        amountOut = finalBalance - initialBalance;
     }
 
     /**
@@ -534,6 +1016,31 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         } else {
             IERC20(token).safeTransfer(owner(), amount);
         }
+    }
+
+    /**
+     * @dev Add authorized protocol (admin only)
+     * @param protocol Protocol address to authorize
+     */
+    function addAuthorizedProtocol(address protocol) external onlyOwner {
+        authorizedProtocols[protocol] = true;
+    }
+
+    /**
+     * @dev Remove authorized protocol (admin only)
+     * @param protocol Protocol address to remove
+     */
+    function removeAuthorizedProtocol(address protocol) external onlyOwner {
+        authorizedProtocols[protocol] = false;
+    }
+
+    /**
+     * @dev Check if protocol is authorized for liquidations
+     * @param protocol Protocol address to check
+     * @return bool True if authorized
+     */
+    function isAuthorizedProtocol(address protocol) external view returns (bool) {
+        return authorizedProtocols[protocol];
     }
 
     /**
