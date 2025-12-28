@@ -12,15 +12,47 @@ import { ConfigLoader } from './config/loader';
 import { MetricsCollector } from './monitoring/metrics-collector';
 import { CircuitBreaker } from './monitoring/circuit-breaker';
 import { RelayProvider } from './bundler/private-relay';
+import { LendingProtocolMonitor } from './scanner/lending-monitor';
+import { StablePoolMonitor } from './scanner/stable-pool-monitor';
+import { LiquidationProfitCalculator } from './simulator/liquidation-calculator';
+import { StablePoolRebalancingCalculator } from './simulator/stable-pool-calculator';
 import { EventEmitter } from 'events';
 import path from 'path';
+
+// Platform configuration
+interface PlatformConfig {
+  phases: {
+    arbitrage: { enabled: boolean; priority: number };
+    liquidations: { enabled: boolean; priority: number };
+    stablePoolRebalancing: { enabled: boolean; priority: number };
+  };
+  gracefulDegradation: {
+    enabled: boolean;
+    fallbackToArbitrageOnly: boolean;
+    maxConsecutiveFailures: number;
+  };
+  featureFlags: {
+    enableLiquidationMonitoring: boolean;
+    enableStablePoolMonitoring: boolean;
+    enableAdvancedRouting: boolean;
+    enablePerformanceOptimizations: boolean;
+  };
+}
 
 class BaseMEVPlatform extends EventEmitter {
   private configLoader: ConfigLoader;
   private metricsCollector: MetricsCollector;
   private circuitBreaker: CircuitBreaker;
+
+  // Phase-specific components
+  private lendingMonitor?: LendingProtocolMonitor;
+  private stablePoolMonitor?: StablePoolMonitor;
+  private liquidationCalculator?: LiquidationProfitCalculator;
+  private stablePoolCalculator?: StablePoolRebalancingCalculator;
+
   private isRunning = false;
   private platformLogger = createComponentLogger('platform');
+  private config?: PlatformConfig;
 
   constructor() {
     super();
@@ -47,6 +79,11 @@ class BaseMEVPlatform extends EventEmitter {
     this.circuitBreaker.on('stateChanged', state => {
       this.metricsCollector.updateCircuitBreakerStatus(state);
       this.platformLogger.logCircuitBreakerStateChange('unknown', state, 'State change detected');
+
+      // Handle graceful degradation
+      if (state === 'open' && this.config?.gracefulDegradation.enabled) {
+        this.handleGracefulDegradation();
+      }
     });
 
     // Log metrics periodically with enhanced formatting
@@ -57,6 +94,7 @@ class BaseMEVPlatform extends EventEmitter {
         winRate: `${(metrics.opportunities.winRate * 100).toFixed(2)}%`,
         totalProfit: `$${metrics.profit.totalProfitUSD.toFixed(2)}`,
         systemHealth: metrics.systemHealth.circuitBreakerStatus,
+        activePhases: this.getActivePhases(),
       });
     }, 30000); // Every 30 seconds
   }
@@ -66,13 +104,149 @@ class BaseMEVPlatform extends EventEmitter {
       this.platformLogger.info('Initializing Base MEV Platform...');
 
       // Load configuration
-      const config = await this.configLoader.load();
+      const rawConfig = await this.configLoader.load();
+      this.config = this.parseConfig(rawConfig);
+
       this.platformLogger.info('Configuration loaded successfully', {
-        hasConfig: !!config,
+        enabledPhases: Object.entries(this.config.phases)
+          .filter(([_, phase]) => phase.enabled)
+          .map(([name, _]) => name),
+        featureFlags: this.config.featureFlags,
       });
+
+      // Initialize phase-specific components based on configuration
+      await this.initializePhaseComponents();
 
       this.platformLogger.info('Base MEV Platform initialized successfully');
     });
+  }
+
+  private parseConfig(rawConfig: any): PlatformConfig {
+    // Default configuration with all phases enabled
+    return {
+      phases: {
+        arbitrage: {
+          enabled: rawConfig.phases?.arbitrage?.enabled ?? true,
+          priority: rawConfig.phases?.arbitrage?.priority ?? 1,
+        },
+        liquidations: {
+          enabled: rawConfig.phases?.liquidations?.enabled ?? true,
+          priority: rawConfig.phases?.liquidations?.priority ?? 2,
+        },
+        stablePoolRebalancing: {
+          enabled: rawConfig.phases?.stablePoolRebalancing?.enabled ?? true,
+          priority: rawConfig.phases?.stablePoolRebalancing?.priority ?? 3,
+        },
+      },
+      gracefulDegradation: {
+        enabled: rawConfig.gracefulDegradation?.enabled ?? true,
+        fallbackToArbitrageOnly: rawConfig.gracefulDegradation?.fallbackToArbitrageOnly ?? true,
+        maxConsecutiveFailures: rawConfig.gracefulDegradation?.maxConsecutiveFailures ?? 10,
+      },
+      featureFlags: {
+        enableLiquidationMonitoring: rawConfig.featureFlags?.enableLiquidationMonitoring ?? true,
+        enableStablePoolMonitoring: rawConfig.featureFlags?.enableStablePoolMonitoring ?? true,
+        enableAdvancedRouting: rawConfig.featureFlags?.enableAdvancedRouting ?? true,
+        enablePerformanceOptimizations:
+          rawConfig.featureFlags?.enablePerformanceOptimizations ?? true,
+      },
+    };
+  }
+
+  private async initializePhaseComponents(): Promise<void> {
+    if (!this.config) throw new Error('Configuration not loaded');
+
+    // Phase 2: Liquidations
+    if (
+      this.config.phases.liquidations.enabled &&
+      this.config.featureFlags.enableLiquidationMonitoring
+    ) {
+      this.platformLogger.info('Initializing Phase 2: Liquidation monitoring');
+
+      // Initialize lending protocol monitor (mock configuration)
+      this.lendingMonitor = new LendingProtocolMonitor(
+        {
+          protocols: [
+            {
+              protocol: 'moonwell' as any,
+              comptrollerAddress: '0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180',
+              liquidationThreshold: 0.8,
+              liquidationBonus: 0.05,
+              minProfitThreshold: 10000000000000000n, // 0.01 ETH
+            },
+          ],
+          healthFactorThresholds: {
+            critical: 1.05,
+            warning: 1.2,
+            healthy: 1.5,
+          },
+          scanIntervalMs: 10000,
+          maxPositionsPerScan: 10,
+          minProfitThreshold: 10000000000000000n,
+        },
+        {} as any
+      ); // Mock connection manager
+
+      // Initialize liquidation calculator
+      this.liquidationCalculator = new LiquidationProfitCalculator({
+        maxSlippage: 0.01,
+        gasPrice: 20000000000n, // 20 gwei
+        flashLoanFeeRate: 0.0009,
+        minProfitMargin: 0.1,
+        riskToleranceScore: 70,
+      });
+
+      // Set up liquidation event handlers
+      this.lendingMonitor.on('liquidationOpportunityDetected', async opportunity => {
+        await this.handleLiquidationOpportunity(opportunity);
+      });
+    }
+
+    // Phase 3: Stable Pool Rebalancing
+    if (
+      this.config.phases.stablePoolRebalancing.enabled &&
+      this.config.featureFlags.enableStablePoolMonitoring
+    ) {
+      this.platformLogger.info('Initializing Phase 3: Stable pool rebalancing');
+
+      // Initialize stable pool monitor (mock configuration)
+      this.stablePoolMonitor = new StablePoolMonitor(
+        {
+          pools: [
+            {
+              poolAddress: '0x1234567890123456789012345678901234567890',
+              token0Symbol: 'USDC',
+              token1Symbol: 'DAI',
+              minImbalanceThreshold: 0.05,
+              maxImbalanceThreshold: 0.2,
+              minProfitThreshold: 5000000000000000n, // 0.005 ETH
+              priority: 'high' as const,
+              isActive: true,
+            },
+          ],
+          scanIntervalMs: 15000,
+          minImbalanceThreshold: 0.05,
+          maxOpportunitiesPerScan: 5,
+          minProfitThreshold: 5000000000000000n,
+          gasPrice: 20000000000n,
+        },
+        {} as any
+      ); // Mock connection manager
+
+      // Initialize stable pool calculator
+      this.stablePoolCalculator = new StablePoolRebalancingCalculator({
+        maxSlippage: 0.005,
+        gasPrice: 20000000000n,
+        minProfitMargin: 0.05,
+        maxPriceImpact: 0.01,
+        incentiveMultiplier: 1.0,
+      });
+
+      // Set up stable pool event handlers
+      this.stablePoolMonitor.on('stablePoolOpportunityDetected', async opportunity => {
+        await this.handleStablePoolOpportunity(opportunity);
+      });
+    }
   }
 
   async start(): Promise<void> {
@@ -84,91 +258,253 @@ class BaseMEVPlatform extends EventEmitter {
     return globalPerformanceTracker.trackOperation('platform-startup', async () => {
       this.platformLogger.info('Starting Base MEV Platform...');
 
-      // In a full implementation, this would:
-      // 1. Start the RPC connection manager
-      // 2. Initialize pool monitors (Uniswap V3, Aerodrome)
-      // 3. Start the arbitrage scanner
-      // 4. Initialize the profit calculator/simulator
-      // 5. Start the transaction bundler with private relays
-      // 6. Begin the opportunity detection pipeline
-
-      // For now, we demonstrate the core integration pattern
-      this.platformLogger.info('Core components initialized:');
-      this.platformLogger.info('- Configuration management: ✓');
-      this.platformLogger.info('- Metrics collection: ✓');
-      this.platformLogger.info('- Circuit breaker: ✓');
-      this.platformLogger.info('- Event-driven architecture: ✓');
+      // Start phase-specific components
+      await this.startPhaseComponents();
 
       this.isRunning = true;
-      this.platformLogger.info('Base MEV Platform started successfully');
+      this.platformLogger.info('Base MEV Platform started successfully', {
+        activePhases: this.getActivePhases(),
+        gracefulDegradation: this.config?.gracefulDegradation.enabled,
+      });
 
       // Emit ready event
       this.emit('ready');
 
-      // Simulate some activity for demonstration
-      this.simulateActivity();
+      // Start opportunity simulation for demonstration
+      this.simulateMultiPhaseActivity();
     });
   }
 
-  private simulateActivity(): void {
-    // Simulate periodic opportunity detection for demonstration
-    setInterval(() => {
-      // Simulate finding an opportunity
-      const mockOpportunity = {
-        id: `opp_${Date.now()}`,
-        type: 'arbitrage' as const,
-        tokenA: '0x4200000000000000000000000000000000000006', // WETH on Base
-        tokenB: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC on Base
-        amountIn: 1000000000000000000n, // 1 ETH
-        expectedProfit: 50000000000000000n, // 0.05 ETH
-        gasEstimate: 300000n,
-        deadline: Date.now() + 12000, // 12 seconds
-        pools: {
-          uniswapV3: '0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640',
-          aerodrome: '0x1234567890123456789012345678901234567890',
-        },
-      };
+  private async startPhaseComponents(): Promise<void> {
+    if (!this.config) return;
 
-      // Test circuit breaker
-      this.circuitBreaker
-        .execute(async () => {
-          // Simulate opportunity processing with performance tracking
-          const operationId = `opportunity-${mockOpportunity.id}`;
-          this.platformLogger.startPerformanceTracking(operationId);
+    // Start Phase 2: Liquidation monitoring
+    if (this.config.phases.liquidations.enabled && this.lendingMonitor) {
+      this.platformLogger.info('Starting liquidation monitoring');
+      this.lendingMonitor.startScanning();
+    }
 
-          this.platformLogger.logOpportunityDetected(mockOpportunity);
-          this.platformLogger.markPerformance(operationId, 'detection-complete');
+    // Start Phase 3: Stable pool monitoring
+    if (this.config.phases.stablePoolRebalancing.enabled && this.stablePoolMonitor) {
+      this.platformLogger.info('Starting stable pool monitoring');
+      this.stablePoolMonitor.startScanning();
+    }
 
-          // Simulate processing time
-          await new Promise(resolve => setTimeout(resolve, 100));
-          this.platformLogger.markPerformance(operationId, 'simulation-complete');
+    this.platformLogger.info('All enabled phase components started');
+  }
 
-          // Record successful opportunity
-          this.metricsCollector.recordOpportunitySuccess(
-            RelayProvider.FLASHBOTS_PROTECT, // relay provider
-            mockOpportunity.expectedProfit, // profit
-            mockOpportunity.gasEstimate * 20000000000n, // gas cost (gas * price)
-            10000000000000000n, // 0.01 ETH bribe
-            Date.now(), // inclusion time
-            5000 // end-to-end latency in ms
-          );
+  private async handleLiquidationOpportunity(opportunity: any): Promise<void> {
+    if (!this.liquidationCalculator) return;
 
-          this.platformLogger.logOpportunityProcessed(mockOpportunity, {
-            success: true,
-            profit: mockOpportunity.expectedProfit,
-            gasUsed: mockOpportunity.gasEstimate,
-          });
+    try {
+      const operationId = `liquidation-${opportunity.id}`;
+      this.platformLogger.startPerformanceTracking(operationId);
 
-          this.platformLogger.endPerformanceTracking(operationId);
-          return true;
-        })
-        .catch(error => {
-          this.platformLogger.logError(error as Error, {
-            opportunityId: mockOpportunity.id,
-            operation: 'opportunity-processing',
-          });
+      // Check circuit breaker
+      const canExecute = await new Promise<boolean>(resolve => {
+        this.circuitBreaker
+          .execute(async () => {
+            resolve(true);
+            return true;
+          })
+          .catch(() => resolve(false));
+      });
+
+      if (!canExecute) {
+        this.platformLogger.warn('Circuit breaker open, skipping liquidation opportunity', {
+          opportunityId: opportunity.id,
         });
-    }, 10000); // Every 10 seconds
+        return;
+      }
+
+      // Calculate profitability
+      const calculation = await this.liquidationCalculator.calculateLiquidationProfit(opportunity);
+
+      if (calculation.profitable) {
+        this.platformLogger.info('Profitable liquidation opportunity found', {
+          opportunityId: opportunity.id,
+          protocol: opportunity.protocol,
+          netProfit: calculation.netProfit.toString(),
+          riskScore: calculation.riskScore,
+        });
+
+        // Record successful opportunity
+        this.metricsCollector.recordOpportunitySuccess(
+          RelayProvider.FLASHBOTS_PROTECT,
+          calculation.netProfit,
+          calculation.gasCost,
+          0n, // bribe
+          Date.now(),
+          3000 // latency
+        );
+      }
+
+      this.platformLogger.endPerformanceTracking(operationId);
+    } catch (error) {
+      this.platformLogger.logError(error as Error, {
+        opportunityId: opportunity.id,
+        operation: 'liquidation-processing',
+      });
+    }
+  }
+
+  private async handleStablePoolOpportunity(opportunity: any): Promise<void> {
+    if (!this.stablePoolCalculator) return;
+
+    try {
+      const operationId = `stable-rebalance-${opportunity.id}`;
+      this.platformLogger.startPerformanceTracking(operationId);
+
+      // Check circuit breaker
+      const canExecute = await new Promise<boolean>(resolve => {
+        this.circuitBreaker
+          .execute(async () => {
+            resolve(true);
+            return true;
+          })
+          .catch(() => resolve(false));
+      });
+
+      if (!canExecute) {
+        this.platformLogger.warn('Circuit breaker open, skipping stable pool opportunity', {
+          opportunityId: opportunity.id,
+        });
+        return;
+      }
+
+      // Calculate profitability
+      const calculation = await this.stablePoolCalculator.calculateRebalancingProfit(opportunity);
+
+      if (calculation.profitable) {
+        this.platformLogger.info('Profitable stable pool rebalancing opportunity found', {
+          opportunityId: opportunity.id,
+          poolAddress: opportunity.poolAddress,
+          netProfit: calculation.netProfit.toString(),
+          priceImpact: `${(calculation.priceImpact * 100).toFixed(3)}%`,
+          riskScore: calculation.riskScore,
+        });
+
+        // Record successful opportunity
+        this.metricsCollector.recordOpportunitySuccess(
+          RelayProvider.LOCAL_NODE,
+          calculation.netProfit,
+          calculation.gasCost,
+          0n, // bribe
+          Date.now(),
+          2000 // latency
+        );
+      }
+
+      this.platformLogger.endPerformanceTracking(operationId);
+    } catch (error) {
+      this.platformLogger.logError(error as Error, {
+        opportunityId: opportunity.id,
+        operation: 'stable-pool-processing',
+      });
+    }
+  }
+
+  private handleGracefulDegradation(): void {
+    if (!this.config?.gracefulDegradation.enabled) return;
+
+    this.platformLogger.warn('Initiating graceful degradation due to circuit breaker activation');
+
+    if (this.config.gracefulDegradation.fallbackToArbitrageOnly) {
+      // Disable Phase 2 and 3 temporarily
+      if (this.lendingMonitor) {
+        this.lendingMonitor.stopScanning();
+        this.platformLogger.info('Disabled liquidation monitoring for graceful degradation');
+      }
+
+      if (this.stablePoolMonitor) {
+        this.stablePoolMonitor.stopScanning();
+        this.platformLogger.info('Disabled stable pool monitoring for graceful degradation');
+      }
+
+      // Continue with Phase 1 (arbitrage) only
+      this.platformLogger.info('Platform operating in degraded mode: arbitrage only');
+    }
+  }
+
+  private simulateMultiPhaseActivity(): void {
+    // Simulate opportunities across all phases for demonstration
+    let opportunityCounter = 0;
+
+    setInterval(() => {
+      opportunityCounter++;
+      const phaseType = opportunityCounter % 3;
+
+      if (phaseType === 0) {
+        // Simulate Phase 1: Arbitrage opportunity
+        this.simulateArbitrageOpportunity();
+      } else if (phaseType === 1 && this.config?.phases.liquidations.enabled) {
+        // Simulate Phase 2: Liquidation opportunity
+        this.simulateLiquidationOpportunity();
+      } else if (phaseType === 2 && this.config?.phases.stablePoolRebalancing.enabled) {
+        // Simulate Phase 3: Stable pool opportunity
+        this.simulateStablePoolOpportunity();
+      }
+    }, 8000); // Every 8 seconds
+  }
+
+  private simulateArbitrageOpportunity(): void {
+    const mockOpportunity = {
+      id: `arbitrage-${Date.now()}`,
+      type: 'arbitrage' as const,
+      tokenA: '0x4200000000000000000000000000000000000006', // WETH
+      tokenB: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC
+      expectedProfit: 30000000000000000n, // 0.03 ETH
+      gasEstimate: 250000n,
+    };
+
+    this.circuitBreaker
+      .execute(async () => {
+        this.platformLogger.info('Processing Phase 1 arbitrage opportunity', {
+          id: mockOpportunity.id,
+          profit: mockOpportunity.expectedProfit.toString(),
+        });
+
+        this.metricsCollector.recordOpportunitySuccess(
+          RelayProvider.FLASHBOTS_PROTECT,
+          mockOpportunity.expectedProfit,
+          mockOpportunity.gasEstimate * 20000000000n,
+          5000000000000000n, // 0.005 ETH bribe
+          Date.now(),
+          4000
+        );
+
+        return true;
+      })
+      .catch(() => {
+        // Error handling done by circuit breaker
+      });
+  }
+
+  private simulateLiquidationOpportunity(): void {
+    const mockOpportunity = {
+      id: `liquidation-${Date.now()}`,
+      protocol: 'moonwell',
+      borrower: '0x1234567890123456789012345678901234567890',
+      healthFactor: 1.03,
+      estimatedProfit: 25000000000000000n, // 0.025 ETH
+    };
+
+    if (this.lendingMonitor) {
+      this.lendingMonitor.emit('liquidationOpportunityDetected', mockOpportunity);
+    }
+  }
+
+  private simulateStablePoolOpportunity(): void {
+    const mockOpportunity = {
+      id: `stable-rebalance-${Date.now()}`,
+      poolAddress: '0x1234567890123456789012345678901234567890',
+      imbalanceRatio: 0.08, // 8% imbalance
+      estimatedProfit: 15000000000000000n, // 0.015 ETH
+    };
+
+    if (this.stablePoolMonitor) {
+      this.stablePoolMonitor.emit('stablePoolOpportunityDetected', mockOpportunity);
+    }
   }
 
   async stop(): Promise<void> {
@@ -180,11 +516,13 @@ class BaseMEVPlatform extends EventEmitter {
     return globalPerformanceTracker.trackOperation('platform-shutdown', async () => {
       this.platformLogger.info('Stopping Base MEV Platform...');
 
-      // In a full implementation, this would:
-      // 1. Stop the arbitrage scanner
-      // 2. Close RPC connections
-      // 3. Stop monitoring systems
-      // 4. Gracefully shutdown all components
+      // Stop all phase components
+      if (this.lendingMonitor) {
+        this.lendingMonitor.stopScanning();
+      }
+      if (this.stablePoolMonitor) {
+        this.stablePoolMonitor.stopScanning();
+      }
 
       this.isRunning = false;
       this.platformLogger.info('Base MEV Platform stopped successfully');
@@ -204,8 +542,38 @@ class BaseMEVPlatform extends EventEmitter {
     };
   }
 
+  getActivePhases(): string[] {
+    if (!this.config) return [];
+
+    return Object.entries(this.config.phases)
+      .filter(([_, phase]) => phase.enabled)
+      .map(([name, _]) => name);
+  }
+
   isHealthy(): boolean {
     return this.isRunning;
+  }
+
+  // Configuration management
+  async updatePhaseConfig(phase: keyof PlatformConfig['phases'], enabled: boolean): Promise<void> {
+    if (!this.config) throw new Error('Platform not initialized');
+
+    this.config.phases[phase].enabled = enabled;
+
+    this.platformLogger.info('Phase configuration updated', {
+      phase,
+      enabled,
+      activePhases: this.getActivePhases(),
+    });
+
+    // Restart components if needed
+    if (this.isRunning) {
+      await this.startPhaseComponents();
+    }
+  }
+
+  getConfiguration(): PlatformConfig | undefined {
+    return this.config;
   }
 }
 
@@ -240,6 +608,7 @@ async function main(): Promise<void> {
         opportunities: metrics.opportunities.totalOpportunities,
         winRate: metrics.opportunities.winRate,
         totalProfit: metrics.profit.totalProfitUSD,
+        activePhases: platform.getActivePhases(),
       });
     }, 60000); // Every minute
   } catch (error) {
