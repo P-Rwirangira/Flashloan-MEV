@@ -7,5 +7,6 @@
 
 // Re-export bundler components
 export * from './transaction-bundler';
+export * from './private-relay';
 export * from './relay-manager';
 export * from './bribe-optimizer';
