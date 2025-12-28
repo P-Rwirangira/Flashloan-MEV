@@ -1,11 +1,10 @@
 /**
- * Monitoring and Alerting
+ * Monitoring Module
  *
- * Comprehensive monitoring, metrics collection, and alerting system.
- * Tracks performance, success rates, and system health.
+ * Provides metrics collection, alerting, and system health monitoring
+ * for the MEV platform
  */
 
-// Re-export monitoring components
 export * from './metrics-collector';
-export * from './alert-manager';
+export * from './alerting-system';
 export * from './circuit-breaker';
