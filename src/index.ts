@@ -7,7 +7,7 @@
  * - Phase 3: Stable/meta-pool rebalancing on Aerodrome stable pools
  */
 
-import { logger } from './utils/logger';
+import { logger, createComponentLogger, globalPerformanceTracker } from './utils/logger';
 import { ConfigLoader } from './config/loader';
 import { MetricsCollector } from './monitoring/metrics-collector';
 import { CircuitBreaker } from './monitoring/circuit-breaker';
@@ -20,6 +20,7 @@ class BaseMEVPlatform extends EventEmitter {
   private metricsCollector: MetricsCollector;
   private circuitBreaker: CircuitBreaker;
   private isRunning = false;
+  private platformLogger = createComponentLogger('platform');
 
   constructor() {
     super();
@@ -45,45 +46,43 @@ class BaseMEVPlatform extends EventEmitter {
     // Circuit breaker events
     this.circuitBreaker.on('stateChanged', state => {
       this.metricsCollector.updateCircuitBreakerStatus(state);
-      logger.info('Circuit breaker state changed', { state });
+      this.platformLogger.logCircuitBreakerStateChange('unknown', state, 'State change detected');
     });
 
-    // Log metrics periodically
+    // Log metrics periodically with enhanced formatting
     setInterval(() => {
       const metrics = this.getMetrics();
-      logger.debug('Platform metrics', {
+      this.platformLogger.debug('Platform metrics update', {
         opportunities: metrics.opportunities.totalOpportunities,
-        winRate: metrics.opportunities.winRate,
-        totalProfit: metrics.profit.totalProfitUSD,
+        winRate: `${(metrics.opportunities.winRate * 100).toFixed(2)}%`,
+        totalProfit: `$${metrics.profit.totalProfitUSD.toFixed(2)}`,
+        systemHealth: metrics.systemHealth.circuitBreakerStatus,
       });
     }, 30000); // Every 30 seconds
   }
 
   async initialize(): Promise<void> {
-    try {
-      logger.info('Initializing Base MEV Platform...');
+    return globalPerformanceTracker.trackOperation('platform-initialization', async () => {
+      this.platformLogger.info('Initializing Base MEV Platform...');
 
       // Load configuration
       const config = await this.configLoader.load();
-      logger.info('Configuration loaded successfully', {
+      this.platformLogger.info('Configuration loaded successfully', {
         hasConfig: !!config,
       });
 
-      logger.info('Base MEV Platform initialized successfully');
-    } catch (error) {
-      logger.error('Failed to initialize Base MEV Platform', { error });
-      throw error;
-    }
+      this.platformLogger.info('Base MEV Platform initialized successfully');
+    });
   }
 
   async start(): Promise<void> {
     if (this.isRunning) {
-      logger.warn('Platform is already running');
+      this.platformLogger.warn('Platform is already running');
       return;
     }
 
-    try {
-      logger.info('Starting Base MEV Platform...');
+    return globalPerformanceTracker.trackOperation('platform-startup', async () => {
+      this.platformLogger.info('Starting Base MEV Platform...');
 
       // In a full implementation, this would:
       // 1. Start the RPC connection manager
@@ -94,24 +93,21 @@ class BaseMEVPlatform extends EventEmitter {
       // 6. Begin the opportunity detection pipeline
 
       // For now, we demonstrate the core integration pattern
-      logger.info('Core components initialized:');
-      logger.info('- Configuration management: ✓');
-      logger.info('- Metrics collection: ✓');
-      logger.info('- Circuit breaker: ✓');
-      logger.info('- Event-driven architecture: ✓');
+      this.platformLogger.info('Core components initialized:');
+      this.platformLogger.info('- Configuration management: ✓');
+      this.platformLogger.info('- Metrics collection: ✓');
+      this.platformLogger.info('- Circuit breaker: ✓');
+      this.platformLogger.info('- Event-driven architecture: ✓');
 
       this.isRunning = true;
-      logger.info('Base MEV Platform started successfully');
+      this.platformLogger.info('Base MEV Platform started successfully');
 
       // Emit ready event
       this.emit('ready');
 
       // Simulate some activity for demonstration
       this.simulateActivity();
-    } catch (error) {
-      logger.error('Failed to start Base MEV Platform', { error });
-      throw error;
-    }
+    });
   }
 
   private simulateActivity(): void {
@@ -136,11 +132,16 @@ class BaseMEVPlatform extends EventEmitter {
       // Test circuit breaker
       this.circuitBreaker
         .execute(async () => {
-          // Simulate opportunity processing
-          logger.info('Processing opportunity', {
-            id: mockOpportunity.id,
-            profit: mockOpportunity.expectedProfit.toString(),
-          });
+          // Simulate opportunity processing with performance tracking
+          const operationId = `opportunity-${mockOpportunity.id}`;
+          this.platformLogger.startPerformanceTracking(operationId);
+
+          this.platformLogger.logOpportunityDetected(mockOpportunity);
+          this.platformLogger.markPerformance(operationId, 'detection-complete');
+
+          // Simulate processing time
+          await new Promise(resolve => setTimeout(resolve, 100));
+          this.platformLogger.markPerformance(operationId, 'simulation-complete');
 
           // Record successful opportunity
           this.metricsCollector.recordOpportunitySuccess(
@@ -152,22 +153,32 @@ class BaseMEVPlatform extends EventEmitter {
             5000 // end-to-end latency in ms
           );
 
+          this.platformLogger.logOpportunityProcessed(mockOpportunity, {
+            success: true,
+            profit: mockOpportunity.expectedProfit,
+            gasUsed: mockOpportunity.gasEstimate,
+          });
+
+          this.platformLogger.endPerformanceTracking(operationId);
           return true;
         })
         .catch(error => {
-          logger.error('Opportunity processing failed', { error });
+          this.platformLogger.logError(error as Error, {
+            opportunityId: mockOpportunity.id,
+            operation: 'opportunity-processing',
+          });
         });
     }, 10000); // Every 10 seconds
   }
 
   async stop(): Promise<void> {
     if (!this.isRunning) {
-      logger.warn('Platform is not running');
+      this.platformLogger.warn('Platform is not running');
       return;
     }
 
-    try {
-      logger.info('Stopping Base MEV Platform...');
+    return globalPerformanceTracker.trackOperation('platform-shutdown', async () => {
+      this.platformLogger.info('Stopping Base MEV Platform...');
 
       // In a full implementation, this would:
       // 1. Stop the arbitrage scanner
@@ -176,14 +187,11 @@ class BaseMEVPlatform extends EventEmitter {
       // 4. Gracefully shutdown all components
 
       this.isRunning = false;
-      logger.info('Base MEV Platform stopped successfully');
+      this.platformLogger.info('Base MEV Platform stopped successfully');
 
       // Emit stopped event
       this.emit('stopped');
-    } catch (error) {
-      logger.error('Error stopping Base MEV Platform', { error });
-      throw error;
-    }
+    });
   }
 
   getMetrics() {
