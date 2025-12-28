@@ -17,11 +17,71 @@ import {
   PoolType,
 } from '../types/pool';
 import { ArbitrageConfig } from '../types/config';
+import { RpcConnectionManager } from '../rpc/connection-manager';
 
 export interface ArbitrageScannerOptions {
   readonly poolManager: PoolManager;
+  readonly connectionManager: RpcConnectionManager;
   readonly config: ArbitrageConfig;
   readonly scanIntervalMs?: number;
+  readonly priceOracle?: IPriceOracle;
+}
+
+export interface IPriceOracle {
+  getEthUsdPrice(): Promise<number>;
+}
+
+// Simple price oracle implementation
+export class SimplePriceOracle implements IPriceOracle {
+  private readonly provider: ethers.Provider;
+  private cachedPrice?: { price: number; timestamp: number };
+  private readonly cacheTimeMs = 60000; // 1 minute cache
+
+  constructor(provider: ethers.Provider) {
+    this.provider = provider;
+  }
+
+  async getEthUsdPrice(): Promise<number> {
+    // Check cache first
+    if (this.cachedPrice && Date.now() - this.cachedPrice.timestamp < this.cacheTimeMs) {
+      return this.cachedPrice.price;
+    }
+
+    try {
+      // For now, use a fallback price - in production this would query a price feed
+      // This could be replaced with Chainlink price feeds or other oracles
+      const fallbackPrice = 3000; // $3000 USD fallback
+
+      this.cachedPrice = { price: fallbackPrice, timestamp: Date.now() };
+      return fallbackPrice;
+    } catch (error) {
+      // Return fallback price on error
+      return 3000;
+    }
+  }
+}
+
+/**
+ * Calculate square root of a BigInt using Newton's method
+ */
+function bigintSqrt(value: bigint): bigint {
+  if (value < 0n) {
+    throw new Error('Square root of negative number');
+  }
+  if (value < 2n) {
+    return value;
+  }
+
+  // Newton's method for square root
+  let x = value;
+  let y = (x + 1n) / 2n;
+
+  while (y < x) {
+    x = y;
+    y = (x + value / x) / 2n;
+  }
+
+  return x;
 }
 
 export interface ArbitrageSpread {
@@ -47,8 +107,10 @@ export interface ProfitCalculation {
 
 export class ArbitrageScanner extends EventEmitter {
   private readonly poolManager: PoolManager;
+  private readonly connectionManager: RpcConnectionManager;
   private readonly config: ArbitrageConfig;
   private readonly scanIntervalMs: number;
+  private readonly priceOracle: IPriceOracle;
 
   // Scanning state
   private isScanning = false;
@@ -67,8 +129,11 @@ export class ArbitrageScanner extends EventEmitter {
     super();
 
     this.poolManager = options.poolManager;
+    this.connectionManager = options.connectionManager;
     this.config = options.config;
     this.scanIntervalMs = options.scanIntervalMs ?? 1000; // 1s default for fast arbitrage detection
+    this.priceOracle =
+      options.priceOracle ?? new SimplePriceOracle(this.connectionManager.getProvider());
 
     this.initializeTokenPairs();
   }
@@ -85,6 +150,9 @@ export class ArbitrageScanner extends EventEmitter {
       // Initial scan
       await this.scanForOpportunities();
 
+      // Set flag immediately after successful initial scan to prevent race condition
+      this.isScanning = true;
+
       // Start periodic scanning
       this.scanInterval = setInterval(async () => {
         try {
@@ -94,7 +162,6 @@ export class ArbitrageScanner extends EventEmitter {
         }
       }, this.scanIntervalMs);
 
-      this.isScanning = true;
       this.emit('scanningStarted');
     } catch (error) {
       this.emit('scanError', error);
@@ -279,7 +346,7 @@ export class ArbitrageScanner extends EventEmitter {
     }
 
     // Create arbitrage opportunity
-    const opportunity = this.createArbitrageOpportunity(
+    const opportunity = await this.createArbitrageOpportunity(
       tokenPair,
       spread,
       optimalAmount,
@@ -328,7 +395,7 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
-   * Find the best Aerodrome pool (highest reserves)
+   * Find the best Aerodrome pool (highest TVL using geometric mean)
    */
   private findBestAerodromePool(
     poolAddresses: Address[],
@@ -343,10 +410,29 @@ export class ArbitrageScanner extends EventEmitter {
         | AerodromeStablePoolState;
       if (!poolState || !poolState.isActive) continue;
 
-      // Calculate TVL as sum of reserves (simplified)
+      // Calculate TVL using geometric mean: sqrt(reserve0 * reserve1)
       const reserve0 = BigInt(poolState.reserve0.toString());
       const reserve1 = BigInt(poolState.reserve1.toString());
-      const tvl = reserve0 + reserve1; // Simplified TVL calculation
+
+      if (reserve0 === 0n || reserve1 === 0n) {
+        continue; // Skip pools with zero reserves
+      }
+
+      // Handle potential overflow by scaling down if necessary
+      let tvl: bigint;
+      try {
+        const product = reserve0 * reserve1;
+        tvl = bigintSqrt(product);
+      } catch (error) {
+        // If overflow occurs, scale down and try again
+        const scaledReserve0 = reserve0 / 1000n;
+        const scaledReserve1 = reserve1 / 1000n;
+        if (scaledReserve0 > 0n && scaledReserve1 > 0n) {
+          tvl = bigintSqrt(scaledReserve0 * scaledReserve1) * 1000n;
+        } else {
+          continue; // Skip if reserves too small after scaling
+        }
+      }
 
       if (tvl > highestTvl) {
         highestTvl = tvl;
@@ -432,19 +518,24 @@ export class ArbitrageScanner extends EventEmitter {
    * Calculate optimal trade amount for arbitrage
    */
   private calculateOptimalTradeAmount(
-    _uniV3Pool: UniswapV3PoolState,
-    _aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState,
+    uniV3Pool: UniswapV3PoolState,
+    aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState,
     spread: ArbitrageSpread
   ): bigint {
-    // Simplified calculation - use a percentage of available liquidity
-    const uniV3Liquidity = BigInt(_uniV3Pool.liquidity.toString());
-    const aeroReserve = BigInt(_aeroPool.reserve0.toString());
+    // Convert Uniswap V3 liquidity to comparable token amounts
+    const uniV3TokenAmount = this.estimateUniV3TokenAmount(uniV3Pool);
+    const aeroTokenAmount = this.getAerodromeTokenAmount(aeroPool);
 
-    // Use smaller of the two liquidities, with a conservative multiplier
-    const availableLiquidity = uniV3Liquidity < aeroReserve ? uniV3Liquidity : aeroReserve;
+    // Use smaller of the two token amounts, with a conservative multiplier
+    const availableTokenAmount =
+      uniV3TokenAmount < aeroTokenAmount ? uniV3TokenAmount : aeroTokenAmount;
 
-    // Use 1% of available liquidity as starting point
-    const baseAmount = availableLiquidity / 100n;
+    if (availableTokenAmount === 0n) {
+      return 0n;
+    }
+
+    // Use 1% of available token amount as starting point
+    const baseAmount = availableTokenAmount / 100n;
 
     // Adjust based on spread size (larger spreads allow larger trades)
     const spreadMultiplier = BigInt(Math.max(1, Math.min(10, spread.spread / 10))); // 1x to 10x based on spread
@@ -453,18 +544,58 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
+   * Estimate token amount available in Uniswap V3 pool
+   */
+  private estimateUniV3TokenAmount(poolState: UniswapV3PoolState): bigint {
+    try {
+      const liquidity = BigInt(poolState.liquidity.toString());
+      const sqrtPriceX96 = BigInt(poolState.sqrtPriceX96.toString());
+
+      if (liquidity === 0n || sqrtPriceX96 === 0n) {
+        return 0n;
+      }
+
+      // Simplified estimation: convert liquidity to token0 amount
+      // This is a rough approximation - in production you'd want more precise calculations
+      const Q96 = 2n ** 96n;
+
+      // Estimate token0 amount from liquidity and price
+      // amount0 ≈ liquidity / sqrtPrice
+      const estimatedAmount0 = (liquidity * Q96) / sqrtPriceX96;
+
+      // Use the smaller of token0 estimate or a conservative fraction of liquidity
+      const conservativeEstimate = liquidity / 1000n; // Very conservative 0.1% of liquidity
+
+      return estimatedAmount0 < conservativeEstimate ? estimatedAmount0 : conservativeEstimate;
+    } catch (error) {
+      // Fallback to very conservative estimate
+      const liquidity = BigInt(poolState.liquidity.toString());
+      return liquidity / 10000n; // 0.01% of liquidity as fallback
+    }
+  }
+
+  /**
+   * Get comparable token amount from Aerodrome pool
+   */
+  private getAerodromeTokenAmount(
+    poolState: AerodromeVolatilePoolState | AerodromeStablePoolState
+  ): bigint {
+    const reserve0 = BigInt(poolState.reserve0.toString());
+    const reserve1 = BigInt(poolState.reserve1.toString());
+
+    // Return the smaller of the two reserves as the limiting factor
+    return reserve0 < reserve1 ? reserve0 : reserve1;
+  }
+
+  /**
    * Calculate profitability including all costs
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   private async calculateProfitability(
     spread: ArbitrageSpread,
     tradeAmount: bigint,
-    _uniV3Pool: UniswapV3PoolState,
-    _aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState
+    uniV3Pool: UniswapV3PoolState,
+    aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState
   ): Promise<ProfitCalculation> {
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars, no-unused-vars
-    const _unused = [_uniV3Pool, _aeroPool]; // Suppress unused parameter warnings
-
     // Calculate gross profit from spread
     const grossProfit = (tradeAmount * BigInt(spread.spread)) / 10000n;
 
@@ -472,14 +603,15 @@ export class ArbitrageScanner extends EventEmitter {
     const flashLoanFeeBps = 5n; // 0.05%
     const flashLoanFee = (tradeAmount * flashLoanFeeBps) / 10000n;
 
+    // Get real-time gas price
+    const gasPrice = await this.getCurrentGasPrice();
+
     // Estimate gas costs
     const gasEstimate = 300000n; // Estimated gas for flash loan + 2 swaps
-    const gasPrice = 1000000000n; // 1 gwei (will be updated from network)
     const gasCost = gasEstimate * gasPrice;
 
-    // Calculate slippage costs (simplified)
-    const slippageBps = BigInt(this.config.maxSlippageBps);
-    const slippageCost = (tradeAmount * slippageBps) / 10000n;
+    // Calculate slippage costs using pool-specific data
+    const slippageCost = await this.calculateSlippageCost(tradeAmount, uniV3Pool, aeroPool);
 
     // Calculate net profit
     const totalCosts = flashLoanFee + gasCost + slippageCost;
@@ -488,8 +620,9 @@ export class ArbitrageScanner extends EventEmitter {
     // Calculate profit margin
     const profitMargin = tradeAmount > 0n ? Number((netProfit * 100n) / tradeAmount) : 0;
 
-    // Check if viable
-    const minProfitWei = ethers.parseEther(this.config.minProfitUSD.toString()) / 3000n; // Assume $3000 ETH
+    // Get current ETH price and calculate minimum profit in Wei
+    const ethUsdPrice = await this.priceOracle.getEthUsdPrice();
+    const minProfitWei = this.calculateMinProfitWei(ethUsdPrice);
     const isViable = netProfit >= minProfitWei && profitMargin >= 1.0; // 1% minimum margin
 
     return {
@@ -505,16 +638,130 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
+   * Get current gas price from the network
+   */
+  private async getCurrentGasPrice(): Promise<bigint> {
+    try {
+      const provider = this.connectionManager.getProvider();
+      const feeData = await provider.getFeeData();
+
+      // Use maxFeePerGas if available (EIP-1559), otherwise gasPrice
+      const gasPrice = feeData.maxFeePerGas || feeData.gasPrice;
+
+      if (gasPrice) {
+        return BigInt(gasPrice.toString());
+      }
+    } catch (error) {
+      // Fallback on error
+    }
+
+    // Safe fallback: 2 gwei
+    return 2000000000n;
+  }
+
+  /**
+   * Calculate minimum profit in Wei based on USD amount and current ETH price
+   */
+  private calculateMinProfitWei(ethUsdPrice: number): bigint {
+    try {
+      const minProfitUsd = this.config.minProfitUSD;
+      const minProfitEth = minProfitUsd / ethUsdPrice;
+      return ethers.parseEther(minProfitEth.toString());
+    } catch (error) {
+      // Fallback calculation
+      return ethers.parseEther(this.config.minProfitUSD.toString()) / 3000n;
+    }
+  }
+
+  /**
+   * Calculate slippage cost based on pool liquidity and trade size
+   */
+  private async calculateSlippageCost(
+    tradeAmount: bigint,
+    uniV3Pool: UniswapV3PoolState,
+    aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState
+  ): Promise<bigint> {
+    try {
+      // Calculate price impact based on pool liquidity
+      const uniV3Impact = this.calculateUniV3PriceImpact(tradeAmount, uniV3Pool);
+      const aeroImpact = this.calculateAerodromePriceImpact(tradeAmount, aeroPool);
+
+      // Use the higher of the two impacts
+      const maxImpactBps = Math.max(uniV3Impact, aeroImpact);
+
+      // Cap at configured maximum slippage
+      const cappedImpactBps = Math.min(maxImpactBps, this.config.maxSlippageBps);
+
+      return (tradeAmount * BigInt(cappedImpactBps)) / 10000n;
+    } catch (error) {
+      // Fallback to configured max slippage
+      const slippageBps = BigInt(this.config.maxSlippageBps);
+      return (tradeAmount * slippageBps) / 10000n;
+    }
+  }
+
+  /**
+   * Calculate price impact for Uniswap V3 trade
+   */
+  private calculateUniV3PriceImpact(tradeAmount: bigint, poolState: UniswapV3PoolState): number {
+    try {
+      const liquidity = BigInt(poolState.liquidity.toString());
+
+      if (liquidity === 0n) {
+        return this.config.maxSlippageBps; // Max slippage if no liquidity
+      }
+
+      // Simplified price impact calculation
+      // impact ≈ tradeAmount / liquidity * 10000 (in basis points)
+      const impactRatio = (tradeAmount * 10000n) / liquidity;
+
+      // Cap at reasonable maximum and convert to number
+      return Math.min(Number(impactRatio), this.config.maxSlippageBps);
+    } catch (error) {
+      return this.config.maxSlippageBps / 2; // Conservative fallback
+    }
+  }
+
+  /**
+   * Calculate price impact for Aerodrome trade
+   */
+  private calculateAerodromePriceImpact(
+    tradeAmount: bigint,
+    poolState: AerodromeVolatilePoolState | AerodromeStablePoolState
+  ): number {
+    try {
+      const reserve0 = BigInt(poolState.reserve0.toString());
+      const reserve1 = BigInt(poolState.reserve1.toString());
+
+      // Use the smaller reserve as the limiting factor
+      const limitingReserve = reserve0 < reserve1 ? reserve0 : reserve1;
+
+      if (limitingReserve === 0n) {
+        return this.config.maxSlippageBps; // Max slippage if no reserves
+      }
+
+      // Simplified price impact calculation
+      // impact ≈ tradeAmount / limitingReserve * 10000 (in basis points)
+      const impactRatio = (tradeAmount * 10000n) / limitingReserve;
+
+      // Cap at reasonable maximum and convert to number
+      return Math.min(Number(impactRatio), this.config.maxSlippageBps);
+    } catch (error) {
+      return this.config.maxSlippageBps / 2; // Conservative fallback
+    }
+  }
+
+  /**
    * Create arbitrage opportunity object
    */
-  private createArbitrageOpportunity(
+  private async createArbitrageOpportunity(
     tokenPair: { token0: Address; token1: Address },
     spread: ArbitrageSpread,
     tradeAmount: bigint,
     profitCalc: ProfitCalculation,
     uniV3Pool: UniswapV3PoolState,
     aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState
-  ): ArbitrageOpportunity {
+  ): Promise<ArbitrageOpportunity> {
     const opportunityId = `arb_${++this.opportunityCounter}_${Date.now()}`;
     const now = Date.now();
 
@@ -554,7 +801,7 @@ export class ArbitrageScanner extends EventEmitter {
       flashFee: profitCalc.flashLoanFee,
       gasEstimate: profitCalc.gasEstimate,
       expectedProfit: profitCalc.netProfit,
-      minProfit: ethers.parseEther(this.config.minProfitUSD.toString()) / 3000n, // Simplified
+      minProfit: await this.calculateMinProfitWei(await this.priceOracle.getEthUsdPrice()),
       profitMargin: profitCalc.profitMargin,
 
       // Execution parameters
