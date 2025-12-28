@@ -394,9 +394,11 @@ export class ArbitrageScanner extends EventEmitter {
 
     // Sort routes by profitability (highest profit first)
     candidateRoutes.sort((a, b) => {
-      // Primary sort: expected profit
-      const profitDiff = Number(b.expectedProfit - a.expectedProfit);
-      if (profitDiff !== 0) return profitDiff;
+      // Primary sort: expected profit (using BigInt comparison to avoid precision loss)
+      const profitDiff = b.expectedProfit - a.expectedProfit;
+      if (profitDiff !== 0n) {
+        return profitDiff > 0n ? 1 : -1;
+      }
 
       // Secondary sort: profit margin
       return b.profitMargin - a.profitMargin;
