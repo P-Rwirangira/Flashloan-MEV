@@ -133,7 +133,35 @@ dist
 !.yarn/releases
 !.yarn/sdks
 !.yarn/versions
+.kiro
+# MEV Platform specific
+logs/
+config/local.yaml
+config/production.yaml
 
-# Vite logs files
-vite.config.js.timestamp-*
-vite.config.ts.timestamp-*
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker volumes
+prometheus-data/
+grafana-data/
+redis-data/
+
+# Private keys and sensitive data
+*.key
+*.pem
+wallets/
+secrets/

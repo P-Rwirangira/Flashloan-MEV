@@ -1,0 +1,81 @@
+# Base MEV Platform Default Configuration
+
+# Network Configuration
+network:
+  base:
+    chainId: 8453
+    name: "Base Mainnet"
+    rpcUrl: "${BASE_RPC_URL:-http://localhost:8545}"
+    wsUrl: "${BASE_WS_URL:-ws://localhost:8546}"
+    fallbackRpcs:
+      - "${ALCHEMY_BASE_URL}"
+      - "${INFURA_BASE_URL}"
+
+# Strategy Configuration
+strategies:
+  arbitrage:
+    enabled: true
+    minProfitUSD: 20
+    maxSlippageBps: 50
+    maxGasPriceGwei: 10
+    pairs:
+      - "WETH/USDC"
+      - "wstETH/ETH"
+      - "USDC/DAI"
+  
+  liquidation:
+    enabled: false # Phase 2
+    minHealthFactor: 1.0
+    maxCloseFactor: 0.5
+    protocols:
+      - "moonwell"
+      - "aave-v3"
+      - "seamless"
+  
+  rebalancing:
+    enabled: false # Phase 3
+    minImbalanceBps: 100
+    incentiveThreshold: 0.1
+
+# Pool Allowlists
+allowedPools:
+  uniswapV3:
+    # WETH/USDC 0.05%
+    - "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18"
+    # WETH/USDC 0.3%
+    - "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+  
+  aerodrome:
+    # WETH/USDC volatile
+    - "0xcDAC0d6c6C59727a65F871236188350531885C43"
+
+# Relay Configuration
+relays:
+  primary: "bloxroute"
+  fallbacks:
+    - "flashbots"
+    - "local"
+  maxBribeGwei: 5
+  
+  bloxroute:
+    apiKey: "${BLOXROUTE_API_KEY}"
+    endpoint: "https://api.blxrbdn.com"
+  
+  flashbots:
+    endpoint: "${FLASHBOTS_PROTECT_URL:-https://rpc.flashbots.net}"
+
+# Monitoring Configuration
+monitoring:
+  metricsPort: 3001
+  healthCheckPort: 3002
+  alerting:
+    consecutiveRevertThreshold: 5
+    latencyThresholdMs: 300
+    successRateThreshold: 0.3
+
+# Performance Configuration
+performance:
+  maxLatencyMs: 150
+  simulationTimeoutMs: 50
+  maxRetries: 3
+  retryDelayMs: 100
