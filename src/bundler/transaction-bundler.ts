@@ -8,6 +8,7 @@
 import { ethers, TransactionRequest } from 'ethers';
 import { EventEmitter } from 'events';
 import { PrivateRelayManager, SubmissionParams, SubmissionResult } from './private-relay';
+import { BribeOptimizer, BribeOptimizationParams, CongestionLevel } from './bribe-optimizer';
 
 /**
  * Bundler configuration
@@ -52,21 +53,27 @@ export class TransactionBundler extends EventEmitter {
   private readonly relayManager: PrivateRelayManager;
   private readonly provider: ethers.Provider;
   private readonly config: BundlerConfig;
+  private readonly bribeOptimizer: BribeOptimizer;
 
   private readonly pendingBundles: Map<string, TransactionBundle>;
   private readonly submissionHistory: Map<string, SubmissionResult[]>;
 
   // Bribe optimization state
   private networkGasPrice: bigint = 0n;
-  private congestionLevel: number = 0;
-  private lastBribeUpdate: number = 0;
+  private congestionLevel: CongestionLevel = CongestionLevel.MEDIUM;
 
-  constructor(relayManager: PrivateRelayManager, provider: ethers.Provider, config: BundlerConfig) {
+  constructor(
+    relayManager: PrivateRelayManager,
+    provider: ethers.Provider,
+    config: BundlerConfig,
+    bribeOptimizer?: BribeOptimizer
+  ) {
     super();
 
     this.relayManager = relayManager;
     this.provider = provider;
     this.config = config;
+    this.bribeOptimizer = bribeOptimizer || new BribeOptimizer();
 
     this.pendingBundles = new Map();
     this.submissionHistory = new Map();
@@ -171,55 +178,43 @@ export class TransactionBundler extends EventEmitter {
   }
 
   /**
-   * Calculate optimal bribe based on network conditions and bundle priority
+   * Calculate optimal bribe using the bribe optimizer
    */
   private calculateOptimalBribe(bundle: TransactionBundle): bigint {
-    const baseGasPrice = this.networkGasPrice;
-    const congestionMultiplier = 1 + this.congestionLevel / 100;
+    const timeRemaining = Math.max(0, bundle.deadline - Date.now());
+    const timeUrgency = timeRemaining < 30000 ? 1.0 : Math.max(0, (60000 - timeRemaining) / 60000);
 
-    // Priority multipliers
-    const priorityMultipliers = {
-      high: 2.0,
-      medium: 1.5,
-      low: 1.0,
+    const optimizationParams: BribeOptimizationParams = {
+      baseGasPrice: this.networkGasPrice,
+      networkCongestion: this.congestionLevel,
+      timeUrgency,
+      priority: bundle.priority,
+      targetInclusionProbability: 0.8, // 80% target inclusion probability
+      maxBribe: bundle.maxBribe,
+      minBribe: this.config.minBribe,
     };
 
-    const priorityMultiplier = priorityMultipliers[bundle.priority];
+    const result = this.bribeOptimizer.calculateOptimalBribe(optimizationParams);
 
-    // Time urgency factor
-    const timeRemaining = Math.max(0, bundle.deadline - Date.now());
-    const urgencyMultiplier = timeRemaining < 30000 ? 2.0 : 1.0; // 30 seconds
+    this.emit('bribeOptimized', {
+      bundleId: bundle.id,
+      optimalBribe: result.optimalBribe,
+      expectedInclusionProbability: result.expectedInclusionProbability,
+      reasoning: result.reasoning,
+    });
 
-    // Calculate optimal bribe
-    let optimalBribe =
-      baseGasPrice *
-      BigInt(Math.floor(congestionMultiplier * priorityMultiplier * urgencyMultiplier));
-
-    // Apply bounds
-    optimalBribe = this.clampBribe(optimalBribe);
-
-    return optimalBribe;
+    return result.optimalBribe;
   }
 
   /**
-   * Increase bribe for retry attempts
+   * Increase bribe for retry attempts using optimizer
    */
-  private increaseBribe(currentBribe: bigint): bigint {
-    const newBribe = currentBribe + this.config.bribeIncrement;
-    return this.clampBribe(newBribe);
-  }
-
-  /**
-   * Clamp bribe within configured bounds
-   */
-  private clampBribe(bribe: bigint): bigint {
-    if (bribe < this.config.minBribe) {
-      return this.config.minBribe;
-    }
-    if (bribe > this.config.maxBribe) {
-      return this.config.maxBribe;
-    }
-    return bribe;
+  private increaseBribe(currentBribe: bigint, attemptNumber: number = 1): bigint {
+    return this.bribeOptimizer.adjustBribeForRetry(
+      currentBribe,
+      attemptNumber,
+      this.config.maxBribe
+    );
   }
 
   /**
@@ -283,19 +278,9 @@ export class TransactionBundler extends EventEmitter {
         const feeData = await this.provider.getFeeData();
         this.networkGasPrice = feeData.gasPrice || 0n;
 
-        // Simple congestion estimation based on gas price changes
-        const now = Date.now();
-        if (this.lastBribeUpdate > 0) {
-          const timeDiff = now - this.lastBribeUpdate;
-          if (timeDiff > 0) {
-            // Estimate congestion based on gas price volatility
-            this.congestionLevel = Math.min(
-              100,
-              Math.max(0, this.congestionLevel + Math.random() * 10 - 5)
-            );
-          }
-        }
-        this.lastBribeUpdate = now;
+        // Update congestion level using bribe optimizer
+        this.bribeOptimizer.updateCongestionLevel(this.networkGasPrice);
+        this.congestionLevel = this.bribeOptimizer.getCurrentCongestion();
       } catch (error) {
         this.emit('networkMonitoringError', error);
       }
@@ -328,7 +313,7 @@ export class TransactionBundler extends EventEmitter {
   }
 
   /**
-   * Get bundler statistics
+   * Get bundler statistics including bribe optimizer stats
    */
   getStats(): {
     pendingBundles: number;
@@ -336,7 +321,8 @@ export class TransactionBundler extends EventEmitter {
     successRate: number;
     averageBribe: bigint;
     networkGasPrice: bigint;
-    congestionLevel: number;
+    congestionLevel: CongestionLevel;
+    bribeOptimizerStats: any;
   } {
     const allSubmissions = Array.from(this.submissionHistory.values()).flat();
     const successfulSubmissions = allSubmissions.filter(s => s.success);
@@ -353,6 +339,7 @@ export class TransactionBundler extends EventEmitter {
       averageBribe,
       networkGasPrice: this.networkGasPrice,
       congestionLevel: this.congestionLevel,
+      bribeOptimizerStats: this.bribeOptimizer.getStats(),
     };
   }
 
