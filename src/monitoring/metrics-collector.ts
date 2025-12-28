@@ -166,10 +166,15 @@ export class MetricsCollector extends EventEmitter {
   > = new Map();
 
   // System health tracking
-  private systemHealth = {
+  private systemHealth: SystemHealthMetrics = {
+    uptime: 0,
+    memoryUsage: 0,
+    cpuUsage: 0,
+    networkLatency: 0,
+    rpcConnectionHealth: true,
     consecutiveFailures: 0,
     lastSuccessfulOperation: Date.now(),
-    circuitBreakerStatus: 'closed' as const,
+    circuitBreakerStatus: 'closed',
   };
 
   constructor() {
@@ -423,9 +428,9 @@ export class MetricsCollector extends EventEmitter {
 
       const sorted = [...data].sort((a, b) => a - b);
       const avg = data.reduce((sum, val) => sum + val, 0) / data.length;
-      const p50 = sorted[Math.floor(sorted.length * 0.5)];
-      const p95 = sorted[Math.floor(sorted.length * 0.95)];
-      const p99 = sorted[Math.floor(sorted.length * 0.99)];
+      const p50 = sorted[Math.floor(sorted.length * 0.5)] ?? 0;
+      const p95 = sorted[Math.floor(sorted.length * 0.95)] ?? 0;
+      const p99 = sorted[Math.floor(sorted.length * 0.99)] ?? 0;
 
       return { avg, p50, p95, p99 };
     };
@@ -621,6 +626,11 @@ export class MetricsCollector extends EventEmitter {
     });
 
     this.systemHealth = {
+      uptime: 0,
+      memoryUsage: 0,
+      cpuUsage: 0,
+      networkLatency: 0,
+      rpcConnectionHealth: true,
       consecutiveFailures: 0,
       lastSuccessfulOperation: Date.now(),
       circuitBreakerStatus: 'closed',
