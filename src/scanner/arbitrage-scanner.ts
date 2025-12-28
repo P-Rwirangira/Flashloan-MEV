@@ -94,6 +94,25 @@ export interface ArbitrageSpread {
   readonly direction: 'uni_to_aero' | 'aero_to_uni';
 }
 
+export interface ArbitrageRoute {
+  readonly id: string;
+  readonly uniV3Pool: UniswapV3PoolState;
+  readonly aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState;
+  readonly spread: ArbitrageSpread;
+  readonly optimalAmount: bigint;
+  readonly expectedProfit: bigint;
+  readonly profitMargin: number;
+  readonly gasEstimate: bigint;
+  readonly priority: number; // 1-10 scale based on profitability
+}
+
+export interface RouteOptimizationResult {
+  readonly primaryRoute: ArbitrageRoute;
+  readonly fallbackRoutes: ArbitrageRoute[];
+  readonly totalRoutes: number;
+  readonly bestProfitMargin: number;
+}
+
 export interface ProfitCalculation {
   readonly grossProfit: bigint;
   readonly flashLoanFee: bigint;
@@ -293,7 +312,7 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
-   * Scan a specific token pair for arbitrage opportunities
+   * Scan a specific token pair for arbitrage opportunities with route optimization
    */
   private async scanTokenPair(
     tokenPair: { token0: Address; token1: Address },
@@ -305,61 +324,31 @@ export class ArbitrageScanner extends EventEmitter {
       return;
     }
 
-    // Find best pools from each DEX (highest liquidity)
-    const bestUniV3Pool = this.findBestUniswapV3Pool(poolPairing.uniV3Pools, allPoolStates);
-    const bestAeroPool = this.findBestAerodromePool(poolPairing.aeroPools, allPoolStates);
+    // Optimize routes across all pool combinations
+    const routeOptimization = await this.optimizeRoutes(tokenPair, poolPairing, allPoolStates);
 
-    if (!bestUniV3Pool || !bestAeroPool) {
-      return;
+    if (!routeOptimization) {
+      return; // No viable routes found
     }
 
-    // Calculate prices on both DEXs
-    const uniV3Price = this.calculateUniswapV3Price(bestUniV3Pool);
-    const aeroPrice = this.calculateAerodromePrice(bestAeroPool);
-
-    if (!uniV3Price || !aeroPrice) {
-      return;
-    }
-
-    // Detect spread and direction
-    const spread = this.calculateSpread(uniV3Price, aeroPrice);
-    if (spread.spread < this.config.minSpreadBps) {
-      return; // Spread too small
-    }
-
-    // Calculate optimal trade amount
-    const optimalAmount = this.calculateOptimalTradeAmount(bestUniV3Pool, bestAeroPool, spread);
-    if (optimalAmount === 0n) {
-      return; // No viable trade amount
-    }
-
-    // Calculate profitability
-    const profitCalc = await this.calculateProfitability(
-      spread,
-      optimalAmount,
-      bestUniV3Pool,
-      bestAeroPool
-    );
-
-    if (!profitCalc.isViable) {
-      return; // Not profitable after costs
-    }
-
-    // Create arbitrage opportunity
-    const opportunity = await this.createArbitrageOpportunity(
+    // Create arbitrage opportunity with optimized routes
+    const opportunity = await this.createArbitrageOpportunityWithRoutes(
       tokenPair,
-      spread,
-      optimalAmount,
-      profitCalc,
-      bestUniV3Pool,
-      bestAeroPool
+      routeOptimization
     );
 
     // Check if this is a new or updated opportunity
-    const existingOpportunity = this.findExistingOpportunity(tokenPair, spread.direction);
+    const existingOpportunity = this.findExistingOpportunity(
+      tokenPair,
+      routeOptimization.primaryRoute.spread.direction
+    );
+
     if (existingOpportunity) {
       // Update existing opportunity if profit improved
-      if (profitCalc.netProfit > BigInt(existingOpportunity.expectedProfit.toString())) {
+      if (
+        routeOptimization.primaryRoute.expectedProfit >
+        BigInt(existingOpportunity.expectedProfit.toString())
+      ) {
         this.activeOpportunities.set(existingOpportunity.id, opportunity);
         this.emit('opportunityUpdated', opportunity);
       }
@@ -371,7 +360,278 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
-   * Find the best Uniswap V3 pool (highest liquidity)
+   * Optimize routes by evaluating all pool combinations and selecting the best ones
+   */
+  private async optimizeRoutes(
+    tokenPair: { token0: Address; token1: Address },
+    poolPairing: { uniV3Pools: Address[]; aeroPools: Address[] },
+    allPoolStates: Map<Address, any>
+  ): Promise<RouteOptimizationResult | undefined> {
+    const candidateRoutes: ArbitrageRoute[] = [];
+
+    // Evaluate all possible pool combinations
+    for (const uniV3PoolAddress of poolPairing.uniV3Pools) {
+      const uniV3Pool = allPoolStates.get(uniV3PoolAddress) as UniswapV3PoolState;
+      if (!uniV3Pool || !uniV3Pool.isActive) continue;
+
+      for (const aeroPoolAddress of poolPairing.aeroPools) {
+        const aeroPool = allPoolStates.get(aeroPoolAddress) as
+          | AerodromeVolatilePoolState
+          | AerodromeStablePoolState;
+        if (!aeroPool || !aeroPool.isActive) continue;
+
+        // Evaluate this route combination
+        const route = await this.evaluateRoute(uniV3Pool, aeroPool, tokenPair);
+        if (route) {
+          candidateRoutes.push(route);
+        }
+      }
+    }
+
+    if (candidateRoutes.length === 0) {
+      return undefined;
+    }
+
+    // Sort routes by profitability (highest profit first)
+    candidateRoutes.sort((a, b) => {
+      // Primary sort: expected profit
+      const profitDiff = Number(b.expectedProfit - a.expectedProfit);
+      if (profitDiff !== 0) return profitDiff;
+
+      // Secondary sort: profit margin
+      return b.profitMargin - a.profitMargin;
+    });
+
+    // Select primary route and up to maxRoutes-1 fallback routes
+    const maxRoutes = Math.min(this.config.maxRoutes, candidateRoutes.length);
+    const primaryRoute = candidateRoutes[0];
+    const fallbackRoutes = candidateRoutes.slice(1, maxRoutes);
+
+    return {
+      primaryRoute,
+      fallbackRoutes,
+      totalRoutes: candidateRoutes.length,
+      bestProfitMargin: primaryRoute.profitMargin,
+    };
+  }
+
+  /**
+   * Evaluate a specific route combination
+   */
+  private async evaluateRoute(
+    uniV3Pool: UniswapV3PoolState,
+    aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState,
+    tokenPair: { token0: Address; token1: Address }
+  ): Promise<ArbitrageRoute | undefined> {
+    try {
+      // Calculate prices on both DEXs
+      const uniV3Price = this.calculateUniswapV3Price(uniV3Pool);
+      const aeroPrice = this.calculateAerodromePrice(aeroPool);
+
+      if (!uniV3Price || !aeroPrice) {
+        return undefined;
+      }
+
+      // Calculate spread and direction
+      const spread = this.calculateSpread(uniV3Price, aeroPrice);
+      spread.tokenPair = [tokenPair.token0, tokenPair.token1];
+      spread.uniswapV3Pool = uniV3Pool.address;
+      spread.aerodromePool = aeroPool.address;
+
+      if (spread.spread < this.config.minSpreadBps) {
+        return undefined; // Spread too small
+      }
+
+      // Calculate optimal trade amount for this specific route
+      const optimalAmount = this.calculateOptimalTradeAmount(uniV3Pool, aeroPool, spread);
+      if (optimalAmount === 0n) {
+        return undefined; // No viable trade amount
+      }
+
+      // Calculate profitability for this route
+      const profitCalc = await this.calculateProfitability(
+        spread,
+        optimalAmount,
+        uniV3Pool,
+        aeroPool
+      );
+
+      if (!profitCalc.isViable) {
+        return undefined; // Not profitable after costs
+      }
+
+      // Calculate priority based on profit margin and spread
+      const priority = Math.min(
+        10,
+        Math.max(1, Math.floor((profitCalc.profitMargin * spread.spread) / 100))
+      );
+
+      const routeId = `${uniV3Pool.address}-${aeroPool.address}-${Date.now()}`;
+
+      return {
+        id: routeId,
+        uniV3Pool,
+        aeroPool,
+        spread,
+        optimalAmount,
+        expectedProfit: profitCalc.netProfit,
+        profitMargin: profitCalc.profitMargin,
+        gasEstimate: profitCalc.gasEstimate,
+        priority,
+      };
+    } catch (error) {
+      // Log error and continue with other routes
+      return undefined;
+    }
+  }
+
+  /**
+   * Create arbitrage opportunity with optimized routes
+   */
+  private async createArbitrageOpportunityWithRoutes(
+    tokenPair: { token0: Address; token1: Address },
+    routeOptimization: RouteOptimizationResult
+  ): Promise<ArbitrageOpportunity> {
+    const primaryRoute = routeOptimization.primaryRoute;
+    const opportunityId = `arb_${++this.opportunityCounter}_${Date.now()}`;
+    const now = Date.now();
+
+    // Determine source and target based on direction
+    const isAeroToUni = primaryRoute.spread.direction === 'aero_to_uni';
+    const sourcePool = isAeroToUni ? primaryRoute.aeroPool.address : primaryRoute.uniV3Pool.address;
+    const targetPool = isAeroToUni ? primaryRoute.uniV3Pool.address : primaryRoute.aeroPool.address;
+    const sourceDex = isAeroToUni ? 'aerodrome' : 'uniswap-v3';
+    const targetDex = isAeroToUni ? 'uniswap-v3' : 'aerodrome';
+
+    // Create primary route
+    const route: Route = {
+      pools: [sourcePool, targetPool],
+      fees: [primaryRoute.uniV3Pool.fee, 0], // Aerodrome fees are dynamic
+      directions: [true, false], // Simplified
+      expectedGas: Number(primaryRoute.gasEstimate),
+      priceImpact: primaryRoute.spread.spread, // Use spread as price impact estimate
+    };
+
+    // Create fallback routes
+    const fallbackRoutes: Route[] = routeOptimization.fallbackRoutes.map(fallbackRoute => {
+      const isFallbackAeroToUni = fallbackRoute.spread.direction === 'aero_to_uni';
+      const fallbackSourcePool = isFallbackAeroToUni
+        ? fallbackRoute.aeroPool.address
+        : fallbackRoute.uniV3Pool.address;
+      const fallbackTargetPool = isFallbackAeroToUni
+        ? fallbackRoute.uniV3Pool.address
+        : fallbackRoute.aeroPool.address;
+
+      return {
+        pools: [fallbackSourcePool, fallbackTargetPool],
+        fees: [fallbackRoute.uniV3Pool.fee, 0],
+        directions: [true, false],
+        expectedGas: Number(fallbackRoute.gasEstimate),
+        priceImpact: fallbackRoute.spread.spread,
+      };
+    });
+
+    // Get current ETH price for minimum profit calculation
+    const ethUsdPrice = await this.priceOracle.getEthUsdPrice();
+    const minProfitWei = this.calculateMinProfitWei(ethUsdPrice);
+
+    return {
+      id: opportunityId,
+      timestamp: now,
+      type: 'arbitrage',
+      status: OpportunityStatus.DETECTED,
+
+      // Route information
+      tokenIn: tokenPair.token0,
+      tokenOut: tokenPair.token1,
+      amountIn: primaryRoute.optimalAmount,
+      expectedAmountOut: primaryRoute.optimalAmount + primaryRoute.expectedProfit,
+
+      // DEX routing with fallbacks
+      route,
+      fallbackRoutes,
+
+      // Profitability
+      flashFee: (primaryRoute.optimalAmount * 5n) / 10000n, // 0.05% flash loan fee
+      gasEstimate: primaryRoute.gasEstimate,
+      expectedProfit: primaryRoute.expectedProfit,
+      minProfit: minProfitWei,
+      profitMargin: primaryRoute.profitMargin,
+
+      // Execution parameters
+      slippageTolerance: this.config.maxSlippageBps / 100, // Convert to percentage
+      deadline: now + 30000, // 30s default
+      maxBribe: ethers.parseEther('0.01'), // 0.01 ETH max bribe
+      priority: primaryRoute.priority,
+
+      // Metadata
+      detectedAt: now,
+      expiresAt: now + 30000, // 30s default
+      source: 'arbitrage-scanner',
+
+      // Arbitrage-specific fields
+      sourcePool,
+      targetPool,
+      sourceDex,
+      targetDex,
+      spread: primaryRoute.spread.spread,
+      spreadAfterCosts: Math.max(
+        0,
+        primaryRoute.spread.spread -
+          Number(
+            (primaryRoute.gasEstimate * (await this.getCurrentGasPrice()) * 10000n) /
+              primaryRoute.optimalAmount
+          )
+      ),
+    };
+  }
+
+  /**
+   * Get optimized routes for a specific token pair (public method for external access)
+   */
+  async getOptimizedRoutes(tokenPair: {
+    token0: Address;
+    token1: Address;
+  }): Promise<RouteOptimizationResult | undefined> {
+    const pairKey = this.getPairKey(tokenPair.token0, tokenPair.token1);
+    const poolPairing = this.poolPairings.get(pairKey);
+
+    if (!poolPairing) {
+      return undefined;
+    }
+
+    const allPoolStates = this.poolManager.getAllPoolStates();
+    return this.optimizeRoutes(tokenPair, poolPairing, allPoolStates);
+  }
+
+  /**
+   * Get the best route for a specific token pair
+   */
+  async getBestRoute(tokenPair: {
+    token0: Address;
+    token1: Address;
+  }): Promise<ArbitrageRoute | undefined> {
+    const optimization = await this.getOptimizedRoutes(tokenPair);
+    return optimization?.primaryRoute;
+  }
+
+  /**
+   * Get all viable routes for a specific token pair, sorted by profitability
+   */
+  async getAllViableRoutes(tokenPair: {
+    token0: Address;
+    token1: Address;
+  }): Promise<ArbitrageRoute[]> {
+    const optimization = await this.getOptimizedRoutes(tokenPair);
+    if (!optimization) {
+      return [];
+    }
+
+    return [optimization.primaryRoute, ...optimization.fallbackRoutes];
+  }
+
+  /**
+   * Find the best Uniswap V3 pool (highest liquidity) - kept for backward compatibility
    */
   private findBestUniswapV3Pool(
     poolAddresses: Address[],
