@@ -6,7 +6,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as yaml from 'js-yaml';
+import * as yaml from 'yaml';
 import { EventEmitter } from 'events';
 import { Config } from '../types/config';
 
@@ -42,7 +42,7 @@ export class ConfigLoader extends EventEmitter {
       const ext = path.extname(this.configPath).toLowerCase();
 
       if (ext === '.yaml' || ext === '.yml') {
-        parsedConfig = yaml.load(substitutedContent);
+        parsedConfig = yaml.parse(substitutedContent);
       } else if (ext === '.json') {
         parsedConfig = JSON.parse(substitutedContent);
       } else {
