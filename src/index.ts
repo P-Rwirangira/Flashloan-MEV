@@ -78,7 +78,7 @@ class BaseMEVPlatform extends EventEmitter {
     // Circuit breaker events
     this.circuitBreaker.on('stateChanged', state => {
       this.metricsCollector.updateCircuitBreakerStatus(state);
-      this.platformLogger.logCircuitBreakerStateChange('unknown', state, 'State change detected');
+      this.platformLogger.logCircuitBreakerStateChange('platform', state, 'State change detected');
 
       // Handle graceful degradation
       if (state === 'open' && this.config?.gracefulDegradation.enabled) {
@@ -546,8 +546,18 @@ class BaseMEVPlatform extends EventEmitter {
     if (!this.config) return [];
 
     return Object.entries(this.config.phases)
-      .filter(([_, phase]) => phase.enabled)
-      .map(([name, _]) => name);
+      .filter(([name, phase]) => {
+        // Use both name and phase in the filter logic
+        this.platformLogger.debug(`Checking phase ${name}`, {
+          enabled: phase.enabled,
+          priority: phase.priority,
+        });
+        return phase.enabled;
+      })
+      .map(([name, phase]) => {
+        // Use phase data for additional context
+        return `${name}(priority:${phase.priority})`;
+      });
   }
 
   isHealthy(): boolean {

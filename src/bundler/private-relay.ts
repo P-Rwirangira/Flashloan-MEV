@@ -7,6 +7,7 @@
 
 import { ethers, TransactionRequest } from 'ethers';
 import { EventEmitter } from 'events';
+import { ComponentLogger, createComponentLogger } from '../utils/logger.js';
 
 /**
  * Relay provider types
@@ -71,6 +72,7 @@ export class PrivateRelayManager extends EventEmitter {
   private readonly relays: Map<RelayProvider, RelayConfig>;
   private readonly stats: Map<RelayProvider, RelayStats>;
   private readonly signer: ethers.Signer;
+  private readonly logger: ComponentLogger;
 
   constructor(provider: ethers.Provider, signer: ethers.Signer, relayConfigs: RelayConfig[]) {
     super();
@@ -80,6 +82,7 @@ export class PrivateRelayManager extends EventEmitter {
     this.signer = signer;
     this.relays = new Map();
     this.stats = new Map();
+    this.logger = createComponentLogger('PrivateRelayManager');
 
     // Initialize relay configurations
     for (const config of relayConfigs) {
@@ -275,9 +278,14 @@ export class PrivateRelayManager extends EventEmitter {
    * Submit to local Base node
    */
   private async submitToLocalNode(
-    _config: RelayConfig,
+    config: RelayConfig,
     params: SubmissionParams
   ): Promise<SubmissionResult> {
+    // Validate configuration
+    if (!config.endpoint) {
+      throw new Error('Local node endpoint not configured');
+    }
+
     const { transaction } = params;
 
     try {
@@ -308,7 +316,13 @@ export class PrivateRelayManager extends EventEmitter {
    */
   private getOrderedRelays(): RelayProvider[] {
     const enabledRelays = Array.from(this.relays.entries())
-      .filter(([_, config]) => config.enabled)
+      .filter(([provider, config]) => {
+        if (!config.enabled) {
+          this.logger?.debug(`Relay ${provider} is disabled, skipping`);
+          return false;
+        }
+        return true;
+      })
       .map(([provider, config]) => ({
         provider,
         priority: config.priority,
@@ -349,7 +363,9 @@ export class PrivateRelayManager extends EventEmitter {
   /**
    * Cancel pending transaction
    */
-  async cancelTransaction(_txHash: string, newGasPrice: bigint): Promise<SubmissionResult> {
+  async cancelTransaction(txHash: string, newGasPrice: bigint): Promise<SubmissionResult> {
+    this.logger?.info(`Attempting to cancel transaction ${txHash} with gas price ${newGasPrice}`);
+
     // Create cancellation transaction with higher gas price
     const cancelTx: TransactionRequest = {
       to: await this.signer.getAddress(),
@@ -365,10 +381,12 @@ export class PrivateRelayManager extends EventEmitter {
    * Replace pending transaction
    */
   async replaceTransaction(
-    _originalTxHash: string,
+    originalTxHash: string,
     newTransaction: TransactionRequest,
     newBribe: bigint
   ): Promise<SubmissionResult> {
+    this.logger?.info(`Replacing transaction ${originalTxHash} with new bribe ${newBribe}`);
+
     return this.submitTransaction({
       transaction: newTransaction,
       bribe: newBribe,

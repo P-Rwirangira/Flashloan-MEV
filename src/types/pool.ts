@@ -115,3 +115,131 @@ export interface PoolPrice {
   readonly blockNumber: number;
   readonly confidence: number; // 0-1 scale based on liquidity
 }
+
+// Pool type utilities
+export const PoolTypeUtils = {
+  /**
+   * Check if pool type is supported
+   */
+  isSupportedPoolType: (type: string): type is PoolType => {
+    return Object.values(PoolType).includes(type as PoolType);
+  },
+
+  /**
+   * Get pool type display name
+   */
+  getPoolTypeDisplayName: (type: PoolType): string => {
+    switch (type) {
+      case PoolType.UNISWAP_V3:
+        return 'Uniswap V3';
+      case PoolType.AERODROME_VOLATILE:
+        return 'Aerodrome Volatile';
+      case PoolType.AERODROME_STABLE:
+        return 'Aerodrome Stable';
+      default:
+        return 'Unknown Pool Type';
+    }
+  },
+
+  /**
+   * Check if pool type uses constant product formula
+   */
+  isConstantProductPool: (type: PoolType): boolean => {
+    return type === PoolType.AERODROME_VOLATILE;
+  },
+
+  /**
+   * Check if pool type uses stable swap formula
+   */
+  isStableSwapPool: (type: PoolType): boolean => {
+    return type === PoolType.AERODROME_STABLE;
+  },
+
+  /**
+   * Check if pool type uses concentrated liquidity
+   */
+  isConcentratedLiquidityPool: (type: PoolType): boolean => {
+    return type === PoolType.UNISWAP_V3;
+  },
+
+  /**
+   * Get default fee for pool type
+   */
+  getDefaultFee: (type: PoolType): number => {
+    switch (type) {
+      case PoolType.UNISWAP_V3:
+        return 3000; // 0.3%
+      case PoolType.AERODROME_VOLATILE:
+        return 2000; // 0.2%
+      case PoolType.AERODROME_STABLE:
+        return 200; // 0.02%
+      default:
+        return 3000;
+    }
+  },
+
+  /**
+   * Validate pool state based on type
+   */
+  validatePoolState: (state: AnyPoolState): boolean => {
+    if (!state.address || !state.token0 || !state.token1) {
+      return false;
+    }
+    if (state.token0 === state.token1) {
+      return false;
+    }
+    if (state.fee < 0) {
+      return false;
+    }
+    if (state.lastUpdated <= 0 || state.blockNumber <= 0) {
+      return false;
+    }
+
+    // Type-specific validation
+    switch (state.type) {
+      case PoolType.UNISWAP_V3: {
+        const v3State = state as UniswapV3PoolState;
+        return (
+          BigInt(v3State.sqrtPriceX96.toString()) > 0n && BigInt(v3State.liquidity.toString()) >= 0n
+        );
+      }
+
+      case PoolType.AERODROME_VOLATILE: {
+        const volatileState = state as AerodromeVolatilePoolState;
+        return (
+          BigInt(volatileState.reserve0.toString()) >= 0n &&
+          BigInt(volatileState.reserve1.toString()) >= 0n
+        );
+      }
+
+      case PoolType.AERODROME_STABLE: {
+        const stableState = state as AerodromeStablePoolState;
+        return (
+          BigInt(stableState.reserve0.toString()) >= 0n &&
+          BigInt(stableState.reserve1.toString()) >= 0n &&
+          stableState.decimals0 > 0 &&
+          stableState.decimals1 > 0
+        );
+      }
+
+      default:
+        return false;
+    }
+  },
+
+  /**
+   * Get pool type priority for routing
+   */
+  getPoolTypePriority: (type: PoolType): number => {
+    switch (type) {
+      case PoolType.UNISWAP_V3:
+        return 3; // Highest priority - concentrated liquidity
+      case PoolType.AERODROME_VOLATILE:
+        return 2; // Medium priority - volatile pairs
+      case PoolType.AERODROME_STABLE:
+        return 1; // Lower priority - stable pairs only
+      default:
+        return 0;
+    }
+  },
+};

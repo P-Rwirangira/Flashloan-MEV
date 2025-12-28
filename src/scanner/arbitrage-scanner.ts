@@ -145,8 +145,7 @@ export class ArbitrageScanner extends EventEmitter {
     this.connectionManager = options.connectionManager;
     this.config = options.config;
     this.scanIntervalMs = options.scanIntervalMs ?? 1000; // 1s default for fast arbitrage detection
-    this.priceOracle =
-      options.priceOracle ?? new SimplePriceOracle();
+    this.priceOracle = options.priceOracle ?? new SimplePriceOracle();
 
     this.initializeTokenPairs();
   }
@@ -401,11 +400,11 @@ export class ArbitrageScanner extends EventEmitter {
     // Select primary route and up to maxRoutes-1 fallback routes
     const maxRoutes = Math.min(this.config.maxRoutes, candidateRoutes.length);
     const primaryRoute = candidateRoutes[0];
-    
+
     if (!primaryRoute) {
       return undefined;
     }
-    
+
     const fallbackRoutes = candidateRoutes.slice(1, maxRoutes);
 
     return {

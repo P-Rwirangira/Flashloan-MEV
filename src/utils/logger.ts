@@ -21,24 +21,23 @@ class SimplePerformanceTracker implements PerformanceTracker {
   private marks: { [key: string]: number } = {};
 
   start(): void {
-    this.startTime = performance.now();
-    this.marks = {};
+    this.startTime = Date.now();
+    this.marks = {}; // Reset marks on start
   }
 
   end(): number {
-    if (this.startTime === undefined) {
-      throw new Error('Performance tracker not started');
+    if (!this.startTime) {
+      return 0;
     }
-    const duration = performance.now() - this.startTime;
-    this.startTime = undefined;
-    return duration;
+    return Date.now() - this.startTime;
   }
 
   mark(label: string): void {
-    if (this.startTime === undefined) {
-      throw new Error('Performance tracker not started');
+    if (!this.startTime) {
+      console.warn(`Performance tracker not started, cannot mark: ${label}`);
+      return;
     }
-    this.marks[label] = performance.now() - this.startTime;
+    this.marks[label] = Date.now() - this.startTime;
   }
 
   getMarks(): { [key: string]: number } {

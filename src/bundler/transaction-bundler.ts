@@ -9,6 +9,7 @@ import { ethers, TransactionRequest } from 'ethers';
 import { EventEmitter } from 'events';
 import { PrivateRelayManager, SubmissionParams, SubmissionResult } from './private-relay';
 import { BribeOptimizer, BribeOptimizationParams, CongestionLevel } from './bribe-optimizer';
+import { ComponentLogger, createComponentLogger } from '../utils/logger.js';
 
 /**
  * Bundler configuration
@@ -54,6 +55,7 @@ export class TransactionBundler extends EventEmitter {
   private readonly provider: ethers.Provider;
   private readonly config: BundlerConfig;
   private readonly bribeOptimizer: BribeOptimizer;
+  private readonly logger: ComponentLogger;
 
   private readonly pendingBundles: Map<string, TransactionBundle>;
   private readonly submissionHistory: Map<string, SubmissionResult[]>;
@@ -74,6 +76,7 @@ export class TransactionBundler extends EventEmitter {
     this.provider = provider;
     this.config = config;
     this.bribeOptimizer = bribeOptimizer || new BribeOptimizer();
+    this.logger = createComponentLogger('TransactionBundler');
 
     this.pendingBundles = new Map();
     this.submissionHistory = new Map();
@@ -136,8 +139,10 @@ export class TransactionBundler extends EventEmitter {
    */
   private async submitWithRetry(
     params: SubmissionParams,
-    _bundleId: string
+    bundleId: string
   ): Promise<SubmissionResult> {
+    this.logger?.debug(`Submitting transaction for bundle ${bundleId}, attempt 1`);
+
     let lastError: string = '';
     let currentBribe = params.bribe || 0n;
 
@@ -147,6 +152,9 @@ export class TransactionBundler extends EventEmitter {
         if (attempt > 0 && this.config.dynamicBribing) {
           currentBribe = this.increaseBribe(currentBribe);
           params.bribe = currentBribe;
+          this.logger?.debug(
+            `Bundle ${bundleId}: Increasing bribe to ${currentBribe} for attempt ${attempt + 1}`
+          );
         }
 
         const result = await this.relayManager.submitTransaction(params);

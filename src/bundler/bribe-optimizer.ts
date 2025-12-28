@@ -306,18 +306,40 @@ export class BribeOptimizer extends EventEmitter {
   /**
    * Calculate confidence level based on historical data
    */
-  private calculateConfidenceLevel(_params: BribeOptimizationParams): number {
+  private calculateConfidenceLevel(params: BribeOptimizationParams): number {
     const dataPoints = this.historicalData.length;
 
+    // Base confidence from data quantity
+    let baseConfidence: number;
     if (dataPoints < 10) {
-      return 0.3; // Low confidence with little data
+      baseConfidence = 0.3; // Low confidence with little data
     } else if (dataPoints < 50) {
-      return 0.6; // Medium confidence
+      baseConfidence = 0.6; // Medium confidence
     } else if (dataPoints < 200) {
-      return 0.8; // High confidence
+      baseConfidence = 0.8; // High confidence
     } else {
-      return 0.9; // Very high confidence
+      baseConfidence = 0.9; // Very high confidence
     }
+
+    // Adjust confidence based on optimization parameters
+    let adjustedConfidence = baseConfidence;
+
+    // Reduce confidence for extreme conditions
+    if (params.networkCongestion === CongestionLevel.EXTREME) {
+      adjustedConfidence *= 0.8; // Less predictable in extreme congestion
+    }
+
+    // Reduce confidence for very high urgency (less time for analysis)
+    if (params.timeUrgency > 0.8) {
+      adjustedConfidence *= 0.9;
+    }
+
+    // Reduce confidence for very high target inclusion probability
+    if (params.targetInclusionProbability > 0.9) {
+      adjustedConfidence *= 0.85; // Harder to predict at extreme probabilities
+    }
+
+    return Math.max(0.1, Math.min(0.95, adjustedConfidence));
   }
 
   /**

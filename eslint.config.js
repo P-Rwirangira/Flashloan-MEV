@@ -28,6 +28,6 @@ export default [
     },
   },
   {
-    ignores: ['dist/', 'node_modules/', 'artifacts/', 'cache/', '*.js'],
+    ignores: ['dist/', 'node_modules/', 'artifacts/', 'cache/', '*.js', 'src/test/**/*'],
   },
 ];

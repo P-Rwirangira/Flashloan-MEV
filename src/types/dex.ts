@@ -155,3 +155,118 @@ export interface AggregatorResult {
   readonly savings: BigNumberish; // vs worst route
   readonly timestamp: number;
 }
+
+// Utility functions for DEX types
+export const DexUtils = {
+  /**
+   * Check if a DEX type is supported
+   */
+  isSupportedDex: (dex: string): dex is DexType => {
+    return Object.values(DexType).includes(dex as DexType);
+  },
+
+  /**
+   * Get DEX display name
+   */
+  getDexDisplayName: (dex: DexType): string => {
+    switch (dex) {
+      case DexType.UNISWAP_V3:
+        return 'Uniswap V3';
+      case DexType.AERODROME:
+        return 'Aerodrome';
+      default:
+        return 'Unknown DEX';
+    }
+  },
+
+  /**
+   * Determine swap direction from token addresses
+   */
+  getSwapDirection: (
+    tokenIn: Address,
+    tokenOut: Address,
+    token0: Address,
+    token1: Address
+  ): SwapDirection => {
+    if (
+      tokenIn.toLowerCase() === token0.toLowerCase() &&
+      tokenOut.toLowerCase() === token1.toLowerCase()
+    ) {
+      return SwapDirection.TOKEN0_TO_TOKEN1;
+    } else if (
+      tokenIn.toLowerCase() === token1.toLowerCase() &&
+      tokenOut.toLowerCase() === token0.toLowerCase()
+    ) {
+      return SwapDirection.TOKEN1_TO_TOKEN0;
+    }
+    throw new Error(
+      `Invalid token pair: ${tokenIn}->${tokenOut} not found in pool tokens ${token0}, ${token1}`
+    );
+  },
+
+  /**
+   * Validate swap parameters
+   */
+  validateSwapParams: (params: SwapParams): void => {
+    if (!params.tokenIn || !params.tokenOut) {
+      throw new Error('Token addresses are required');
+    }
+    if (params.tokenIn === params.tokenOut) {
+      throw new Error('Cannot swap same token');
+    }
+    if (!params.amountIn || BigInt(params.amountIn.toString()) <= 0n) {
+      throw new Error('Amount in must be greater than 0');
+    }
+    if (!params.recipient) {
+      throw new Error('Recipient address is required');
+    }
+    if (params.deadline <= Math.floor(Date.now() / 1000)) {
+      throw new Error('Deadline must be in the future');
+    }
+  },
+
+  /**
+   * Validate pool discovery parameters
+   */
+  validatePoolDiscovery: (token0: Address, token1: Address): void => {
+    if (!token0 || !token1) {
+      throw new Error('Both token addresses are required');
+    }
+    if (token0 === token1) {
+      throw new Error('Token addresses must be different');
+    }
+  },
+
+  /**
+   * Validate quote parameters
+   */
+  validateQuoteParams: (tokenIn: Address, tokenOut: Address, amountIn: BigNumberish): void => {
+    if (!tokenIn || !tokenOut) {
+      throw new Error('Token addresses are required for quote');
+    }
+    if (tokenIn === tokenOut) {
+      throw new Error('Cannot quote same token');
+    }
+    if (!amountIn || BigInt(amountIn.toString()) <= 0n) {
+      throw new Error('Amount must be greater than 0 for quote');
+    }
+  },
+};
+
+// Pool state validation utilities
+export const PoolUtils = {
+  /**
+   * Validate pool address and token pair
+   */
+  validatePoolState: (poolAddress: Address, token0: Address, token1: Address): void => {
+    if (!poolAddress) {
+      throw new Error('Pool address is required');
+    }
+    if (!token0 || !token1) {
+      throw new Error('Token addresses are required');
+    }
+    if (token0 === token1) {
+      throw new Error('Pool tokens must be different');
+    }
+  },
+};

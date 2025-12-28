@@ -55,6 +55,14 @@ export class SimplePriceOracle implements IPriceOracle {
   private priceCache: Map<string, { price: number; timestamp: number }> = new Map();
   private readonly cacheTimeMs = 60000; // 1 minute cache
 
+  // Known token addresses on Base
+  private static readonly KNOWN_TOKENS: Record<string, 'stablecoin' | 'weth'> = {
+    '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 'stablecoin', // USDC
+    '0x50c5725949a6f0c72e6c4a641f24049a917db0cb': 'stablecoin', // DAI
+    '0xfde4c96c8593536e31f229ea8f37b2ada2699bb2': 'stablecoin', // USDT
+    '0x4200000000000000000000000000000000000006': 'weth', // WETH
+  };
+
   async getEthUsdPrice(): Promise<number> {
     const cacheKey = 'ETH-USD';
     const cached = this.priceCache.get(cacheKey);
@@ -84,14 +92,27 @@ export class SimplePriceOracle implements IPriceOracle {
     }
 
     try {
-      // In production, this would query price feeds for specific tokens
-      // For now, assume most tokens are stablecoins or ETH-equivalent
       const ethPrice = await this.getEthUsdPrice();
-      const tokenPrice = tokenAddress.toLowerCase().includes('usdc') ? 1 : ethPrice;
+      const tokenAddressLower = tokenAddress.toLowerCase();
+
+      // Use known token mapping for accurate identification
+      const tokenType = SimplePriceOracle.KNOWN_TOKENS[tokenAddressLower];
+
+      let tokenPrice: number;
+      if (tokenType === 'stablecoin') {
+        tokenPrice = 1; // Stablecoin
+      } else if (tokenType === 'weth') {
+        tokenPrice = ethPrice; // WETH
+      } else {
+        // Unknown token - fallback to ETH price (consider integrating a real price oracle)
+        tokenPrice = ethPrice;
+      }
 
       this.priceCache.set(cacheKey, { price: tokenPrice, timestamp: Date.now() });
       return tokenPrice;
     } catch (error) {
+      // Log the tokenAddress for debugging
+      console.warn(`Failed to get price for token ${tokenAddress}, using fallback price`);
       return 1; // Fallback to $1 (stablecoin assumption)
     }
   }

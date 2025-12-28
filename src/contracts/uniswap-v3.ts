@@ -142,11 +142,7 @@ export interface IUniswapV3FlashCallback {
    * @param fee1 Fee for token1 flash loan
    * @param data Callback data passed to flash function
    */
-  uniswapV3FlashCallback(
-    fee0: BigNumberish,
-    fee1: BigNumberish,
-    data: string
-  ): Promise<void>;
+  uniswapV3FlashCallback(fee0: BigNumberish, fee1: BigNumberish, data: string): Promise<void>;
 }
 
 /**
@@ -227,18 +223,136 @@ export const UNISWAP_V3_CONSTANTS = {
     MEDIUM: 3000, // 0.3%
     HIGH: 10000, // 1%
   },
-  
+
   // Tick spacing for each fee tier
   TICK_SPACINGS: {
     500: 10,
     3000: 60,
     10000: 200,
   },
-  
+
   // Price limits
   MIN_SQRT_RATIO: 4295128739n,
   MAX_SQRT_RATIO: 1461446703485210103287273052203988822378723970342n,
-  
+
   // Pool initialization code hash
   POOL_INIT_CODE_HASH: '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54',
 } as const;
+
+/**
+ * Uniswap V3 validation utilities
+ */
+export const UniswapV3Utils = {
+  /**
+   * Validate flash loan parameters
+   */
+  validateFlashParams: (
+    recipient: Address,
+    amount0: BigNumberish,
+    amount1: BigNumberish,
+    data: string
+  ): boolean => {
+    if (!recipient || recipient === '0x0000000000000000000000000000000000000000') {
+      return false;
+    }
+    if (BigInt(amount0.toString()) < 0n || BigInt(amount1.toString()) < 0n) {
+      return false;
+    }
+    if (BigInt(amount0.toString()) === 0n && BigInt(amount1.toString()) === 0n) {
+      return false;
+    }
+    return typeof data === 'string';
+  },
+
+  /**
+   * Validate swap parameters
+   */
+  validateSwapParams: (
+    recipient: Address,
+    zeroForOne: boolean,
+    amountSpecified: BigNumberish,
+    sqrtPriceLimitX96: BigNumberish,
+    data: string
+  ): boolean => {
+    if (!recipient || recipient === '0x0000000000000000000000000000000000000000') {
+      return false;
+    }
+    if (typeof zeroForOne !== 'boolean') {
+      return false;
+    }
+    if (BigInt(amountSpecified.toString()) === 0n) {
+      return false;
+    }
+    const priceLimit = BigInt(sqrtPriceLimitX96.toString());
+    if (
+      priceLimit < UNISWAP_V3_CONSTANTS.MIN_SQRT_RATIO ||
+      priceLimit > UNISWAP_V3_CONSTANTS.MAX_SQRT_RATIO
+    ) {
+      return false;
+    }
+    return typeof data === 'string';
+  },
+
+  /**
+   * Validate tick parameter
+   */
+  validateTickParam: (tick: number): boolean => {
+    return Number.isInteger(tick) && tick >= -887272 && tick <= 887272;
+  },
+
+  /**
+   * Validate factory parameters
+   */
+  validateFactoryParams: (tokenA: Address, tokenB: Address, fee: number): boolean => {
+    if (!tokenA || !tokenB) {
+      return false;
+    }
+    if (tokenA === tokenB) {
+      return false;
+    }
+    if (
+      tokenA === '0x0000000000000000000000000000000000000000' ||
+      tokenB === '0x0000000000000000000000000000000000000000'
+    ) {
+      return false;
+    }
+    return (Object.values(UNISWAP_V3_CONSTANTS.FEE_TIERS) as number[]).includes(fee);
+  },
+
+  /**
+   * Validate fee tier parameter
+   */
+  validateFeeParam: (fee: number): boolean => {
+    return (Object.values(UNISWAP_V3_CONSTANTS.FEE_TIERS) as number[]).includes(fee);
+  },
+
+  /**
+   * Validate flash callback parameters
+   */
+  validateFlashCallbackParams: (fee0: BigNumberish, fee1: BigNumberish, data: string): boolean => {
+    if (BigInt(fee0.toString()) < 0n || BigInt(fee1.toString()) < 0n) {
+      return false;
+    }
+    return typeof data === 'string';
+  },
+
+  /**
+   * Validate swap callback parameters
+   */
+  validateSwapCallbackParams: (
+    amount0Delta: BigNumberish,
+    amount1Delta: BigNumberish,
+    data: string
+  ): boolean => {
+    // Deltas can be positive or negative
+    const delta0 = BigInt(amount0Delta.toString());
+    const delta1 = BigInt(amount1Delta.toString());
+
+    // At least one delta should be non-zero
+    if (delta0 === 0n && delta1 === 0n) {
+      return false;
+    }
+
+    return typeof data === 'string';
+  },
+};

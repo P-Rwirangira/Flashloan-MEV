@@ -151,10 +151,7 @@ export interface IAerodromeRouter {
    * @param amountIn Input amount
    * @param routes Swap route array
    */
-  getAmountsOut(
-    amountIn: BigNumberish,
-    routes: SwapRoute[]
-  ): Promise<BigNumberish[]>;
+  getAmountsOut(amountIn: BigNumberish, routes: SwapRoute[]): Promise<BigNumberish[]>;
 
   /**
    * Execute exact input swap
@@ -250,16 +247,16 @@ export const AERODROME_CONSTANTS = {
     VOLATILE: 30, // 0.3%
     STABLE: 1, // 0.01%
   },
-  
+
   // Minimum liquidity for new pairs
   MINIMUM_LIQUIDITY: 1000n,
-  
+
   // Maximum fee (in basis points)
   MAX_FEE: 10000, // 100%
-  
+
   // Stable swap A parameter (amplification coefficient)
   STABLE_A: 85n,
-  
+
   // Precision for stable swap calculations
   STABLE_PRECISION: 10n ** 18n,
 } as const;
@@ -331,3 +328,170 @@ export interface GaugeInfo {
   readonly lastUpdateTime: number;
   readonly rewardPerTokenStored: BigNumberish;
 }
+
+/**
+ * Aerodrome validation utilities
+ */
+export const AerodromeUtils = {
+  /**
+   * Validate swap parameters
+   */
+  validateSwapParams: (
+    amount0Out: BigNumberish,
+    amount1Out: BigNumberish,
+    to: Address,
+    data: string
+  ): boolean => {
+    if (BigInt(amount0Out.toString()) < 0n || BigInt(amount1Out.toString()) < 0n) {
+      return false;
+    }
+    if (BigInt(amount0Out.toString()) === 0n && BigInt(amount1Out.toString()) === 0n) {
+      return false;
+    }
+    if (!to || to === '0x0000000000000000000000000000000000000000') {
+      return false;
+    }
+    // Data can be empty for direct swaps
+    return typeof data === 'string';
+  },
+
+  /**
+   * Validate amount out parameters
+   */
+  validateAmountOut: (amountIn: BigNumberish, tokenIn: Address): boolean => {
+    if (BigInt(amountIn.toString()) <= 0n) {
+      return false;
+    }
+    if (!tokenIn || tokenIn === '0x0000000000000000000000000000000000000000') {
+      return false;
+    }
+    return true;
+  },
+
+  /**
+   * Validate skim parameters
+   */
+  validateSkimParams: (to: Address): boolean => {
+    return to !== '0x0000000000000000000000000000000000000000';
+  },
+
+  /**
+   * Validate current price parameters
+   */
+  validateCurrentParams: (tokenIn: Address, amountIn: BigNumberish): boolean => {
+    if (!tokenIn || tokenIn === '0x0000000000000000000000000000000000000000') {
+      return false;
+    }
+    return BigInt(amountIn.toString()) > 0n;
+  },
+
+  /**
+   * Validate sample parameters
+   */
+  validateSampleParams: (
+    tokenIn: Address,
+    amountIn: BigNumberish,
+    points: number,
+    window: number
+  ): boolean => {
+    if (!tokenIn || tokenIn === '0x0000000000000000000000000000000000000000') {
+      return false;
+    }
+    if (BigInt(amountIn.toString()) <= 0n) {
+      return false;
+    }
+    if (points <= 0 || points > 100) {
+      return false;
+    }
+    if (window <= 0 || window > 86400) {
+      // Max 24 hours
+      return false;
+    }
+    return true;
+  },
+
+  /**
+   * Validate factory pair parameters
+   */
+  validatePairParams: (tokenA: Address, tokenB: Address, stable: boolean): boolean => {
+    if (!tokenA || !tokenB) {
+      return false;
+    }
+    if (tokenA === tokenB) {
+      return false;
+    }
+    if (
+      tokenA === '0x0000000000000000000000000000000000000000' ||
+      tokenB === '0x0000000000000000000000000000000000000000'
+    ) {
+      return false;
+    }
+    return typeof stable === 'boolean';
+  },
+
+  /**
+   * Validate factory index parameter
+   */
+  validateIndexParam: (index: number): boolean => {
+    return index >= 0 && Number.isInteger(index);
+  },
+
+  /**
+   * Validate stable parameter for fee calculation
+   */
+  validateStableParam: (stable: boolean): boolean => {
+    return typeof stable === 'boolean';
+  },
+
+  /**
+   * Validate router swap parameters
+   */
+  validateRouterSwapParams: (amountIn: BigNumberish, routes: any[]): boolean => {
+    if (BigInt(amountIn.toString()) <= 0n) {
+      return false;
+    }
+    if (!Array.isArray(routes) || routes.length === 0) {
+      return false;
+    }
+    return true;
+  },
+
+  /**
+   * Validate exact tokens for tokens swap parameters
+   */
+  validateExactTokensSwapParams: (
+    amountIn: BigNumberish,
+    amountOutMin: BigNumberish,
+    routes: any[],
+    to: Address,
+    deadline: number
+  ): boolean => {
+    if (BigInt(amountIn.toString()) <= 0n || BigInt(amountOutMin.toString()) < 0n) {
+      return false;
+    }
+    if (!Array.isArray(routes) || routes.length === 0) {
+      return false;
+    }
+    if (!to || to === '0x0000000000000000000000000000000000000000') {
+      return false;
+    }
+    if (deadline <= Date.now() / 1000) {
+      return false;
+    }
+    return true;
+  },
+
+  /**
+   * Validate gauge account parameter
+   */
+  validateAccountParam: (account: Address): boolean => {
+    return account !== '0x0000000000000000000000000000000000000000';
+  },
+
+  /**
+   * Validate gauge amount parameter
+   */
+  validateAmountParam: (amount: BigNumberish): boolean => {
+    return BigInt(amount.toString()) > 0n;
+  },
+};

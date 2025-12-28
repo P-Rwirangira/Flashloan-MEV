@@ -14,6 +14,87 @@ export enum ErrorSeverity {
   CRITICAL = 'critical',
 }
 
+// Error severity utilities
+export const ErrorUtils = {
+  /**
+   * Determine if error severity requires immediate attention
+   */
+  requiresImmediateAttention: (severity: ErrorSeverity): boolean => {
+    return severity === ErrorSeverity.CRITICAL || severity === ErrorSeverity.HIGH;
+  },
+
+  /**
+   * Get error severity level as numeric value for comparison
+   */
+  getSeverityLevel: (severity: ErrorSeverity): number => {
+    switch (severity) {
+      case ErrorSeverity.LOW:
+        return 1;
+      case ErrorSeverity.MEDIUM:
+        return 2;
+      case ErrorSeverity.HIGH:
+        return 3;
+      case ErrorSeverity.CRITICAL:
+        return 4;
+      default:
+        return 0;
+    }
+  },
+
+  /**
+   * Validate error code format
+   */
+  validateErrorCode: (code: string): boolean => {
+    return /^[A-Z_]+$/.test(code) && code.length > 0;
+  },
+
+  /**
+   * Create error context with code validation
+   */
+  createErrorContext: (
+    code: string,
+    additionalContext?: Record<string, unknown>
+  ): Record<string, unknown> => {
+    if (!ErrorUtils.validateErrorCode(code)) {
+      throw new Error(`Invalid error code format: ${code}`);
+    }
+    return {
+      errorCode: code,
+      timestamp: Date.now(),
+      ...additionalContext,
+    };
+  },
+
+  /**
+   * Format error for logging with code and severity
+   */
+  formatErrorForLogging: (error: MevPlatformError): Record<string, unknown> => {
+    return {
+      message: error.message,
+      code: error.code,
+      severity: error.severity,
+      timestamp: error.timestamp,
+      context: error.context,
+      stack: error.stack,
+    };
+  },
+
+  /**
+   * Check if error should trigger circuit breaker
+   */
+  shouldTriggerCircuitBreaker: (severity: ErrorSeverity): boolean => {
+    return severity === ErrorSeverity.CRITICAL;
+  },
+
+  /**
+   * Get retry delay based on error severity
+   */
+  getRetryDelay: (severity: ErrorSeverity, attempt: number): number => {
+    const baseDelay = ErrorUtils.getSeverityLevel(severity) * 1000; // Base delay in ms
+    return baseDelay * Math.pow(2, attempt - 1); // Exponential backoff
+  },
+};
+
 // Base MEV platform error
 export class MevPlatformError extends Error {
   public readonly severity: ErrorSeverity;
@@ -30,7 +111,18 @@ export class MevPlatformError extends Error {
     this.name = 'MevPlatformError';
     this.severity = severity;
     this.timestamp = Date.now();
-    this.context = context;
+    this.context = {
+      ...context,
+      errorCode: code, // Use the code parameter in context
+      errorTimestamp: this.timestamp,
+    };
+
+    // Validate error code format
+    if (!ErrorUtils.validateErrorCode(code)) {
+      console.warn(
+        `Invalid error code format: ${code}. Expected uppercase letters and underscores only.`
+      );
+    }
   }
 }
 

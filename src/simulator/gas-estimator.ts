@@ -241,9 +241,17 @@ export class GasEstimator extends EventEmitter {
   /**
    * Get fallback gas estimate
    */
-  private getFallbackEstimate(_opportunity: ArbitrageOpportunity): GasEstimate {
+  private getFallbackEstimate(opportunity: ArbitrageOpportunity): GasEstimate {
     const fallbackGasLimit = 400000n; // Conservative 400k gas
     const gasPrices = this.getFallbackGasPrices();
+
+    // Log fallback usage for monitoring
+    this.emit('fallbackEstimateUsed', {
+      opportunityId: opportunity.id,
+      opportunityType: opportunity.type,
+      routeComplexity: opportunity.route.pools.length,
+      fallbackGasLimit: fallbackGasLimit.toString(),
+    });
 
     return {
       gasLimit: fallbackGasLimit,

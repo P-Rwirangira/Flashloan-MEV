@@ -93,7 +93,7 @@ export class FoundrySimulator extends EventEmitter {
     this.anvilPort = options.anvilPort || 8545;
     this.simulationTimeoutMs = options.simulationTimeoutMs || 50; // 50ms for latency requirement
     this.maxConcurrentSimulations = options.maxConcurrentSimulations || 5;
-    
+
     // Default timeout configuration
     this.timeoutConfig = {
       maxSimulationTimeMs: this.simulationTimeoutMs,
@@ -218,14 +218,13 @@ export class FoundrySimulator extends EventEmitter {
       });
 
       // Execute simulation with timeout
-      const result = await Promise.race([
-        this.performSimulation(opportunity),
-        timeoutPromise,
-      ]);
+      const result = await Promise.race([this.performSimulation(opportunity), timeoutPromise]);
 
       resolve(result);
     } catch (error) {
-      reject(error instanceof Error ? error : new Error(String(error)));
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.emit('simulationError', { opportunityId: opportunity.id, error: errorMessage });
+      reject(error instanceof Error ? error : new Error(errorMessage));
     } finally {
       this.activeSimulations--;
       this.processQueue();
@@ -248,17 +247,29 @@ export class FoundrySimulator extends EventEmitter {
       // Clean up fork
       this.activeForks.delete(fork.forkId);
 
-      return {
+      const finalResult = {
         ...simulationResult,
         executionTime: Date.now() - startTime,
       };
+
+      this.emit('simulationCompleted', {
+        opportunityId: opportunity.id,
+        success: finalResult.success,
+        profit: finalResult.actualProfit.toString(),
+        gasUsed: finalResult.gasUsed.toString(),
+      });
+
+      return finalResult;
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.emit('simulationFailed', { opportunityId: opportunity.id, error: errorMessage });
+
       return {
         success: false,
         gasUsed: 0n,
         actualProfit: 0n,
         executionTime: Date.now() - startTime,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage,
       };
     }
   }
@@ -324,7 +335,7 @@ export class FoundrySimulator extends EventEmitter {
    */
   private async simulateFlashLoan(
     opportunity: ArbitrageOpportunity,
-    _wallet: ethers.HDNodeWallet
+    wallet: ethers.HDNodeWallet
   ): Promise<{
     success: boolean;
     gasUsed: bigint;
@@ -334,6 +345,13 @@ export class FoundrySimulator extends EventEmitter {
     try {
       // For simulation, we'll estimate the gas and execution without deploying contracts
       // In a real implementation, this would interact with the actual Flash Executor contract
+
+      // Log wallet usage for debugging
+      this.emit('walletUsed', {
+        walletAddress: wallet.address,
+        opportunityId: opportunity.id,
+        balance: (await wallet.provider?.getBalance(wallet.address)) || 0n,
+      });
 
       // Estimate gas for the complete arbitrage transaction
       const estimatedGas = await this.estimateArbitrageGas(opportunity);
@@ -436,7 +454,7 @@ export class FoundrySimulator extends EventEmitter {
       if (!provider) {
         return 0n;
       }
-      
+
       const feeData = await provider.getFeeData();
       const gasPrice = feeData.gasPrice || ethers.parseUnits('2', 'gwei');
 
@@ -448,7 +466,8 @@ export class FoundrySimulator extends EventEmitter {
 
       // Simulate slippage impact
       const expectedProfit = BigInt(opportunity.expectedProfit.toString());
-      const slippageImpact = (expectedProfit * BigInt(opportunity.slippageTolerance * 100)) / 10000n;
+      const slippageImpact =
+        (expectedProfit * BigInt(opportunity.slippageTolerance * 100)) / 10000n;
 
       // Calculate net profit
       const grossProfit = expectedProfit - slippageImpact;
@@ -464,7 +483,10 @@ export class FoundrySimulator extends EventEmitter {
    * Process simulation queue
    */
   private processQueue(): void {
-    if (this.simulationQueue.length === 0 || this.activeSimulations >= this.maxConcurrentSimulations) {
+    if (
+      this.simulationQueue.length === 0 ||
+      this.activeSimulations >= this.maxConcurrentSimulations
+    ) {
       return;
     }
 
@@ -492,14 +514,14 @@ export class FoundrySimulator extends EventEmitter {
 
       let isResolved = false;
 
-      this.anvilProcess.on('error', (error) => {
+      this.anvilProcess.on('error', error => {
         if (!isResolved) {
           isResolved = true;
           reject(new Error(`Failed to start Anvil: ${error.message}`));
         }
       });
 
-      this.anvilProcess.on('exit', (code) => {
+      this.anvilProcess.on('exit', code => {
         if (!isResolved && code !== 0) {
           isResolved = true;
           reject(new Error(`Anvil exited with code ${code}`));

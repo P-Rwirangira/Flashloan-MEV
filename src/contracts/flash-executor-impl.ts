@@ -24,16 +24,16 @@ import { Address, AsyncResult } from '../types/common';
 const FLASH_EXECUTOR_ABI = [
   // Main execution function
   'function executeArbitrage(address flashPool, uint256 amount0, uint256 amount1, bytes calldata routeData) external',
-  
+
   // Flash callback (called by Uniswap V3 pool)
   'function uniswapV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external',
-  
+
   // View functions
   'function isAuthorizedPool(address pool) external view returns (bool)',
   'function getMinProfit() external view returns (uint256)',
   'function isPaused() external view returns (bool)',
   'function owner() external view returns (address)',
-  
+
   // Admin functions
   'function setMinProfit(uint256 minProfit) external',
   'function addAuthorizedPool(address pool) external',
@@ -41,7 +41,7 @@ const FLASH_EXECUTOR_ABI = [
   'function pause() external',
   'function unpause() external',
   'function emergencyWithdraw(address token, uint256 amount) external',
-  
+
   // Events
   'event ArbitrageExecuted(address indexed caller, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 profit, uint256 gasUsed)',
   'event ArbitrageFailed(address indexed caller, string reason, uint256 gasUsed)',
@@ -80,11 +80,7 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     this.safetyConfig = safetyConfig;
 
     // Create contract instance
-    this.contract = new Contract(
-      contractAddress,
-      FLASH_EXECUTOR_ABI,
-      signer || provider
-    );
+    this.contract = new Contract(contractAddress, FLASH_EXECUTOR_ABI, signer || provider);
 
     if (signer) {
       this.signer = signer;
@@ -112,10 +108,10 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
       // Verify contract is deployed and accessible
       // @ts-ignore - Contract is guaranteed to be initialized in constructor
       await this.getContract()['owner']();
-      
+
       // Verify configuration matches contract state
       await this.validateConfiguration();
-      
+
       this.isInitialized = true;
       this.emit('initialized');
     } catch (error) {
@@ -168,7 +164,7 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
 
       // Wait for confirmation
       const receipt = await tx.wait();
-      
+
       this.executionCount++;
       this.totalGasUsed += BigInt(receipt.gasUsed.toString());
 
@@ -177,7 +173,6 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
         gasUsed: receipt.gasUsed,
         blockNumber: receipt.blockNumber,
       });
-
     } catch (error) {
       this.emit('arbitrageFailed', {
         error: error instanceof Error ? error.message : String(error),
@@ -421,15 +416,10 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     // Encode route data as bytes for contract call
     // This would typically use ethers.js ABI encoding
     const abiCoder = ethers.AbiCoder.defaultAbiCoder();
-    
+
     return abiCoder.encode(
       ['address[]', 'bool[]', 'uint256', 'uint256'],
-      [
-        routeData.pools,
-        routeData.directions,
-        routeData.minProfit,
-        routeData.deadline,
-      ]
+      [routeData.pools, routeData.directions, routeData.minProfit, routeData.deadline]
     );
   }
 
@@ -441,7 +431,7 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
       // Check minimum profit matches
       const contractMinProfit = await this.getMinProfit();
       const configMinProfit = BigInt(this.config.minProfitWei.toString());
-      
+
       if (BigInt(contractMinProfit.toString()) !== configMinProfit) {
         console.warn('Configuration minimum profit does not match contract state');
       }
@@ -463,22 +453,25 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
    */
   private setupEventListeners(): void {
     const contract = this.getContract();
-    
+
     // Listen for ArbitrageExecuted events
-    contract.on('ArbitrageExecuted', (caller, tokenIn, tokenOut, amountIn, profit, gasUsed, event) => {
-      this.totalProfit += BigInt(profit.toString());
-      
-      this.emit('ArbitrageExecuted', {
-        caller,
-        tokenIn,
-        tokenOut,
-        amountIn,
-        profit,
-        gasUsed,
-        blockNumber: event.blockNumber,
-        transactionHash: event.transactionHash,
-      });
-    });
+    contract.on(
+      'ArbitrageExecuted',
+      (caller, tokenIn, tokenOut, amountIn, profit, gasUsed, event) => {
+        this.totalProfit += BigInt(profit.toString());
+
+        this.emit('ArbitrageExecuted', {
+          caller,
+          tokenIn,
+          tokenOut,
+          amountIn,
+          profit,
+          gasUsed,
+          blockNumber: event.blockNumber,
+          transactionHash: event.transactionHash,
+        });
+      }
+    );
 
     // Listen for ArbitrageFailed events
     contract.on('ArbitrageFailed', (caller, reason, gasUsed, event) => {
@@ -546,7 +539,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
       executionCount: this.executionCount,
       totalGasUsed: this.totalGasUsed,
       totalProfit: this.totalProfit,
-      averageGasPerExecution: this.executionCount > 0 ? this.totalGasUsed / BigInt(this.executionCount) : 0n,
+      averageGasPerExecution:
+        this.executionCount > 0 ? this.totalGasUsed / BigInt(this.executionCount) : 0n,
       isInitialized: this.isInitialized,
     };
   }
@@ -579,7 +573,7 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     // Remove all event listeners
     this.getContract().removeAllListeners();
     this.removeAllListeners();
-    
+
     this.isInitialized = false;
   }
 }

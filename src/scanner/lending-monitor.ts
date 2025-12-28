@@ -323,7 +323,12 @@ class MoonwellMonitor extends ProtocolMonitor {
     // 3. Estimate gas costs and profits
     // 4. Return viable liquidation opportunities
 
-    this.logger.debug('Scanning Moonwell for liquidation opportunities', { blockNumber });
+    this.logger.debug('Scanning Moonwell for liquidation opportunities', {
+      blockNumber,
+      protocol: this.config.protocol,
+      comptroller: this.config.comptrollerAddress,
+      minProfit: this.config.minProfitThreshold.toString(),
+    });
 
     // Placeholder implementation
     return [];
