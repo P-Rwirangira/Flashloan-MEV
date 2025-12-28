@@ -1,81 +1,201 @@
-# Base MEV Platform Default Configuration
+# Base MEV Platform Configuration
+# This is the default configuration for the Base MEV platform
 
-# Network Configuration
+# Network configuration
 network:
-  base:
-    chainId: 8453
-    name: "Base Mainnet"
-    rpcUrl: "${BASE_RPC_URL:-http://localhost:8545}"
-    wsUrl: "${BASE_WS_URL:-ws://localhost:8546}"
-    fallbackRpcs:
-      - "${ALCHEMY_BASE_URL}"
-      - "${INFURA_BASE_URL}"
+  chainId: 8453  # Base mainnet
+  name: "base"
+  rpcUrl: "https://mainnet.base.org"
+  wsUrl: "${WS_URL:}"
+  fallbackRpcs:
+    - "https://base.llamarpc.com"
+    - "https://base.blockpi.network/v1/rpc/public"
 
-# Strategy Configuration
+# Gas configuration
+gas:
+  maxGasPrice: "${MAX_GAS_PRICE:50}"  # 50 gwei
+  gasLimit: 500000
+  priorityFee: "${PRIORITY_FEE:2}"
+  baseFeeMultiplier: 1.2
+
+# Timing configuration
+timing:
+  maxLatencyMs: 200
+  timeoutMs: 5000
+  retryDelayMs: 100
+  maxRetries: 3
+  simulationTimeoutMs: 50
+
+# Security configuration
+security:
+  maxConcurrentTx: 5
+  maxDailyLoss: 1000  # USD
+  emergencyStop: false
+  allowedCallers: []
+  rateLimits:
+    requestsPerSecond: 100
+    burstSize: 200
+
+# Performance configuration
+performance:
+  maxLatencyMs: 150
+  simulationTimeoutMs: 50
+  maxRetries: 3
+  batchSize: 10
+  cacheSize: 1000
+  cacheTtlMs: 30000
+
+# Strategy configurations
 strategies:
   arbitrage:
     enabled: true
-    minProfitUSD: 20
-    maxSlippageBps: 50
-    maxGasPriceGwei: 10
+    minProfitUSD: 5.0
+    maxSlippageBps: 50  # 0.5%
+    maxGasPriceGwei: 50
+    maxPositionSize: 10000  # USD
+    cooldownMs: 1000
     pairs:
       - "WETH/USDC"
       - "wstETH/ETH"
-      - "USDC/DAI"
-  
+    maxRoutes: 3
+    fallbackRoutes: 2
+    minSpreadBps: 10  # 0.1%
+    maxPriceImpactBps: 100  # 1%
+    dexPriority:
+      - "uniswap-v3"
+      - "aerodrome"
+    competitionThreshold: 2
+
   liquidation:
-    enabled: false # Phase 2
-    minHealthFactor: 1.0
+    enabled: false  # Phase 2
+    minProfitUSD: 10.0
+    maxSlippageBps: 100
+    maxGasPriceGwei: 100
+    maxPositionSize: 50000
+    cooldownMs: 5000
+    minHealthFactor: 0.95
     maxCloseFactor: 0.5
     protocols:
       - "moonwell"
       - "aave-v3"
       - "seamless"
-  
-  rebalancing:
-    enabled: false # Phase 3
-    minImbalanceBps: 100
-    incentiveThreshold: 0.1
+    minLiquidationBonus: 0.05
+    maxLiquidationAmount: 100000
+    healthFactorBuffer: 0.02
 
-# Pool Allowlists
+  rebalancing:
+    enabled: false  # Phase 3
+    minProfitUSD: 3.0
+    maxSlippageBps: 30
+    maxGasPriceGwei: 30
+    maxPositionSize: 5000
+    cooldownMs: 2000
+    minImbalanceBps: 50
+    incentiveThreshold: 0.1
+    stablePools: []
+    maxRebalanceAmount: 20000
+    targetUtilization: 0.8
+
+# Pool allowlists
 allowedPools:
   uniswapV3:
-    # WETH/USDC 0.05%
-    - "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18"
-    # WETH/USDC 0.3%
-    - "0xd0b53D9277642d899DF5C87A3966A349A798F224"
-  
+    - address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18"  # WETH/USDC 0.05%
+      enabled: true
+      priority: 1
+      minTvl: 1000000
+      maxSlippage: 0.01
+      tags: ["high-volume", "stable"]
+    - address: "0xd0b53D9277642d899DF5C87A3966A349A798F224"  # WETH/USDC 0.3%
+      enabled: true
+      priority: 2
+      minTvl: 500000
+      maxSlippage: 0.02
+      tags: ["medium-volume"]
+
   aerodrome:
-    # WETH/USDC volatile
-    - "0xcDAC0d6c6C59727a65F871236188350531885C43"
+    - address: "0xcDAC0d6c6C59727a65F871236188350531885C43"  # WETH/USDC volatile
+      enabled: true
+      priority: 1
+      minTvl: 500000
+      maxSlippage: 0.02
+      tags: ["volatile", "high-volume"]
 
-# Relay Configuration
+# Token allowlists
+allowedTokens:
+  - address: "0x4200000000000000000000000000000000000006"  # WETH
+    symbol: "WETH"
+    decimals: 18
+    enabled: true
+    trusted: true
+    maxAmount: 100
+  - address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC
+    symbol: "USDC"
+    decimals: 6
+    enabled: true
+    trusted: true
+    maxAmount: 200000
+
+# Relay configuration
 relays:
-  primary: "bloxroute"
+  primary: "flashbots"
   fallbacks:
-    - "flashbots"
+    - "bloxroute"
     - "local"
-  maxBribeGwei: 5
-  
-  bloxroute:
-    apiKey: "${BLOXROUTE_API_KEY}"
-    endpoint: "https://api.blxrbdn.com"
-  
-  flashbots:
-    endpoint: "${FLASHBOTS_PROTECT_URL:-https://rpc.flashbots.net}"
+  maxBribeGwei: 10
+  retryAttempts: 3
+  timeoutMs: 2000
+  endpoints:
+    flashbots:
+      name: "Flashbots Protect"
+      url: "https://rpc.flashbots.net"
+      enabled: true
+      priority: 1
+      maxLatencyMs: 500
+      rateLimit: 100
+    bloxroute:
+      name: "bloXroute BDN"
+      url: "https://base.bdn.blxrbdn.com"
+      apiKey: "${BLOXROUTE_API_KEY:}"
+      enabled: true
+      priority: 2
+      maxLatencyMs: 300
+      rateLimit: 200
+    local:
+      name: "Local Node"
+      url: "http://localhost:8545"
+      enabled: true
+      priority: 3
+      maxLatencyMs: 100
+      rateLimit: 1000
 
-# Monitoring Configuration
+# Monitoring configuration
 monitoring:
-  metricsPort: 3001
-  healthCheckPort: 3002
+  metricsPort: 9090
+  healthCheckPort: 8080
+  logLevel: "info"
   alerting:
     consecutiveRevertThreshold: 5
     latencyThresholdMs: 300
-    successRateThreshold: 0.3
+    successRateThreshold: 0.7
+    profitThresholdUSD: 1.0
+    alerts:
+      slack:
+        enabled: false
+        webhook: "${SLACK_WEBHOOK_URL:}"
+        threshold: 3
+        cooldownMs: 300000
+      email:
+        enabled: false
+        email: "${ALERT_EMAIL:}"
+        threshold: 5
+        cooldownMs: 600000
+  circuitBreaker:
+    enabled: true
+    failureThreshold: 10
+    recoveryTimeMs: 60000
+    halfOpenMaxCalls: 5
 
-# Performance Configuration
-performance:
-  maxLatencyMs: 150
-  simulationTimeoutMs: 50
-  maxRetries: 3
-  retryDelayMs: 100
+# Environment settings
+environment: "development"
+debug: true
+dryRun: true
