@@ -1,12 +1,8 @@
 /**
- * RPC Connection Layer
+ * RPC Module
  *
- * Manages connections to Base blockchain nodes with failover support.
- * Provides WebSocket and HTTP connections with health monitoring.
+ * Blockchain RPC connection management for Base network.
  */
 
-// Re-export RPC components
 export * from './connection-manager';
-export * from './websocket-client';
-export * from './http-client';
-export * from './health-monitor';
+export * from './provider-factory';
