@@ -9,6 +9,7 @@ import { Address } from '../types/common';
 import { PoolState } from '../types/pool';
 import { PoolAllowlists, PoolAllowlist } from '../types/config';
 import { UniswapV3Monitor } from './uniswap-v3-monitor';
+import { AerodromeMonitor } from './aerodrome-monitor';
 import { RpcConnectionManager } from '../rpc/connection-manager';
 
 export interface PoolManagerOptions {
@@ -30,7 +31,7 @@ export class PoolManager extends EventEmitter {
 
   // Pool monitors
   private uniswapV3Monitor?: UniswapV3Monitor;
-  private aerodromeMonitor?: any; // Will be implemented in next task
+  private aerodromeMonitor?: AerodromeMonitor;
 
   // Allowlist enforcement
   private allowlistViolations: Map<Address, AllowlistViolation> = new Map();
@@ -53,9 +54,9 @@ export class PoolManager extends EventEmitter {
         await this.initializeUniswapV3Monitor();
       }
 
-      // Initialize Aerodrome monitor (placeholder for next task)
+      // Initialize Aerodrome monitor
       if (this.allowedPools.aerodrome.length > 0) {
-        // await this.initializeAerodromeMonitor();
+        await this.initializeAerodromeMonitor();
       }
 
       this.emit('initialized');
@@ -76,7 +77,7 @@ export class PoolManager extends EventEmitter {
     }
 
     if (this.aerodromeMonitor) {
-      // promises.push(this.aerodromeMonitor.startMonitoring());
+      promises.push(this.aerodromeMonitor.startMonitoring());
     }
 
     await Promise.all(promises);
@@ -94,7 +95,7 @@ export class PoolManager extends EventEmitter {
     }
 
     if (this.aerodromeMonitor) {
-      // promises.push(this.aerodromeMonitor.stopMonitoring());
+      promises.push(this.aerodromeMonitor.stopMonitoring());
     }
 
     await Promise.all(promises);
@@ -113,8 +114,8 @@ export class PoolManager extends EventEmitter {
 
     // Check Aerodrome pools
     if (this.aerodromeMonitor) {
-      // const state = this.aerodromeMonitor.getPoolState(poolAddress);
-      // if (state) return state;
+      const state = this.aerodromeMonitor.getPoolState(poolAddress);
+      if (state) return state;
     }
 
     return undefined;
@@ -136,10 +137,10 @@ export class PoolManager extends EventEmitter {
 
     // Add Aerodrome pools
     if (this.aerodromeMonitor) {
-      // const aeroStates = this.aerodromeMonitor.getAllPoolStates();
-      // aeroStates.forEach((state, address) => {
-      //   allStates.set(address, state);
-      // });
+      const aeroStates = this.aerodromeMonitor.getAllPoolStates();
+      aeroStates.forEach((state, address) => {
+        allStates.set(address, state);
+      });
     }
 
     return allStates;
@@ -195,8 +196,25 @@ export class PoolManager extends EventEmitter {
       }
     }
 
-    // Update Aerodrome pools (placeholder)
-    // Similar logic for Aerodrome pools
+    // Update Aerodrome pools
+    if (this.aerodromeMonitor) {
+      // Remove pools no longer in allowlist
+      const currentAeroPools = this.aerodromeMonitor.getMonitoredPools();
+      const newAeroAddresses = new Set(newAllowlists.aerodrome.map(p => p.address));
+
+      for (const poolAddress of currentAeroPools) {
+        if (!newAeroAddresses.has(poolAddress)) {
+          this.aerodromeMonitor.removePool(poolAddress);
+        }
+      }
+
+      // Add new pools
+      for (const poolConfig of newAllowlists.aerodrome) {
+        if (poolConfig.enabled && !currentAeroPools.includes(poolConfig.address)) {
+          await this.aerodromeMonitor.addPool(poolConfig);
+        }
+      }
+    }
 
     // Update internal allowlists
     this.allowedPools = { ...newAllowlists }; // Create new mutable copy
@@ -224,6 +242,30 @@ export class PoolManager extends EventEmitter {
     });
 
     this.uniswapV3Monitor.on('monitoringError', error => {
+      this.emit('monitoringError', error);
+    });
+  }
+
+  /**
+   * Initialize Aerodrome monitor
+   */
+  private async initializeAerodromeMonitor(): Promise<void> {
+    this.aerodromeMonitor = new AerodromeMonitor({
+      connectionManager: this.connectionManager,
+      allowedPools: this.allowedPools.aerodrome,
+      updateIntervalMs: this.updateIntervalMs,
+    });
+
+    // Forward events
+    this.aerodromeMonitor.on('poolUpdated', event => {
+      this.emit('poolUpdated', event);
+    });
+
+    this.aerodromeMonitor.on('poolUpdateError', (poolAddress, error) => {
+      this.emit('poolFetchError', poolAddress, error);
+    });
+
+    this.aerodromeMonitor.on('monitoringError', error => {
       this.emit('monitoringError', error);
     });
   }
