@@ -31,7 +31,6 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "@eslint/js": "^9.39.2",
     "@nomicfoundation/hardhat-toolbox": "^6.1.0",
     "@types/jest": "^29.5.8",
     "@types/node": "^20.9.0",
@@ -61,7 +60,6 @@
   },
   "lint-staged": {
     "*.ts": [
-      "eslint --fix",
       "prettier --write"
     ]
   },

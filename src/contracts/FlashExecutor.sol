@@ -243,10 +243,17 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
             revert InsufficientProfitError(0, callbackData.route.minProfit);
         }
 
-        // Calculate profit
-        uint256 profit0 = finalBalance0 - repayAmount0;
-        uint256 profit1 = finalBalance1 - repayAmount1;
-        uint256 totalProfitValue = profit0 + profit1; // Simplified - would need price conversion
+        // Calculate profit more accurately
+        uint256 profit0 = finalBalance0 > repayAmount0 ? finalBalance0 - repayAmount0 : 0;
+        uint256 profit1 = finalBalance1 > repayAmount1 ? finalBalance1 - repayAmount1 : 0;
+        
+        // Convert profits to a common denomination (simplified - would use price oracle)
+        uint256 totalProfitValue = _calculateTotalProfitValue(
+            token0, 
+            token1, 
+            profit0, 
+            profit1
+        );
 
         // Verify minimum profit
         if (totalProfitValue < callbackData.route.minProfit) {
@@ -311,20 +318,122 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         address token0,
         address token1
     ) internal {
-        // This is a placeholder for actual swap execution
-        // In production, this would call the appropriate DEX functions
-        // (Uniswap V3 or Aerodrome) based on pool type
+        // Determine if this is a Uniswap V3 or Aerodrome pool
+        // This is a simplified check - in production, you'd have a registry
         
-        // For now, we'll just emit an event to indicate swap attempt
-        // The actual implementation would be added in task 9.5
+        try IUniswapV3Pool(pool).token0() returns (address poolToken0) {
+            // This is a Uniswap V3 pool
+            _executeUniswapV3Swap(pool, direction, token0, token1);
+        } catch {
+            // This is likely an Aerodrome pool
+            _executeAerodromeSwap(pool, direction, token0, token1);
+        }
+    }
+
+    /**
+     * @dev Execute swap on Uniswap V3 pool
+     */
+    function _executeUniswapV3Swap(
+        address pool,
+        bool zeroForOne,
+        address token0,
+        address token1
+    ) internal {
+        // Get current balance to determine swap amount
+        address tokenIn = zeroForOne ? token0 : token1;
+        uint256 amountIn = IERC20(tokenIn).balanceOf(address(this));
         
-        // Placeholder to prevent unused parameter warnings
-        pool;
-        direction;
-        token0;
-        token1;
+        if (amountIn == 0) return;
+
+        // Approve token for swap
+        IERC20(tokenIn).safeApprove(pool, amountIn);
+
+        // Execute swap
+        IUniswapV3Pool(pool).swap(
+            address(this),
+            zeroForOne,
+            int256(amountIn),
+            zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341, // sqrt price limits
+            abi.encode(tokenIn, amountIn)
+        );
+    }
+
+    /**
+     * @dev Execute swap on Aerodrome pool
+     */
+    function _executeAerodromeSwap(
+        address pool,
+        bool direction,
+        address token0,
+        address token1
+    ) internal {
+        // Get current balance to determine swap amount
+        address tokenIn = direction ? token0 : token1;
+        address tokenOut = direction ? token1 : token0;
+        uint256 amountIn = IERC20(tokenIn).balanceOf(address(this));
         
-        // Actual swap logic will be implemented in task 9.5
+        if (amountIn == 0) return;
+
+        // Transfer tokens to pool
+        IERC20(tokenIn).safeTransfer(pool, amountIn);
+
+        // Calculate amounts out (simplified - would use actual Aerodrome math)
+        uint256 amountOut = _getAerodromeAmountOut(pool, tokenIn, amountIn);
+
+        // Execute swap
+        if (direction) {
+            IAerodromePair(pool).swap(0, amountOut, address(this), "");
+        } else {
+            IAerodromePair(pool).swap(amountOut, 0, address(this), "");
+        }
+    }
+
+    /**
+     * @dev Calculate Aerodrome swap output (simplified)
+     */
+    function _getAerodromeAmountOut(
+        address pool,
+        address tokenIn,
+        uint256 amountIn
+    ) internal view returns (uint256) {
+        // This is a simplified calculation
+        // In production, you'd implement the full Aerodrome formula
+        (uint256 reserve0, uint256 reserve1,) = IAerodromePair(pool).getReserves();
+        address token0 = IAerodromePair(pool).token0();
+        
+        (uint256 reserveIn, uint256 reserveOut) = tokenIn == token0 
+            ? (reserve0, reserve1) 
+            : (reserve1, reserve0);
+            
+        // Simplified constant product formula (would need stable pool logic too)
+        uint256 amountInWithFee = amountIn * 997;
+        uint256 numerator = amountInWithFee * reserveOut;
+        uint256 denominator = reserveIn * 1000 + amountInWithFee;
+        
+        return numerator / denominator;
+    }
+
+    /**
+     * @dev Uniswap V3 swap callback
+     */
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external {
+        // Verify callback is from authorized pool
+        require(authorizedPools[msg.sender], "Unauthorized swap callback");
+        
+        // Decode callback data
+        (address tokenIn, uint256 amountIn) = abi.decode(data, (address, uint256));
+        
+        // Pay the pool
+        if (amount0Delta > 0) {
+            IERC20(IUniswapV3Pool(msg.sender).token0()).safeTransfer(msg.sender, uint256(amount0Delta));
+        }
+        if (amount1Delta > 0) {
+            IERC20(IUniswapV3Pool(msg.sender).token1()).safeTransfer(msg.sender, uint256(amount1Delta));
+        }
     }
 
     // Admin functions
@@ -415,12 +524,34 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         return (totalExecutions, totalProfit);
     }
 
+    /**
+     * @dev Calculate total profit value in a common denomination
+     * @param token0 First token address
+     * @param token1 Second token address  
+     * @param profit0 Profit in token0
+     * @param profit1 Profit in token1
+     * @return Total profit value
+     */
+    function _calculateTotalProfitValue(
+        address token0,
+        address token1,
+        uint256 profit0,
+        uint256 profit1
+    ) internal pure returns (uint256) {
+        // Simplified profit calculation
+        // In production, this would use a price oracle to convert to USD/ETH
+        
+        // For now, assume both tokens have similar value (1:1 ratio)
+        // This is obviously incorrect but serves as a placeholder
+        return profit0 + profit1;
+    }
+
     // Receive ETH
     receive() external payable {}
 }
 
 /**
- * @dev Minimal Uniswap V3 Pool interface for flash loans
+ * @dev Minimal Uniswap V3 Pool interface for flash loans and swaps
  */
 interface IUniswapV3Pool {
     function flash(
@@ -430,6 +561,31 @@ interface IUniswapV3Pool {
         bytes calldata data
     ) external;
 
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
+
     function token0() external view returns (address);
     function token1() external view returns (address);
+}
+
+/**
+ * @dev Minimal Aerodrome Pair interface for swaps
+ */
+interface IAerodromePair {
+    function swap(
+        uint256 amount0Out,
+        uint256 amount1Out,
+        address to,
+        bytes calldata data
+    ) external;
+
+    function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast);
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function stable() external view returns (bool);
 }
