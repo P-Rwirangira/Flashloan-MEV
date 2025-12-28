@@ -32,14 +32,15 @@ export interface UniswapV3PoolState extends PoolState {
   readonly sqrtPriceX96: BigNumberish;
   readonly tick: number;
   readonly liquidity: BigNumberish;
-  readonly feeGrowthGlobal0X128: BigNumberish;
-  readonly feeGrowthGlobal1X128: BigNumberish;
-  readonly protocolFees: {
+  readonly tickSpacing: number;
+  readonly feeGrowthGlobal0X128?: BigNumberish;
+  readonly feeGrowthGlobal1X128?: BigNumberish;
+  readonly protocolFees?: {
     readonly token0: number;
     readonly token1: number;
   };
-  readonly observationIndex: number;
-  readonly observationCardinality: number;
+  readonly observationIndex?: number;
+  readonly observationCardinality?: number;
 }
 
 // Aerodrome volatile pool state
