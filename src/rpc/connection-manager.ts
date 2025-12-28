@@ -92,6 +92,13 @@ export class RpcConnectionManager extends EventEmitter {
   }
 
   /**
+   * Get primary RPC URL
+   */
+  getPrimaryRpcUrl(): string {
+    return this.network.rpcUrl;
+  }
+
+  /**
    * Get WebSocket connection for real-time data
    */
   getWebSocket(): WebSocket | undefined {

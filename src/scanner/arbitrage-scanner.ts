@@ -33,13 +33,8 @@ export interface IPriceOracle {
 
 // Simple price oracle implementation
 export class SimplePriceOracle implements IPriceOracle {
-  private readonly provider: ethers.Provider;
   private cachedPrice?: { price: number; timestamp: number };
   private readonly cacheTimeMs = 60000; // 1 minute cache
-
-  constructor(provider: ethers.Provider) {
-    this.provider = provider;
-  }
 
   async getEthUsdPrice(): Promise<number> {
     // Check cache first
@@ -85,9 +80,9 @@ function bigintSqrt(value: bigint): bigint {
 }
 
 export interface ArbitrageSpread {
-  readonly tokenPair: [Address, Address];
-  readonly uniswapV3Pool: Address;
-  readonly aerodromePool: Address;
+  tokenPair: [Address, Address];
+  uniswapV3Pool: Address;
+  aerodromePool: Address;
   readonly uniswapV3Price: bigint;
   readonly aerodromePrice: bigint;
   readonly spread: number; // in basis points
@@ -133,8 +128,7 @@ export class ArbitrageScanner extends EventEmitter {
 
   // Scanning state
   private isScanning = false;
-  private scanInterval?: ReturnType<typeof setInterval>;
-  private lastScanTimestamp = 0;
+  private scanInterval: ReturnType<typeof setInterval> | undefined;
 
   // Token pair tracking
   private monitoredPairs: Map<string, { token0: Address; token1: Address }> = new Map();
@@ -152,7 +146,7 @@ export class ArbitrageScanner extends EventEmitter {
     this.config = options.config;
     this.scanIntervalMs = options.scanIntervalMs ?? 1000; // 1s default for fast arbitrage detection
     this.priceOracle =
-      options.priceOracle ?? new SimplePriceOracle(this.connectionManager.getProvider());
+      options.priceOracle ?? new SimplePriceOracle();
 
     this.initializeTokenPairs();
   }
@@ -224,7 +218,6 @@ export class ArbitrageScanner extends EventEmitter {
    */
   async scanForOpportunities(): Promise<void> {
     const scanStartTime = Date.now();
-    this.lastScanTimestamp = scanStartTime;
 
     try {
       // Get all current pool states
@@ -324,38 +317,39 @@ export class ArbitrageScanner extends EventEmitter {
       return;
     }
 
-    // Optimize routes across all pool combinations
+    // Try route optimization first
     const routeOptimization = await this.optimizeRoutes(tokenPair, poolPairing, allPoolStates);
 
-    if (!routeOptimization) {
-      return; // No viable routes found
-    }
+    if (routeOptimization) {
+      // Create arbitrage opportunity with optimized routes
+      const opportunity = await this.createArbitrageOpportunityWithRoutes(
+        tokenPair,
+        routeOptimization
+      );
 
-    // Create arbitrage opportunity with optimized routes
-    const opportunity = await this.createArbitrageOpportunityWithRoutes(
-      tokenPair,
-      routeOptimization
-    );
+      // Check if this is a new or updated opportunity
+      const existingOpportunity = this.findExistingOpportunity(
+        tokenPair,
+        routeOptimization.primaryRoute.spread.direction
+      );
 
-    // Check if this is a new or updated opportunity
-    const existingOpportunity = this.findExistingOpportunity(
-      tokenPair,
-      routeOptimization.primaryRoute.spread.direction
-    );
-
-    if (existingOpportunity) {
-      // Update existing opportunity if profit improved
-      if (
-        routeOptimization.primaryRoute.expectedProfit >
-        BigInt(existingOpportunity.expectedProfit.toString())
-      ) {
-        this.activeOpportunities.set(existingOpportunity.id, opportunity);
-        this.emit('opportunityUpdated', opportunity);
+      if (existingOpportunity) {
+        // Update existing opportunity if profit improved
+        if (
+          routeOptimization.primaryRoute.expectedProfit >
+          BigInt(existingOpportunity.expectedProfit.toString())
+        ) {
+          this.activeOpportunities.set(existingOpportunity.id, opportunity);
+          this.emit('opportunityUpdated', opportunity);
+        }
+      } else {
+        // New opportunity
+        this.activeOpportunities.set(opportunity.id, opportunity);
+        this.emit('opportunityDetected', opportunity);
       }
     } else {
-      // New opportunity
-      this.activeOpportunities.set(opportunity.id, opportunity);
-      this.emit('opportunityDetected', opportunity);
+      // Fallback to simple pool selection if route optimization fails
+      await this.scanTokenPairSimple(tokenPair, poolPairing, allPoolStates);
     }
   }
 
@@ -407,6 +401,11 @@ export class ArbitrageScanner extends EventEmitter {
     // Select primary route and up to maxRoutes-1 fallback routes
     const maxRoutes = Math.min(this.config.maxRoutes, candidateRoutes.length);
     const primaryRoute = candidateRoutes[0];
+    
+    if (!primaryRoute) {
+      return undefined;
+    }
+    
     const fallbackRoutes = candidateRoutes.slice(1, maxRoutes);
 
     return {
@@ -633,7 +632,25 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
-   * Find the best Uniswap V3 pool (highest liquidity) - kept for backward compatibility
+   * Calculate Uniswap V3 price from pool state
+   */
+  private calculateUniswapV3Price(poolState: UniswapV3PoolState): bigint | undefined {
+    try {
+      const sqrtPriceX96 = BigInt(poolState.sqrtPriceX96.toString());
+
+      // Convert sqrtPriceX96 to price
+      // price = (sqrtPriceX96 / 2^96)^2
+      const Q96 = 2n ** 96n;
+      const price = (sqrtPriceX96 * sqrtPriceX96) / (Q96 * Q96);
+
+      return price;
+    } catch (error) {
+      return undefined;
+    }
+  }
+
+  /**
+   * Find the best Uniswap V3 pool (highest liquidity)
    */
   private findBestUniswapV3Pool(
     poolAddresses: Address[],
@@ -703,24 +720,6 @@ export class ArbitrageScanner extends EventEmitter {
     }
 
     return bestPool;
-  }
-
-  /**
-   * Calculate Uniswap V3 price from pool state
-   */
-  private calculateUniswapV3Price(poolState: UniswapV3PoolState): bigint | undefined {
-    try {
-      const sqrtPriceX96 = BigInt(poolState.sqrtPriceX96.toString());
-
-      // Convert sqrtPriceX96 to price
-      // price = (sqrtPriceX96 / 2^96)^2
-      const Q96 = 2n ** 96n;
-      const price = (sqrtPriceX96 * sqrtPriceX96) / (Q96 * Q96);
-
-      return price;
-    } catch (error) {
-      return undefined;
-    }
   }
 
   /**
@@ -1014,7 +1013,7 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
-   * Create arbitrage opportunity object
+   * Create arbitrage opportunity object (alternative method for simple cases)
    */
   private async createArbitrageOpportunity(
     tokenPair: { token0: Address; token1: Address },
@@ -1057,7 +1056,7 @@ export class ArbitrageScanner extends EventEmitter {
 
       // DEX routing
       route,
-      fallbackRoutes: [], // TODO: Implement fallback routes
+      fallbackRoutes: [], // Will be populated by route optimization
 
       // Profitability
       flashFee: profitCalc.flashLoanFee,
@@ -1092,6 +1091,84 @@ export class ArbitrageScanner extends EventEmitter {
           )
       ),
     };
+  }
+
+  /**
+   * Scan token pair using simple pool selection (fallback method)
+   */
+  private async scanTokenPairSimple(
+    tokenPair: { token0: Address; token1: Address },
+    poolPairing: { uniV3Pools: Address[]; aeroPools: Address[] },
+    allPoolStates: Map<Address, any>
+  ): Promise<void> {
+    // Use the pool selection methods to find best pools
+    const bestUniV3Pool = this.findBestUniswapV3Pool(poolPairing.uniV3Pools, allPoolStates);
+    const bestAeroPool = this.findBestAerodromePool(poolPairing.aeroPools, allPoolStates);
+
+    if (!bestUniV3Pool || !bestAeroPool) {
+      return; // No suitable pools found
+    }
+
+    // Calculate prices on both DEXs
+    const uniV3Price = this.calculateUniswapV3Price(bestUniV3Pool);
+    const aeroPrice = this.calculateAerodromePrice(bestAeroPool);
+
+    if (!uniV3Price || !aeroPrice) {
+      return;
+    }
+
+    // Calculate spread and direction
+    const spread = this.calculateSpread(uniV3Price, aeroPrice);
+    spread.tokenPair = [tokenPair.token0, tokenPair.token1];
+    spread.uniswapV3Pool = bestUniV3Pool.address;
+    spread.aerodromePool = bestAeroPool.address;
+
+    if (spread.spread < this.config.minSpreadBps) {
+      return; // Spread too small
+    }
+
+    // Calculate optimal trade amount
+    const optimalAmount = this.calculateOptimalTradeAmount(bestUniV3Pool, bestAeroPool, spread);
+    if (optimalAmount === 0n) {
+      return; // No viable trade amount
+    }
+
+    // Calculate profitability
+    const profitCalc = await this.calculateProfitability(
+      spread,
+      optimalAmount,
+      bestUniV3Pool,
+      bestAeroPool
+    );
+
+    if (!profitCalc.isViable) {
+      return; // Not profitable after costs
+    }
+
+    // Create arbitrage opportunity using the simple method
+    const opportunity = await this.createArbitrageOpportunity(
+      tokenPair,
+      spread,
+      optimalAmount,
+      profitCalc,
+      bestUniV3Pool,
+      bestAeroPool
+    );
+
+    // Check if this is a new or updated opportunity
+    const existingOpportunity = this.findExistingOpportunity(tokenPair, spread.direction);
+
+    if (existingOpportunity) {
+      // Update existing opportunity if profit improved
+      if (profitCalc.netProfit > BigInt(existingOpportunity.expectedProfit.toString())) {
+        this.activeOpportunities.set(existingOpportunity.id, opportunity);
+        this.emit('opportunityUpdated', opportunity);
+      }
+    } else {
+      // New opportunity
+      this.activeOpportunities.set(opportunity.id, opportunity);
+      this.emit('opportunityDetected', opportunity);
+    }
   }
 
   /**
