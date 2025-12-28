@@ -7,3 +7,4 @@
 export * from './uniswap-v3-monitor';
 export * from './aerodrome-monitor';
 export * from './pool-manager';
+export * from './arbitrage-scanner';
