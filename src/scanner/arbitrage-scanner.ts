@@ -775,7 +775,7 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
-   * Calculate optimal trade amount for arbitrage
+   * Calculate optimal trade amount for arbitrage with aggressive sizing
    */
   private calculateOptimalTradeAmount(
     uniV3Pool: UniswapV3PoolState,
@@ -786,7 +786,7 @@ export class ArbitrageScanner extends EventEmitter {
     const uniV3TokenAmount = this.estimateUniV3TokenAmount(uniV3Pool);
     const aeroTokenAmount = this.getAerodromeTokenAmount(aeroPool);
 
-    // Use smaller of the two token amounts, with a conservative multiplier
+    // Use smaller of the two token amounts
     const availableTokenAmount =
       uniV3TokenAmount < aeroTokenAmount ? uniV3TokenAmount : aeroTokenAmount;
 
@@ -794,17 +794,35 @@ export class ArbitrageScanner extends EventEmitter {
       return 0n;
     }
 
-    // Use 1% of available token amount as starting point
-    const baseAmount = availableTokenAmount / 100n;
+    // AGGRESSIVE SIZING: Use 5-15% of available liquidity instead of 1%
+    const maxSizePercent = 15; // 15% maximum
+
+    // Base amount: 5% of available liquidity
+    const baseAmount = availableTokenAmount / 20n; // 5%
 
     // Adjust based on spread size (larger spreads allow larger trades)
-    const spreadMultiplier = BigInt(Math.max(1, Math.min(10, spread.spread / 10))); // 1x to 10x based on spread
+    const spreadMultiplier = Math.min(3, Math.max(1, spread.spread / 50)); // 1x to 3x based on spread
+    const sizeMultiplier = BigInt(Math.floor(spreadMultiplier * 100));
 
-    return baseAmount * spreadMultiplier;
+    let optimalAmount = (baseAmount * sizeMultiplier) / 100n;
+
+    // Cap at maximum size (15% of liquidity)
+    const maxAmount = (availableTokenAmount * BigInt(maxSizePercent)) / 100n;
+    if (optimalAmount > maxAmount) {
+      optimalAmount = maxAmount;
+    }
+
+    // Ensure minimum viable size
+    const minAmount = availableTokenAmount / 100n; // 1% minimum
+    if (optimalAmount < minAmount) {
+      optimalAmount = minAmount;
+    }
+
+    return optimalAmount;
   }
 
   /**
-   * Estimate token amount available in Uniswap V3 pool
+   * Estimate token amount available in Uniswap V3 pool with aggressive approach
    */
   private estimateUniV3TokenAmount(poolState: UniswapV3PoolState): bigint {
     try {
@@ -815,22 +833,20 @@ export class ArbitrageScanner extends EventEmitter {
         return 0n;
       }
 
-      // Simplified estimation: convert liquidity to token0 amount
-      // This is a rough approximation - in production you'd want more precise calculations
+      // More aggressive estimation: use larger fraction of liquidity
       const Q96 = 2n ** 96n;
 
       // Estimate token0 amount from liquidity and price
-      // amount0 ≈ liquidity / sqrtPrice
       const estimatedAmount0 = (liquidity * Q96) / sqrtPriceX96;
 
-      // Use the smaller of token0 estimate or a conservative fraction of liquidity
-      const conservativeEstimate = liquidity / 1000n; // Very conservative 0.1% of liquidity
+      // Use more aggressive fraction: 10% instead of 0.1%
+      const aggressiveEstimate = liquidity / 10n; // 10% of liquidity
 
-      return estimatedAmount0 < conservativeEstimate ? estimatedAmount0 : conservativeEstimate;
+      return estimatedAmount0 < aggressiveEstimate ? estimatedAmount0 : aggressiveEstimate;
     } catch (error) {
-      // Fallback to very conservative estimate
+      // Fallback to more aggressive estimate: 1% instead of 0.01%
       const liquidity = BigInt(poolState.liquidity.toString());
-      return liquidity / 10000n; // 0.01% of liquidity as fallback
+      return liquidity / 100n; // 1% of liquidity as fallback
     }
   }
 
