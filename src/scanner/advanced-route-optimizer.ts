@@ -676,11 +676,13 @@ export class AdvancedRouteOptimizer extends EventEmitter {
       const reserveIn = poolState.token0 === tokenIn ? reserve0 : reserve1;
       const reserveOut = poolState.token0 === tokenIn ? reserve1 : reserve0;
 
+      if (reserveIn === 0n) return 0n; // Prevent division by zero
+
       const amountInWithFee = amountIn * 997n; // 0.3% fee
       const numerator = amountInWithFee * reserveOut;
       const denominator = reserveIn * 1000n + amountInWithFee;
 
-      return numerator / denominator;
+      return denominator > 0n ? numerator / denominator : 0n;
     }
   }
 

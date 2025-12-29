@@ -21,7 +21,7 @@ const BASE_PRICE_FEEDS: Record<string, Address> = {
   'ETH/USD': '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70' as Address, // Base ETH/USD
   'USDC/USD': '0x7e860098F58bBFC8648a4311b374B1D669a2bc6B' as Address, // Base USDC/USD
   'DAI/USD': '0x591e79239a7d679378eC8c847e5038150364C78F' as Address, // Base DAI/USD
-  'WSTETH/ETH': '0xB88BAc61a4Ca37C43a3725912B1f472c9A5bc061' as Address, // Base wstETH/ETH
+  'WSTETH/ETH': '0x43a5C292A453A3bF3606fa856197f09D7B74251a' as Address, // Base wstETH/ETH
 };
 
 export interface PriceData {

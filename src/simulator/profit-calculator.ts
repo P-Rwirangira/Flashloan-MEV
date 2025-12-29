@@ -636,7 +636,7 @@ export class ProfitCalculator extends EventEmitter {
       const bridgeFees = await this.calculateBridgeFees();
 
       const netProfit = grossProfit - (flashLoanFee + gasCost + slippageCost + bridgeFees);
-      const profitMargin = amountIn > 0n ? Number((netProfit * 100n) / amountIn) : 0;
+      const profitMargin = amountIn > 0n ? Number((netProfit * 10000n) / amountIn) / 100 : 0;
       const profitUsd = await this.calculateProfitUsd(netProfit, opportunity.tokenOut);
 
       const breakdownBps = this.calculateCostBreakdown(

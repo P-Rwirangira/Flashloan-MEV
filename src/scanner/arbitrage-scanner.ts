@@ -786,9 +786,15 @@ export class ArbitrageScanner extends EventEmitter {
     const uniV3TokenAmount = this.estimateUniV3TokenAmount(uniV3Pool);
     const aeroTokenAmount = this.getAerodromeTokenAmount(aeroPool);
 
-    // Use smaller of the two token amounts
+    // Use smaller of the two token amounts (ensure both are valid)
     const availableTokenAmount =
-      uniV3TokenAmount < aeroTokenAmount ? uniV3TokenAmount : aeroTokenAmount;
+      uniV3TokenAmount > 0n && aeroTokenAmount > 0n
+        ? uniV3TokenAmount < aeroTokenAmount
+          ? uniV3TokenAmount
+          : aeroTokenAmount
+        : uniV3TokenAmount > 0n
+          ? uniV3TokenAmount
+          : aeroTokenAmount;
 
     if (availableTokenAmount === 0n) {
       return 0n;

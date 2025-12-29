@@ -46,7 +46,7 @@ export class FlashLoanOptimizer extends EventEmitter {
   private readonly baseSources: FlashLoanSource[] = [
     {
       protocol: 'uniswap-v3',
-      poolAddress: '0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18' as Address, // WETH/USDC 0.05%
+      poolAddress: '0x74cb6260be6f31965c239df6d6ef2ac2b5d4f020' as Address, // WETH/USDC 0.05%
       token: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913' as Address, // USDC
       feeBps: 5, // 0.05%
       maxAmount: ethers.parseUnits('1000000', 6), // 1M USDC
@@ -55,7 +55,7 @@ export class FlashLoanOptimizer extends EventEmitter {
     },
     {
       protocol: 'uniswap-v3',
-      poolAddress: '0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18' as Address, // WETH/USDC 0.05%
+      poolAddress: '0x74cb6260be6f31965c239df6d6ef2ac2b5d4f020' as Address, // WETH/USDC 0.05%
       token: '0x4200000000000000000000000000000000000006' as Address, // WETH
       feeBps: 5, // 0.05%
       maxAmount: ethers.parseEther('500'), // 500 WETH
@@ -102,9 +102,12 @@ export class FlashLoanOptimizer extends EventEmitter {
   async findOptimalFlashLoan(
     token: Address,
     amount: bigint,
-    gasPrice: bigint = ethers.parseUnits('2', 'gwei')
+    gasPrice?: bigint
   ): Promise<FlashLoanOptimizationResult> {
     const reasoning: string[] = [];
+
+    // Get dynamic gas price if not provided
+    const effectiveGasPrice = gasPrice || (await this.getDynamicGasPrice());
 
     // Get available sources for token
     const sources = await this.getAvailableSources(token);
@@ -119,7 +122,7 @@ export class FlashLoanOptimizer extends EventEmitter {
 
     for (const source of sources) {
       if (source.maxAmount >= amount) {
-        const quote = this.generateQuote(source, amount, gasPrice);
+        const quote = this.generateQuote(source, amount, effectiveGasPrice);
         quotes.push(quote);
         reasoning.push(
           `${source.protocol}: ${ethers.formatUnits(quote.totalCost, 'gwei')} gwei total cost`
@@ -160,6 +163,33 @@ export class FlashLoanOptimizer extends EventEmitter {
       savings,
       reasoning,
     };
+  }
+
+  /**
+   * Get dynamic gas price from network
+   */
+  private async getDynamicGasPrice(): Promise<bigint> {
+    try {
+      const provider = this.connectionManager.getProvider();
+      const feeData = await provider.getFeeData();
+
+      // Use maxFeePerGas if available (EIP-1559), otherwise gasPrice
+      let gasPrice = feeData.maxFeePerGas || feeData.gasPrice;
+
+      if (!gasPrice) {
+        // Fallback to manual gas price estimation for Base network
+        gasPrice = ethers.parseUnits('0.5', 'gwei');
+      }
+
+      // Apply minimum gas price for Base network (0.1 gwei minimum)
+      const minGasPrice = ethers.parseUnits('0.1', 'gwei');
+      const effectiveGasPrice = gasPrice && gasPrice > minGasPrice ? gasPrice : minGasPrice;
+
+      return effectiveGasPrice;
+    } catch (error) {
+      // Fallback to reasonable Base network gas price (0.5 gwei)
+      return ethers.parseUnits('0.5', 'gwei');
+    }
   }
 
   /**

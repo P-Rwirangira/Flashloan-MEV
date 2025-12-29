@@ -347,7 +347,7 @@ export class AdvancedGasOptimizer extends EventEmitter {
     gasLimit: bigint,
     profitMargin: bigint
   ): EIP1559Params {
-    const maxAffordableGasPrice = profitMargin / gasLimit;
+    const maxAffordableGasPrice = gasLimit > 0n ? profitMargin / gasLimit : 0n;
 
     if (maxAffordableGasPrice < params.baseFeePerGas) {
       // Can't afford even the base fee - return minimum viable params

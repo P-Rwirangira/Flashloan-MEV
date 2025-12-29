@@ -107,11 +107,19 @@ export class CompetitionTracker extends EventEmitter {
     if (competitorBids.length === 0) {
       // No competition detected
       const conservativeBid = availableProfit / 10n; // 10% of profit
+
+      // Ensure minimum viable bid
+      const minBid = ethers.parseUnits('0.1', 'gwei');
+      const recommendedBid = conservativeBid > minBid ? conservativeBid : minBid;
+
       reasoning.push('No competition detected, using conservative bid');
+      if (recommendedBid === minBid) {
+        reasoning.push('Applied minimum bid threshold');
+      }
 
       return {
         competitorBids: [],
-        recommendedBid: conservativeBid,
+        recommendedBid,
         winProbability: 0.9,
         reasoning,
       };
@@ -324,8 +332,14 @@ export class CompetitionTracker extends EventEmitter {
     const highest = sortedBids[sortedBids.length - 1]!;
     const lowest = sortedBids[0]!;
 
-    // Calculate bid spread
-    const spread = highest > lowest ? Number(highest - lowest) / Number(lowest) : 0;
+    // Calculate bid spread - handle division by zero
+    let spread = 0;
+    if (highest > lowest && lowest > 0n) {
+      spread = Number(highest - lowest) / Number(lowest);
+    } else if (highest > 0n && lowest === 0n) {
+      // If lowest is zero but highest isn't, use a large spread value
+      spread = 10.0; // Indicates extreme spread
+    }
 
     if (spread > 2.0) return 'extreme'; // >200% spread
     if (spread > 1.0) return 'high'; // >100% spread
@@ -379,7 +393,14 @@ export class CompetitionTracker extends EventEmitter {
 
     // Adjust for bid premium
     const highestCompetitor = Math.max(...competitorBids.map(b => Number(b)));
-    const bidPremium = Number(bid) / highestCompetitor;
+    let bidPremium: number;
+
+    if (highestCompetitor === 0) {
+      // Handle zero competitor bids
+      bidPremium = Number(bid) === 0 ? 1 : Number.POSITIVE_INFINITY;
+    } else {
+      bidPremium = Number(bid) / highestCompetitor;
+    }
 
     let adjustedProbability = rankProbability;
     if (bidPremium > 1.2) {
@@ -453,7 +474,11 @@ export class CompetitionTracker extends EventEmitter {
     const cutoff = Date.now() - 3600000; // 1 hour ago
 
     for (const [key, tracking] of this.recentOpportunities) {
-      if (tracking.bids.length === 0 || (tracking.bids[0]?.timestamp || 0) < cutoff) {
+      // Use most recent bid timestamp instead of oldest
+      const mostRecentBidTimestamp =
+        tracking.bids.length > 0 ? tracking.bids[tracking.bids.length - 1]?.timestamp || 0 : 0;
+
+      if (tracking.bids.length === 0 || mostRecentBidTimestamp < cutoff) {
         this.recentOpportunities.delete(key);
       }
     }
@@ -461,7 +486,13 @@ export class CompetitionTracker extends EventEmitter {
     // Keep only recent opportunities
     if (this.recentOpportunities.size > this.maxHistorySize) {
       const entries = Array.from(this.recentOpportunities.entries());
-      entries.sort((a, b) => (b[1].bids[0]?.timestamp || 0) - (a[1].bids[0]?.timestamp || 0));
+      entries.sort((a, b) => {
+        const aTimestamp =
+          a[1].bids.length > 0 ? a[1].bids[a[1].bids.length - 1]?.timestamp || 0 : 0;
+        const bTimestamp =
+          b[1].bids.length > 0 ? b[1].bids[b[1].bids.length - 1]?.timestamp || 0 : 0;
+        return bTimestamp - aTimestamp;
+      });
 
       this.recentOpportunities.clear();
       for (const [key, tracking] of entries.slice(0, this.maxHistorySize)) {

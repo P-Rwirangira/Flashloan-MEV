@@ -47,66 +47,88 @@ export class MEVProtectionDetector extends EventEmitter {
   private readonly protectedTransactions: Map<string, ProtectedTransaction> = new Map();
   private readonly backrunOpportunities: Map<string, BackrunOpportunity> = new Map();
 
-  // Known MEV protection service indicators
+  // Event listener management
+  private isMonitoring = false;
+  private pendingTxListener: ((txHash: string) => Promise<void>) | null = null;
+  private blockListener: ((blockNumber: number) => void) | null = null;
+  private cleanupInterval: NodeJS.Timeout | null = null;
+
+  // Known MEV protection service indicators with enhanced detection
   private readonly protectionIndicators = {
     'flashbots-protect': [
       '0x0000000000000000000000000000000000000000', // Flashbots relay
       'mev-boost', // MEV-Boost related
       'flashbots', // Flashbots in transaction data
+      'protect', // Generic protection indicator
     ],
     'cow-swap': [
       '0x9008d19f58aabd9ed0d60971565aa8510560ab41', // CoW Protocol Settlement
       'cowswap',
       'gnosis-safe',
+      'settlement', // CoW settlement patterns
     ],
-    'private-pool': ['private', 'protected', 'anti-mev'],
+    'private-pool': [
+      'private',
+      'protected',
+      'anti-mev',
+      'flashloan-protected', // Enhanced detection
+    ],
   };
 
-  // Known safe backrun patterns
+  // Enhanced safe backrun patterns
   private readonly safeBackrunPatterns = [
     'uniswap-v2-swap',
     'uniswap-v3-swap',
     'aerodrome-swap',
     'token-transfer',
     'approve',
+    'simple-swap', // Additional safe pattern
   ];
 
   private readonly maxHistorySize = 1000;
-  private readonly opportunityTimeoutMs = 30000; // 30 seconds - integrate timeout for cleanup
+  private readonly opportunityTimeoutMs = 30000; // 30 seconds
 
   constructor(connectionManager: RpcConnectionManager) {
     super();
     this.connectionManager = connectionManager;
-
-    // Use opportunityTimeoutMs for periodic cleanup
-    setInterval(() => {
-      this.cleanupExpiredOpportunities();
-    }, this.opportunityTimeoutMs);
   }
 
   /**
-   * Start monitoring for MEV-protected transactions
+   * Start monitoring for MEV-protected transactions with proper event management
    */
   async startMonitoring(): Promise<void> {
+    if (this.isMonitoring) {
+      throw new Error('Already monitoring - stop first before restarting');
+    }
+
     try {
       const provider = this.connectionManager.getProvider();
 
-      // Listen for pending transactions
-      provider.on('pending', async (txHash: string) => {
+      // Create bound listener functions to avoid duplicates
+      this.pendingTxListener = async (txHash: string) => {
         try {
           await this.analyzePendingTransaction(txHash);
         } catch (error) {
           // Skip failed analysis
         }
-      });
+      };
 
-      // Listen for new blocks to clean up expired opportunities
-      provider.on('block', (blockNumber: number) => {
+      this.blockListener = (blockNumber: number) => {
         // Use blockNumber for logging and metrics
         this.emit('blockProcessed', { blockNumber, timestamp: Date.now() });
         this.cleanupExpiredOpportunities();
-      });
+      };
 
+      // Add listeners
+      provider.on('pending', this.pendingTxListener);
+      provider.on('block', this.blockListener);
+
+      // Start cleanup interval with proper management
+      this.cleanupInterval = setInterval(() => {
+        this.cleanupExpiredOpportunities();
+      }, this.opportunityTimeoutMs);
+
+      this.isMonitoring = true;
       this.emit('monitoringStarted');
     } catch (error) {
       this.emit('monitoringError', error);
@@ -115,16 +137,37 @@ export class MEVProtectionDetector extends EventEmitter {
   }
 
   /**
-   * Stop monitoring
+   * Stop monitoring with proper cleanup
    */
   stopMonitoring(): void {
-    const provider = this.connectionManager.getProvider();
-    provider.removeAllListeners('pending');
-    provider.removeAllListeners('block');
+    if (!this.isMonitoring) {
+      return; // Already stopped
+    }
 
+    const provider = this.connectionManager.getProvider();
+
+    // Remove specific listeners to avoid removing other listeners
+    if (this.pendingTxListener) {
+      provider.removeListener('pending', this.pendingTxListener);
+      this.pendingTxListener = null;
+    }
+
+    if (this.blockListener) {
+      provider.removeListener('block', this.blockListener);
+      this.blockListener = null;
+    }
+
+    // Clear cleanup interval
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+
+    // Clear data
     this.protectedTransactions.clear();
     this.backrunOpportunities.clear();
 
+    this.isMonitoring = false;
     this.emit('monitoringStopped');
   }
 
@@ -225,25 +268,57 @@ export class MEVProtectionDetector extends EventEmitter {
   }
 
   /**
-   * Check for protection heuristics
+   * Check for enhanced protection heuristics with better reliability
    */
   private hasProtectionHeuristics(tx: ethers.TransactionResponse): boolean {
-    // High gas price with specific patterns might indicate protection
-    const gasPrice = tx.gasPrice || 0n;
+    // Enhanced gas price analysis with EIP-1559 support
+    let effectiveGasPrice: bigint;
+
+    if (tx.maxFeePerGas && tx.maxPriorityFeePerGas) {
+      // EIP-1559 transaction - use maxFeePerGas
+      effectiveGasPrice = tx.maxFeePerGas;
+    } else {
+      // Legacy transaction
+      effectiveGasPrice = tx.gasPrice || 0n;
+    }
+
     const highGasThreshold = ethers.parseUnits('20', 'gwei');
 
-    if (gasPrice > highGasThreshold) {
+    if (effectiveGasPrice > highGasThreshold) {
       // Check for MEV protection patterns in transaction data
       const txData = tx.data.toLowerCase();
 
-      // Look for deadline parameters (common in protected swaps)
-      if (txData.includes('deadline') || txData.length > 1000) {
+      // Enhanced pattern detection
+      const protectionPatterns = [
+        'deadline', // Deadline parameters
+        'slippage', // Slippage protection
+        'minout', // Minimum output protection
+        'permit', // Permit-based protection
+        'multicall', // Complex multicall patterns
+      ];
+
+      let patternCount = 0;
+      for (const pattern of protectionPatterns) {
+        if (txData.includes(pattern)) {
+          patternCount++;
+        }
+      }
+
+      // Multiple protection patterns indicate MEV protection
+      if (patternCount >= 2) {
         return true;
       }
 
-      // Check for complex routing (multiple hops)
-      const hopCount = (txData.match(/a9059cbb/g) || []).length; // transfer function selector
-      if (hopCount > 2) {
+      // Check for complex routing (multiple hops) with better detection
+      const transferCount = (txData.match(/a9059cbb/g) || []).length; // transfer function selector
+      const swapCount = (txData.match(/128acb08|38ed1739|7ff36ab5/g) || []).length; // Various swap selectors
+
+      if (transferCount > 2 || swapCount > 1) {
+        return true;
+      }
+
+      // Check transaction data length (complex protected transactions are usually longer)
+      if (txData.length > 2000) {
         return true;
       }
     }
@@ -288,10 +363,15 @@ export class MEVProtectionDetector extends EventEmitter {
   }
 
   /**
-   * Extract token addresses from transaction data
+   * Extract token addresses from transaction data with ABI validation
    */
   private extractTokenAddresses(data: string): Address[] {
     const addresses: Address[] = [];
+
+    // Validate ABI-encoded data structure first
+    if (!this.isValidAbiEncodedData(data)) {
+      return addresses; // Return empty array for invalid ABI data
+    }
 
     // Look for 20-byte addresses in transaction data
     const addressRegex = /0x[a-fA-F0-9]{40}/g;
@@ -310,18 +390,46 @@ export class MEVProtectionDetector extends EventEmitter {
   }
 
   /**
-   * Estimate slippage tolerance from transaction
+   * Validate ABI-encoded data structure
+   */
+  private isValidAbiEncodedData(data: string): boolean {
+    // Basic ABI validation - data should be hex and have proper length
+    if (!data.startsWith('0x') || data.length < 10) {
+      return false;
+    }
+
+    // Check if data length is valid (multiple of 2 for hex)
+    if ((data.length - 2) % 2 !== 0) {
+      return false;
+    }
+
+    // Additional validation for function selectors (first 4 bytes)
+    const functionSelector = data.slice(0, 10);
+    return /^0x[a-fA-F0-9]{8}$/.test(functionSelector);
+  }
+
+  /**
+   * Estimate slippage tolerance from transaction with EIP-1559 support
    */
   private estimateSlippage(tx: ethers.TransactionResponse): number {
-    // Analyze gas price to estimate urgency/slippage tolerance
-    const gasPrice = tx.gasPrice || 0n;
+    // Handle both legacy and EIP-1559 transactions
+    let effectiveGasPrice: bigint;
+
+    if (tx.maxFeePerGas && tx.maxPriorityFeePerGas) {
+      // EIP-1559 transaction - use maxFeePerGas as upper bound
+      effectiveGasPrice = tx.maxFeePerGas;
+    } else {
+      // Legacy transaction
+      effectiveGasPrice = tx.gasPrice || 0n;
+    }
+
     const baseGasPrice = ethers.parseUnits('2', 'gwei');
 
-    if (gasPrice <= baseGasPrice) {
+    if (effectiveGasPrice <= baseGasPrice) {
       return 0.005; // 0.5% for low gas price
-    } else if (gasPrice <= ethers.parseUnits('10', 'gwei')) {
+    } else if (effectiveGasPrice <= ethers.parseUnits('10', 'gwei')) {
       return 0.01; // 1% for medium gas price
-    } else if (gasPrice <= ethers.parseUnits('50', 'gwei')) {
+    } else if (effectiveGasPrice <= ethers.parseUnits('50', 'gwei')) {
       return 0.03; // 3% for high gas price
     } else {
       return 0.05; // 5% for very high gas price
