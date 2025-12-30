@@ -176,20 +176,40 @@ export class EnhancedPriceOracle implements IPriceOracle {
    * Fetch ETH price from external API as fallback
    */
   private async fetchEthPriceFromExternalApi(): Promise<number> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+
     try {
       // Use CoinGecko API as fallback
       const response = await fetch(
-        'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd'
+        'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd',
+        { signal: controller.signal }
       );
-      const data = (await response.json()) as any;
 
-      if (data.ethereum && data.ethereum.usd) {
-        return data.ethereum.usd;
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
-      throw new Error('Invalid API response');
+      const data = (await response.json()) as any;
+
+      if (!data.ethereum || typeof data.ethereum.usd !== 'number' || !isFinite(data.ethereum.usd)) {
+        throw new Error('Invalid API response: missing or invalid ethereum.usd price');
+      }
+
+      return data.ethereum.usd;
     } catch (error) {
-      throw new Error('Failed to fetch ETH price from external API');
+      clearTimeout(timeoutId);
+
+      if (error instanceof Error) {
+        if (error.name === 'AbortError') {
+          throw new Error('CoinGecko API request timed out after 5 seconds');
+        }
+        throw new Error(`CoinGecko API error: ${error.message}`);
+      }
+
+      throw new Error('Unknown error fetching ETH price from CoinGecko API');
     }
   }
 
@@ -203,25 +223,25 @@ export class EnhancedPriceOracle implements IPriceOracle {
   }
 
   /**
-   * Estimate token value ratio based on token characteristics
+   * Estimate token value ratio based on token characteristics using address lookup
    */
   private estimateTokenValueRatio(tokenAddress: Address): number {
     const tokenAddressLower = tokenAddress.toLowerCase();
 
-    // More sophisticated token analysis
-    if (tokenAddressLower.includes('wrapped') || tokenAddressLower.includes('w')) {
-      return 0.8; // Wrapped tokens typically close to underlying
+    // Known token addresses on Base (normalized to lowercase) with their ratios
+    const knownTokenRatios: Record<string, number> = {
+      '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 0.0003, // USDC (1/3000 assuming $3000 ETH)
+      '0x50c5725949a6f0c72e6c4a641f24049a917db0cb': 0.0003, // DAI
+      '0x4200000000000000000000000000000000000006': 1.0, // WETH
+      '0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452': 1.1, // wstETH (10% premium)
+    };
+
+    const ratio = knownTokenRatios[tokenAddressLower];
+    if (ratio !== undefined) {
+      return ratio;
     }
 
-    if (tokenAddressLower.includes('lp') || tokenAddressLower.includes('pair')) {
-      return 0.5; // LP tokens
-    }
-
-    if (tokenAddressLower.includes('gov') || tokenAddressLower.includes('vote')) {
-      return 0.1; // Governance tokens
-    }
-
-    // Default conservative estimate
+    // For unknown tokens, use conservative estimate
     return 0.05; // 5% of ETH for unknown tokens
   }
 }

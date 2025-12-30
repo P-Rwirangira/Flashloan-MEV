@@ -75,20 +75,40 @@ export class EnhancedPriceOracle implements IPriceOracle {
    * Fetch ETH price from external API
    */
   private async fetchEthPriceFromApi(): Promise<number> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+
     try {
       // Use CoinGecko API as fallback
       const response = await fetch(
-        'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd'
+        'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd',
+        { signal: controller.signal }
       );
-      const data = (await response.json()) as any;
 
-      if (data.ethereum && data.ethereum.usd) {
-        return data.ethereum.usd;
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
-      throw new Error('Invalid API response');
+      const data = (await response.json()) as any;
+
+      if (!data.ethereum || typeof data.ethereum.usd !== 'number' || !isFinite(data.ethereum.usd)) {
+        throw new Error('Invalid API response: missing or invalid ethereum.usd price');
+      }
+
+      return data.ethereum.usd;
     } catch (error) {
-      throw new Error('Failed to fetch ETH price from API');
+      clearTimeout(timeoutId);
+
+      if (error instanceof Error) {
+        if (error.name === 'AbortError') {
+          throw new Error('CoinGecko API request timed out after 5 seconds');
+        }
+        throw new Error(`CoinGecko API error: ${error.message}`);
+      }
+
+      throw new Error('Unknown error fetching ETH price from CoinGecko API');
     }
   }
 }

@@ -286,8 +286,10 @@ export class ChainlinkPriceOracleImpl extends EventEmitter implements ChainlinkP
       // Known Base token/ETH pools
       const knownPools: Record<string, string> = {
         '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': '0x74cb6260be6f31965c239df6d6ef2ac2b5d4f020', // USDC/ETH
-        '0x50c5725949a6f0c72e6c4a641f24049a917db0cb': '0x...', // DAI/ETH (if available)
-        '0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452': '0x...', // wstETH/ETH (if available)
+        // TODO: Add real pool addresses for DAI/ETH and wstETH/ETH when available on Base
+        // DAI/ETH pool: Research Base DEX deployments for DAI/ETH pairs
+        // wstETH/ETH pool: Check Uniswap V3 or other DEXs for wstETH/ETH on Base
+        // Sources: https://basescan.org, Uniswap V3 subgraph, DEX aggregator APIs
       };
 
       const poolAddress = knownPools[tokenAddressLower];
@@ -302,7 +304,7 @@ export class ChainlinkPriceOracleImpl extends EventEmitter implements ChainlinkP
       ];
 
       const poolContract = new ethers.Contract(poolAddress, poolAbi, provider);
-      const [slot0, token0] = await Promise.all([
+      const [slot0, token0, token1] = await Promise.all([
         (poolContract as any).slot0(),
         (poolContract as any).token0(),
         (poolContract as any).token1(),
@@ -310,6 +312,15 @@ export class ChainlinkPriceOracleImpl extends EventEmitter implements ChainlinkP
 
       // Determine if token is token0 or token1
       const isToken0 = token0.toLowerCase() === tokenAddressLower;
+
+      // Log token information for debugging
+      this.emit('poolTokensQueried', {
+        poolAddress,
+        token0,
+        token1,
+        queriedToken: tokenAddress,
+        isToken0,
+      });
 
       // Convert sqrtPriceX96 to price
       const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96.toString());
@@ -328,31 +339,32 @@ export class ChainlinkPriceOracleImpl extends EventEmitter implements ChainlinkP
   }
 
   /**
-   * Estimate token price by type analysis
+   * Estimate token price by type analysis using address lookup
    */
   private estimateTokenPriceByType(tokenAddress: Address, ethPrice: number): Promise<number> {
     const tokenAddressLower = tokenAddress.toLowerCase();
 
-    // Enhanced token type detection with real analysis
-    if (
-      tokenAddressLower.includes('usdc') ||
-      tokenAddressLower.includes('dai') ||
-      tokenAddressLower.includes('usdt') ||
-      tokenAddressLower === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
-    ) {
-      return Promise.resolve(1.0); // Stablecoin
-    }
+    // Known token addresses on Base (normalized to lowercase)
+    const knownTokens: Record<string, { type: string; multiplier: number }> = {
+      '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': { type: 'stablecoin', multiplier: 1.0 }, // USDC
+      '0x50c5725949a6f0c72e6c4a641f24049a917db0cb': { type: 'stablecoin', multiplier: 1.0 }, // DAI
+      '0x4200000000000000000000000000000000000006': { type: 'weth', multiplier: 1.0 }, // WETH
+      '0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452': { type: 'wsteth', multiplier: 1.1 }, // wstETH (approximate 10% premium)
+    };
 
-    if (
-      tokenAddressLower.includes('weth') ||
-      tokenAddressLower === '0x4200000000000000000000000000000000000006'
-    ) {
-      return Promise.resolve(ethPrice); // WETH
-    }
+    const tokenInfo = knownTokens[tokenAddressLower];
 
-    if (tokenAddressLower.includes('wsteth')) {
-      // wstETH is typically worth more than ETH
-      return Promise.resolve(ethPrice * 1.1); // Approximate 10% premium
+    if (tokenInfo) {
+      switch (tokenInfo.type) {
+        case 'stablecoin':
+          return Promise.resolve(1.0);
+        case 'weth':
+          return Promise.resolve(ethPrice);
+        case 'wsteth':
+          return Promise.resolve(ethPrice * tokenInfo.multiplier);
+        default:
+          return Promise.resolve(ethPrice * tokenInfo.multiplier);
+      }
     }
 
     // For truly unknown tokens, use conservative estimate

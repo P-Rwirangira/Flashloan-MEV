@@ -260,8 +260,8 @@ export class StablePoolMonitor extends EventEmitter {
       ]);
 
       // Check if pool has incentives (would need to query gauge contract)
-      const isIncentivized = await this.checkPoolIncentives(poolAddress);
-      const incentiveRate = isIncentivized ? await this.getIncentiveRate(poolAddress) : 0n;
+      const isIncentivized = this.checkPoolIncentives(poolAddress);
+      const incentiveRate = isIncentivized ? await this.getIncentiveRate(poolAddress) : null;
 
       const realState: StablePoolState = {
         poolAddress,
@@ -274,7 +274,7 @@ export class StablePoolMonitor extends EventEmitter {
         lastUpdateBlock: blockNumber,
         lastUpdateTimestamp: Date.now(),
         isIncentivized,
-        incentiveRate,
+        incentiveRate: incentiveRate || 0n, // Use 0n if incentive rate is null
       };
 
       this.poolStates.set(poolAddress.toLowerCase(), realState);
@@ -293,30 +293,38 @@ export class StablePoolMonitor extends EventEmitter {
   /**
    * Check if pool has active incentives
    */
-  private async checkPoolIncentives(_poolAddress: string): Promise<boolean> {
-    try {
-      // This would query the Aerodrome gauge factory to check for active gauges
-      // For now, return true for known incentivized pools
-      const knownIncentivizedPools = new Set([
-        '0x...', // Add known incentivized pool addresses
-      ]);
+  private checkPoolIncentives(poolAddress: string): boolean {
+    // TODO: Implement actual Aerodrome gauge-factory query to determine incentives
+    // Sources: Aerodrome docs, gauge factory contract on Base
+    // For now, use known incentivized pools (normalized to lowercase)
+    const knownIncentivizedPools = new Set<string>([
+      // TODO: Add real lowercased incentivized pool addresses from Aerodrome
+      // Example: '0x1234567890abcdef1234567890abcdef12345678'
+    ]);
 
-      return knownIncentivizedPools.has(_poolAddress.toLowerCase());
-    } catch (error) {
-      return false; // Conservative assumption
-    }
+    return knownIncentivizedPools.has(poolAddress.toLowerCase());
   }
 
   /**
    * Get incentive rate for pool
    */
-  private async getIncentiveRate(_poolAddress: string): Promise<bigint> {
+  private async getIncentiveRate(poolAddress: string): Promise<bigint | null> {
     try {
-      // This would query the gauge contract for current incentive rates
-      // For now, return a conservative estimate
-      return ethers.parseEther('0.001'); // 0.001 ETH per unit
+      // TODO: Implement actual gauge contract query for incentive rates
+      // This should connect to the Aerodrome gauge contract and call the appropriate view method
+      // Example implementation:
+      // const provider = this.connectionManager.getProvider();
+      // const gaugeAbi = ['function rewardRate() external view returns (uint256)'];
+      // const gaugeAddress = await this.getGaugeAddressForPool(poolAddress);
+      // const gaugeContract = new ethers.Contract(gaugeAddress, gaugeAbi, provider);
+      // const rate = await gaugeContract.rewardRate();
+      // return BigInt(rate.toString());
+
+      this.logger.warn('getIncentiveRate not implemented - returning null', { poolAddress });
+      return null; // Explicitly return null to indicate unknown incentive
     } catch (error) {
-      return 0n;
+      this.logger.error('Failed to get incentive rate', { poolAddress, error });
+      return null; // Return null on error so callers can handle missing data
     }
   }
 
