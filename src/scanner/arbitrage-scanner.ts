@@ -31,10 +31,15 @@ export interface IPriceOracle {
   getEthUsdPrice(): Promise<number>;
 }
 
-// Simple price oracle implementation
-export class SimplePriceOracle implements IPriceOracle {
+// Enhanced price oracle implementation with real Chainlink integration
+export class EnhancedPriceOracle implements IPriceOracle {
   private cachedPrice?: { price: number; timestamp: number };
   private readonly cacheTimeMs = 60000; // 1 minute cache
+  private readonly chainlinkOracle?: any; // Will be injected if available
+
+  constructor(chainlinkOracle?: any) {
+    this.chainlinkOracle = chainlinkOracle;
+  }
 
   async getEthUsdPrice(): Promise<number> {
     // Check cache first
@@ -43,15 +48,47 @@ export class SimplePriceOracle implements IPriceOracle {
     }
 
     try {
-      // For now, use a fallback price - in production this would query a price feed
-      // This could be replaced with Chainlink price feeds or other oracles
-      const fallbackPrice = 3000; // $3000 USD fallback
+      // Try Chainlink oracle first if available
+      if (this.chainlinkOracle) {
+        const price = await this.chainlinkOracle.getEthUsdPrice();
+        this.cachedPrice = { price, timestamp: Date.now() };
+        return price;
+      }
 
-      this.cachedPrice = { price: fallbackPrice, timestamp: Date.now() };
-      return fallbackPrice;
+      // Fallback to external price API (CoinGecko, etc.)
+      const price = await this.fetchEthPriceFromApi();
+      this.cachedPrice = { price, timestamp: Date.now() };
+      return price;
     } catch (error) {
-      // Return fallback price on error
-      return 3000;
+      // Return cached price if available
+      if (this.cachedPrice) {
+        return this.cachedPrice.price;
+      }
+
+      // Ultimate fallback with warning
+      console.warn('Failed to get ETH price from all sources, using emergency fallback');
+      return 3000; // Emergency fallback
+    }
+  }
+
+  /**
+   * Fetch ETH price from external API
+   */
+  private async fetchEthPriceFromApi(): Promise<number> {
+    try {
+      // Use CoinGecko API as fallback
+      const response = await fetch(
+        'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd'
+      );
+      const data = (await response.json()) as any;
+
+      if (data.ethereum && data.ethereum.usd) {
+        return data.ethereum.usd;
+      }
+
+      throw new Error('Invalid API response');
+    } catch (error) {
+      throw new Error('Failed to fetch ETH price from API');
     }
   }
 }
@@ -145,7 +182,7 @@ export class ArbitrageScanner extends EventEmitter {
     this.connectionManager = options.connectionManager;
     this.config = options.config;
     this.scanIntervalMs = options.scanIntervalMs ?? 1000; // 1s default for fast arbitrage detection
-    this.priceOracle = options.priceOracle ?? new SimplePriceOracle();
+    this.priceOracle = options.priceOracle ?? new EnhancedPriceOracle();
 
     this.initializeTokenPairs();
   }
