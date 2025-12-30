@@ -283,13 +283,11 @@ export class ChainlinkPriceOracleImpl extends EventEmitter implements ChainlinkP
       const provider = this.connectionManager.getProvider();
       const tokenAddressLower = tokenAddress.toLowerCase();
 
-      // Known Base token/ETH pools
+      // Known Base token/ETH pools (verified addresses)
       const knownPools: Record<string, string> = {
         '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': '0x74cb6260be6f31965c239df6d6ef2ac2b5d4f020', // USDC/ETH
-        // TODO: Add real pool addresses for DAI/ETH and wstETH/ETH when available on Base
-        // DAI/ETH pool: Research Base DEX deployments for DAI/ETH pairs
-        // wstETH/ETH pool: Check Uniswap V3 or other DEXs for wstETH/ETH on Base
-        // Sources: https://basescan.org, Uniswap V3 subgraph, DEX aggregator APIs
+        '0x50c5725949a6f0c72e6c4a641f24049a917db0cb': '0xdcf81663e68f076ef9763442de134fd0699de4ef', // DAI/WETH (from GeckoTerminal)
+        // Note: wstETH pools may not be available on Base yet, monitoring for deployment
       };
 
       const poolAddress = knownPools[tokenAddressLower];

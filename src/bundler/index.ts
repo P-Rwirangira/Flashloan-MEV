@@ -8,5 +8,12 @@
 // Re-export bundler components
 export * from './transaction-bundler';
 export * from './private-relay';
-export * from './relay-manager';
+export {
+  RelayManager,
+  RelaySubmissionResult,
+  RelayManagerOptions,
+  // Avoid conflicts by explicitly exporting with different names
+  RelayProvider as RelayManagerProvider,
+  RelayConfig as RelayManagerConfig,
+} from './relay-manager';
 export * from './bribe-optimizer';

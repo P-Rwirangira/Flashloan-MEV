@@ -23,32 +23,6 @@ export type Result<T, E = Error> =
 // Async result type
 export type AsyncResult<T, E = Error> = Promise<Result<T, E>>;
 
-// Network configuration
-export interface NetworkConfig {
-  readonly chainId: number;
-  readonly name: string;
-  readonly rpcUrl: string;
-  readonly wsUrl?: string;
-  readonly fallbackRpcs: string[];
-}
-
-// Gas configuration
-export interface GasConfig {
-  readonly maxGasPrice: BigNumberish;
-  readonly gasLimit: number;
-  readonly priorityFee: BigNumberish;
-  readonly baseFeeMultiplier: number;
-}
-
-// Timing configuration
-export interface TimingConfig {
-  readonly maxLatencyMs: number;
-  readonly timeoutMs: number;
-  readonly retryDelayMs: number;
-  readonly maxRetries: number;
-  readonly simulationTimeoutMs: number;
-}
-
 // Health status for components
 export enum HealthStatus {
   HEALTHY = 'healthy',

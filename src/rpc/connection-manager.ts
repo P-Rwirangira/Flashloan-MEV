@@ -7,7 +7,7 @@
 import { EventEmitter } from 'events';
 import WebSocket from 'ws';
 import { ethers } from 'ethers';
-import { NetworkConfig } from '../types/common';
+import { NetworkConfig } from '../types/config';
 
 export interface ConnectionHealth {
   readonly endpoint: string;

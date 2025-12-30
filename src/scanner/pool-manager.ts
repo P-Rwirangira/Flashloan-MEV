@@ -5,17 +5,21 @@
  */
 
 import { EventEmitter } from 'events';
+import { BigNumberish } from 'ethers';
 import { Address } from '../types/common';
 import { PoolState } from '../types/pool';
 import { PoolAllowlists, PoolAllowlist } from '../types/config';
+import { ChainlinkPriceOracleImpl } from '../oracles/chainlink-oracle';
+import { RpcConnectionManager } from '../rpc/connection-manager';
+import { createComponentLogger } from '../utils/logger';
 import { UniswapV3Monitor } from './uniswap-v3-monitor';
 import { AerodromeMonitor } from './aerodrome-monitor';
-import { RpcConnectionManager } from '../rpc/connection-manager';
 
 export interface PoolManagerOptions {
   readonly connectionManager: RpcConnectionManager;
   readonly allowedPools: PoolAllowlists;
   readonly updateIntervalMs?: number;
+  readonly priceOracle?: ChainlinkPriceOracleImpl;
 }
 
 export interface AllowlistViolation {
@@ -28,6 +32,8 @@ export class PoolManager extends EventEmitter {
   private readonly connectionManager: RpcConnectionManager;
   private allowedPools: PoolAllowlists;
   private readonly updateIntervalMs: number;
+  private readonly logger = createComponentLogger('pool-manager');
+  private readonly priceOracle?: ChainlinkPriceOracleImpl;
 
   // Pool monitors
   private uniswapV3Monitor?: UniswapV3Monitor;
@@ -42,6 +48,8 @@ export class PoolManager extends EventEmitter {
     this.connectionManager = options.connectionManager;
     this.allowedPools = { ...options.allowedPools }; // Create mutable copy
     this.updateIntervalMs = options.updateIntervalMs ?? 5000;
+    this.priceOracle =
+      options.priceOracle || new ChainlinkPriceOracleImpl(options.connectionManager);
   }
 
   /**
@@ -149,17 +157,17 @@ export class PoolManager extends EventEmitter {
   /**
    * Check if a pool is allowed
    */
-  isPoolAllowed(poolAddress: Address): boolean {
+  async isPoolAllowed(poolAddress: Address): Promise<boolean> {
     // Check Uniswap V3 allowlist
     const uniV3Pool = this.allowedPools.uniswapV3.find(pool => pool.address === poolAddress);
     if (uniV3Pool && uniV3Pool.enabled) {
-      return this.validatePoolAllowlist(uniV3Pool);
+      return await this.validatePoolAllowlist(uniV3Pool);
     }
 
     // Check Aerodrome allowlist
     const aeroPool = this.allowedPools.aerodrome.find(pool => pool.address === poolAddress);
     if (aeroPool && aeroPool.enabled) {
-      return this.validatePoolAllowlist(aeroPool);
+      return await this.validatePoolAllowlist(aeroPool);
     }
 
     return false;
@@ -273,7 +281,7 @@ export class PoolManager extends EventEmitter {
   /**
    * Validate pool against allowlist criteria
    */
-  private validatePoolAllowlist(poolConfig: PoolAllowlist): boolean {
+  private async validatePoolAllowlist(poolConfig: PoolAllowlist): Promise<boolean> {
     const poolState = this.getPoolState(poolConfig.address);
 
     if (!poolState) {
@@ -282,9 +290,41 @@ export class PoolManager extends EventEmitter {
     }
 
     // Check minimum TVL (if we have liquidity data)
-    if ('liquidity' in poolState && poolConfig.minTvl > 0) {
-      // This would require price data to calculate TVL
-      // For now, we'll skip this check
+    if ('liquidity' in poolState) {
+      const minTvl = this.safeConvertToBigInt(poolConfig.minTvl);
+      if (minTvl > 0n) {
+        try {
+          const actualTvl = await this.calculatePoolTvl(poolState, poolConfig);
+
+          if (actualTvl < minTvl) {
+            this.logger.warn('Pool TVL below minimum threshold', {
+              poolAddress: poolConfig.address,
+              actualTvl: actualTvl.toString(),
+              minTvl: minTvl.toString(),
+              shortfall: (minTvl - actualTvl).toString(),
+            });
+            return false;
+          }
+
+          this.logger.debug('Pool TVL validation passed', {
+            poolAddress: poolConfig.address,
+            actualTvl: actualTvl.toString(),
+            minTvl: minTvl.toString(),
+          });
+        } catch (error) {
+          this.logger.logError(error as Error, {
+            operation: 'tvl-validation',
+            poolAddress: poolConfig.address,
+          });
+
+          // On price data error, allow pool but log warning
+          this.logger.warn('TVL validation failed due to price data error - allowing pool', {
+            poolAddress: poolConfig.address,
+            minTvl: minTvl.toString(),
+            error: (error as Error).message,
+          });
+        }
+      }
     }
 
     // Check maximum slippage constraints
@@ -295,5 +335,126 @@ export class PoolManager extends EventEmitter {
 
     // Pool passes all checks
     return true;
+  }
+
+  /**
+   * Calculate pool TVL using price oracle data
+   */
+  private async calculatePoolTvl(poolState: PoolState, poolConfig: PoolAllowlist): Promise<bigint> {
+    if (!this.priceOracle) {
+      throw new Error('Price oracle not available for TVL calculation');
+    }
+
+    try {
+      // Handle different pool types
+      if ('liquidity' in poolState) {
+        // Uniswap V3 pool
+        return await this.calculateUniswapV3Tvl(poolState as any);
+      } else if ('reserve0' in poolState && 'reserve1' in poolState) {
+        // Aerodrome pool (AMM style)
+        return await this.calculateAerodromeTvl(poolState as any);
+      } else {
+        throw new Error(`Unsupported pool type for TVL calculation: ${poolConfig.address}`);
+      }
+    } catch (error) {
+      this.logger.logError(error as Error, {
+        operation: 'calculate-pool-tvl',
+        poolAddress: poolConfig.address,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Calculate TVL for Uniswap V3 pools
+   */
+  private async calculateUniswapV3Tvl(poolState: any): Promise<bigint> {
+    try {
+      // For Uniswap V3, we need to estimate TVL from liquidity and current price
+      // This is a simplified calculation - real implementation would need tick data
+
+      const [token0Price, token1Price] = await Promise.all([
+        this.priceOracle!.getTokenUsdPrice(poolState.token0),
+        this.priceOracle!.getTokenUsdPrice(poolState.token1),
+      ]);
+
+      // Simplified TVL estimation using liquidity
+      // In reality, this would require complex tick math and position analysis
+      const liquidityValue = BigInt(poolState.liquidity.toString());
+
+      // Rough approximation: assume equal value split and use geometric mean of prices
+      const avgPrice = Math.sqrt(token0Price * token1Price);
+      const estimatedTvlUsd = (Number(liquidityValue) * avgPrice) / 1e18; // Normalize for 18 decimals
+
+      // Convert back to wei (assuming USD with 18 decimals for consistency)
+      return BigInt(Math.floor(estimatedTvlUsd * 1e18));
+    } catch (error) {
+      this.logger.logError(error as Error, {
+        operation: 'calculate-uniswap-v3-tvl',
+        poolAddress: poolState.address,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Calculate TVL for Aerodrome pools
+   */
+  private async calculateAerodromeTvl(poolState: any): Promise<bigint> {
+    try {
+      const [token0Price, token1Price] = await Promise.all([
+        this.priceOracle!.getTokenUsdPrice(poolState.token0),
+        this.priceOracle!.getTokenUsdPrice(poolState.token1),
+      ]);
+
+      // Get reserve amounts
+      const reserve0 = BigInt(poolState.reserve0.toString());
+      const reserve1 = BigInt(poolState.reserve1.toString());
+
+      // Calculate USD values for each reserve
+      // Assume 18 decimals for simplicity - real implementation would fetch token decimals
+      const reserve0ValueUsd = (Number(reserve0) * token0Price) / 1e18;
+      const reserve1ValueUsd = (Number(reserve1) * token1Price) / 1e18;
+
+      const totalTvlUsd = reserve0ValueUsd + reserve1ValueUsd;
+
+      // Convert to wei (18 decimals)
+      return BigInt(Math.floor(totalTvlUsd * 1e18));
+    } catch (error) {
+      this.logger.logError(error as Error, {
+        operation: 'calculate-aerodrome-tvl',
+        poolAddress: poolState.address,
+      });
+      throw error;
+    }
+  }
+  private safeConvertToBigInt(value: BigNumberish): bigint {
+    if (value === null || value === undefined) {
+      return 0n;
+    }
+
+    if (typeof value === 'bigint') {
+      return value;
+    }
+
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value) || value < 0) {
+        return 0n;
+      }
+      return BigInt(Math.floor(value));
+    }
+
+    if (typeof value === 'string') {
+      try {
+        if (!/^\d+$/.test(value)) {
+          return 0n;
+        }
+        return BigInt(value);
+      } catch {
+        return 0n;
+      }
+    }
+
+    return 0n;
   }
 }

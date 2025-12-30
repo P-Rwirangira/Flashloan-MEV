@@ -5,7 +5,7 @@
  */
 
 import { ethers } from 'ethers';
-import { NetworkConfig } from '../types/common';
+import { NetworkConfig } from '../types/config';
 import { RpcConnectionManager, RpcConnectionOptions } from './connection-manager';
 
 export interface ProviderConfig {
@@ -56,7 +56,7 @@ export class ProviderFactory {
     ];
 
     // Add fallback providers
-    config.network.fallbackRpcs.forEach((url, index) => {
+    config.network.fallbackRpcs.forEach((url: string, index: number) => {
       providers.push({
         provider: new ethers.JsonRpcProvider(url, {
           chainId: config.network.chainId,

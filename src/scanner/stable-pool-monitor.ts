@@ -259,8 +259,8 @@ export class StablePoolMonitor extends EventEmitter {
         (pairContract as any).fee().catch(() => 5n), // Default 0.05% fee
       ]);
 
-      // Check if pool has incentives (would need to query gauge contract)
-      const isIncentivized = this.checkPoolIncentives(poolAddress);
+      // Check if pool has incentives (query Aerodrome Voter contract)
+      const isIncentivized = await this.checkPoolIncentives(poolAddress);
       const incentiveRate = isIncentivized ? await this.getIncentiveRate(poolAddress) : null;
 
       const realState: StablePoolState = {
@@ -291,18 +291,35 @@ export class StablePoolMonitor extends EventEmitter {
   }
 
   /**
-   * Check if pool has active incentives
+   * Check if pool has active incentives using Aerodrome Voter contract
    */
-  private checkPoolIncentives(poolAddress: string): boolean {
-    // TODO: Implement actual Aerodrome gauge-factory query to determine incentives
-    // Sources: Aerodrome docs, gauge factory contract on Base
-    // For now, use known incentivized pools (normalized to lowercase)
-    const knownIncentivizedPools = new Set<string>([
-      // TODO: Add real lowercased incentivized pool addresses from Aerodrome
-      // Example: '0x1234567890abcdef1234567890abcdef12345678'
-    ]);
+  private async checkPoolIncentives(poolAddress: string): Promise<boolean> {
+    try {
+      const provider = this.connectionManager.getProvider();
 
-    return knownIncentivizedPools.has(poolAddress.toLowerCase());
+      // Aerodrome Voter contract on Base
+      const voterAddress = '0x16613524e02ad97eDfeF371bC883F2F5d6C480A5';
+      const voterAbi = [
+        'function gauges(address pool) external view returns (address gauge)',
+        'function isAlive(address gauge) external view returns (bool)',
+      ];
+
+      const voterContract = new ethers.Contract(voterAddress, voterAbi, provider);
+
+      // Get gauge address for this pool
+      const gaugeAddress = await (voterContract as any).gauges(poolAddress.toLowerCase());
+
+      // Check if gauge exists and is alive
+      if (gaugeAddress && gaugeAddress !== ethers.ZeroAddress) {
+        const isAlive = await (voterContract as any).isAlive(gaugeAddress);
+        return isAlive;
+      }
+
+      return false;
+    } catch (error) {
+      this.logger.warn('Failed to check pool incentives', { poolAddress, error });
+      return false; // Conservative assumption on error
+    }
   }
 
   /**
@@ -310,20 +327,42 @@ export class StablePoolMonitor extends EventEmitter {
    */
   private async getIncentiveRate(poolAddress: string): Promise<bigint | null> {
     try {
-      // TODO: Implement actual gauge contract query for incentive rates
-      // This should connect to the Aerodrome gauge contract and call the appropriate view method
-      // Example implementation:
-      // const provider = this.connectionManager.getProvider();
-      // const gaugeAbi = ['function rewardRate() external view returns (uint256)'];
-      // const gaugeAddress = await this.getGaugeAddressForPool(poolAddress);
-      // const gaugeContract = new ethers.Contract(gaugeAddress, gaugeAbi, provider);
-      // const rate = await gaugeContract.rewardRate();
-      // return BigInt(rate.toString());
+      const provider = this.connectionManager.getProvider();
 
-      this.logger.warn('getIncentiveRate not implemented - returning null', { poolAddress });
-      return null; // Explicitly return null to indicate unknown incentive
+      // First get the gauge address from the Voter contract
+      const voterAddress = '0x16613524e02ad97eDfeF371bC883F2F5d6C480A5';
+      const voterAbi = ['function gauges(address pool) external view returns (address gauge)'];
+      const voterContract = new ethers.Contract(voterAddress, voterAbi, provider);
+
+      const gaugeAddress = await (voterContract as any).gauges(poolAddress.toLowerCase());
+
+      if (!gaugeAddress || gaugeAddress === ethers.ZeroAddress) {
+        this.logger.debug('No gauge found for pool', { poolAddress });
+        return null;
+      }
+
+      // Query the gauge for reward rate
+      const gaugeAbi = [
+        'function rewardRate() external view returns (uint256)',
+        'function rewardRateByEpoch(uint256 timestamp) external view returns (uint256)',
+      ];
+
+      const gaugeContract = new ethers.Contract(gaugeAddress, gaugeAbi, provider);
+
+      // Try to get current reward rate
+      const rewardRate = await (gaugeContract as any).rewardRate();
+
+      if (rewardRate && rewardRate > 0n) {
+        return BigInt(rewardRate.toString());
+      }
+
+      this.logger.debug('No active reward rate for gauge', { poolAddress, gaugeAddress });
+      return null;
     } catch (error) {
-      this.logger.error('Failed to get incentive rate', { poolAddress, error });
+      this.logger.error('Failed to get incentive rate from gauge contract', {
+        poolAddress,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
       return null; // Return null on error so callers can handle missing data
     }
   }

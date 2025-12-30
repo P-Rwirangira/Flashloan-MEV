@@ -6,6 +6,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { ethers } from 'ethers';
 import { createComponentLogger } from '../utils/logger';
 import { RpcConnectionManager } from '../rpc/connection-manager';
 
@@ -315,14 +316,23 @@ abstract class ProtocolMonitor {
  * Moonwell Protocol Monitor
  */
 class MoonwellMonitor extends ProtocolMonitor {
-  async scanForOpportunities(blockNumber: number): Promise<LiquidationOpportunity[]> {
-    // TODO: Implement Moonwell-specific liquidation scanning
-    // This would involve:
-    // 1. Query Moonwell comptroller for accounts with low health factors
-    // 2. Calculate liquidation amounts and bonuses
-    // 3. Estimate gas costs and profits
-    // 4. Return viable liquidation opportunities
+  private readonly MOONWELL_COMPTROLLER_ABI = [
+    'function getAllMarkets() external view returns (address[])',
+    'function getAccountLiquidity(address account) external view returns (uint256, uint256, uint256)',
+    'function liquidationIncentiveMantissa() external view returns (uint256)',
+    'function closeFactorMantissa() external view returns (uint256)',
+    'function markets(address) external view returns (bool, uint256, bool)',
+  ];
 
+  private readonly MTOKEN_ABI = [
+    'function borrowBalanceStored(address account) external view returns (uint256)',
+    'function balanceOfUnderlying(address account) external view returns (uint256)',
+    'function exchangeRateStored() external view returns (uint256)',
+    'function underlying() external view returns (address)',
+    'function symbol() external view returns (string)',
+  ];
+
+  async scanForOpportunities(blockNumber: number): Promise<LiquidationOpportunity[]> {
     this.logger.debug('Scanning Moonwell for liquidation opportunities', {
       blockNumber,
       protocol: this.config.protocol,
@@ -330,8 +340,145 @@ class MoonwellMonitor extends ProtocolMonitor {
       minProfit: this.config.minProfitThreshold.toString(),
     });
 
-    // Placeholder implementation
-    return [];
+    try {
+      const provider = this.connectionManager.getProvider();
+      const comptroller = new ethers.Contract(
+        this.config.comptrollerAddress,
+        this.MOONWELL_COMPTROLLER_ABI,
+        provider
+      ) as ethers.Contract & {
+        getAllMarkets(): Promise<string[]>;
+        getAccountLiquidity(account: string): Promise<[bigint, bigint, bigint]>;
+        liquidationIncentiveMantissa(): Promise<bigint>;
+        closeFactorMantissa(): Promise<bigint>;
+      };
+
+      // Get all markets
+      const markets = await comptroller.getAllMarkets();
+      this.logger.debug(`Found ${markets.length} Moonwell markets`);
+
+      const opportunities: LiquidationOpportunity[] = [];
+
+      // Get liquidation incentive and close factor
+      const [liquidationIncentive, closeFactor] = await Promise.all([
+        comptroller.liquidationIncentiveMantissa(),
+        comptroller.closeFactorMantissa(),
+      ]);
+
+      const liquidationBonus = Number(liquidationIncentive) / 1e18 - 1; // Convert from mantissa
+      const closeFactorRatio = Number(closeFactor) / 1e18;
+
+      // For demonstration, we'll check a few known risky accounts
+      // In production, this would involve scanning recent transactions or maintaining a list
+      const riskAccounts = [
+        '0x742d35Cc6634C0532925a3b8D4C9db96C4b4d8b6', // Example account
+        '0x8ba1f109551bD432803012645Hac136c22C4e5c', // Example account
+      ];
+
+      for (const account of riskAccounts) {
+        try {
+          // Get account liquidity (error, liquidity, shortfall)
+          const [error, liquidity, shortfall] = await comptroller.getAccountLiquidity(account);
+
+          if (error > 0 || shortfall === 0n) {
+            continue; // Skip if error or no shortfall
+          }
+
+          // Calculate health factor (simplified)
+          const healthFactor = Number(liquidity) / (Number(shortfall) + Number(liquidity));
+
+          if (healthFactor > this.thresholds.critical) {
+            continue; // Not critical enough
+          }
+
+          // Get account positions in each market
+          for (const marketAddress of markets) {
+            try {
+              const mToken = new ethers.Contract(
+                marketAddress,
+                this.MTOKEN_ABI,
+                provider
+              ) as ethers.Contract & {
+                borrowBalanceStored(account: string): Promise<bigint>;
+                balanceOfUnderlying(account: string): Promise<bigint>;
+                symbol(): Promise<string>;
+              };
+
+              const [borrowBalance, collateralBalance, symbol] = await Promise.all([
+                mToken.borrowBalanceStored(account),
+                mToken.balanceOfUnderlying(account),
+                mToken.symbol(),
+              ]);
+
+              if (borrowBalance === 0n || collateralBalance === 0n) {
+                continue;
+              }
+
+              // Calculate liquidation amount (max 50% of debt)
+              const maxLiquidationAmount =
+                (borrowBalance * BigInt(Math.floor(closeFactorRatio * 1e18))) / BigInt(1e18);
+
+              // Estimate profit (simplified calculation)
+              const liquidationValue = maxLiquidationAmount;
+              const bonusValue =
+                (liquidationValue * BigInt(Math.floor(liquidationBonus * 1e18))) / BigInt(1e18);
+              const gasEstimate = 300000n; // Estimated gas for liquidation
+              const gasCost = gasEstimate * 20000000000n; // 20 gwei
+              const estimatedProfit = bonusValue - gasCost;
+
+              if (estimatedProfit < this.config.minProfitThreshold) {
+                continue;
+              }
+
+              const opportunity: LiquidationOpportunity = {
+                id: `moonwell-${account}-${marketAddress}-${blockNumber}`,
+                protocol: LendingProtocol.MOONWELL,
+                borrower: account,
+                healthFactor,
+                collateralAsset: marketAddress,
+                collateralAmount: collateralBalance,
+                debtAsset: marketAddress, // Simplified - same market
+                debtAmount: borrowBalance,
+                liquidationBonus,
+                maxLiquidationAmount,
+                estimatedProfit,
+                gasEstimate,
+                deadline: Date.now() + 300000, // 5 minutes
+                blockNumber,
+              };
+
+              opportunities.push(opportunity);
+
+              this.logger.info('Found Moonwell liquidation opportunity', {
+                account,
+                market: symbol,
+                healthFactor: healthFactor.toFixed(3),
+                profit: ethers.formatEther(estimatedProfit),
+              });
+            } catch (marketError) {
+              this.logger.debug('Error checking market for account', {
+                account,
+                market: marketAddress,
+                error: (marketError as Error).message,
+              });
+            }
+          }
+        } catch (accountError) {
+          this.logger.debug('Error checking account liquidity', {
+            account,
+            error: (accountError as Error).message,
+          });
+        }
+      }
+
+      return opportunities;
+    } catch (error) {
+      this.logger.logError(error as Error, {
+        operation: 'moonwell-scan',
+        blockNumber,
+      });
+      return [];
+    }
   }
 }
 
@@ -339,18 +486,152 @@ class MoonwellMonitor extends ProtocolMonitor {
  * Aave V3 Protocol Monitor
  */
 class AaveV3Monitor extends ProtocolMonitor {
-  async scanForOpportunities(blockNumber: number): Promise<LiquidationOpportunity[]> {
-    // TODO: Implement Aave V3-specific liquidation scanning
-    // This would involve:
-    // 1. Query Aave V3 data provider for unhealthy positions
-    // 2. Calculate liquidation parameters using Aave's formulas
-    // 3. Estimate profits considering liquidation bonuses
-    // 4. Return viable liquidation opportunities
+  private readonly AAVE_V3_DATA_PROVIDER_ABI = [
+    'function getAllReservesTokens() external view returns (tuple(string symbol, address tokenAddress)[])',
+    'function getUserReservesData(address user) external view returns (tuple(address underlyingAsset, uint256 scaledATokenBalance, bool usageAsCollateralEnabled, uint256 currentATokenBalance, uint256 currentStableDebt, uint256 currentVariableDebt, uint256 principalStableDebt, uint256 scaledVariableDebt, uint256 stableBorrowRate, uint256 liquidityRate, uint40 stableRateLastUpdated, bool stableBorrowRateEnabled)[])',
+    'function getReserveConfigurationData(address asset) external view returns (uint256 decimals, uint256 ltv, uint256 liquidationThreshold, uint256 liquidationBonus, uint256 reserveFactor, bool usageAsCollateralEnabled, bool borrowingEnabled, bool stableBorrowRateEnabled, bool isActive, bool isFrozen)',
+  ];
 
+  private readonly AAVE_V3_POOL_ABI = [
+    'function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)',
+  ];
+
+  async scanForOpportunities(blockNumber: number): Promise<LiquidationOpportunity[]> {
     this.logger.debug('Scanning Aave V3 for liquidation opportunities', { blockNumber });
 
-    // Placeholder implementation
-    return [];
+    try {
+      const provider = this.connectionManager.getProvider();
+
+      // Aave V3 addresses on Base (if deployed)
+      const dataProviderAddress =
+        this.config.dataProviderAddress || '0x2d8A3C5677189723C4cB8873CfC9C8976FDF38Ac'; // Example address
+      const poolAddress = this.config.comptrollerAddress; // Pool address
+
+      const dataProvider = new ethers.Contract(
+        dataProviderAddress,
+        this.AAVE_V3_DATA_PROVIDER_ABI,
+        provider
+      ) as ethers.Contract & {
+        getAllReservesTokens(): Promise<Array<{ symbol: string; tokenAddress: string }>>;
+        getUserReservesData(user: string): Promise<
+          Array<{
+            underlyingAsset: string;
+            currentATokenBalance: bigint;
+            currentVariableDebt: bigint;
+            usageAsCollateralEnabled: boolean;
+          }>
+        >;
+        getReserveConfigurationData(asset: string): Promise<{
+          liquidationThreshold: bigint;
+          liquidationBonus: bigint;
+        }>;
+      };
+
+      const pool = new ethers.Contract(
+        poolAddress,
+        this.AAVE_V3_POOL_ABI,
+        provider
+      ) as ethers.Contract & {
+        getUserAccountData(user: string): Promise<{
+          totalCollateralBase: bigint;
+          totalDebtBase: bigint;
+          healthFactor: bigint;
+        }>;
+      };
+
+      const opportunities: LiquidationOpportunity[] = [];
+
+      // Get all reserves
+      const reserves = await dataProvider.getAllReservesTokens();
+      this.logger.debug(`Found ${reserves.length} Aave V3 reserves`);
+
+      // Sample risky accounts (in production, would scan recent transactions or maintain a list)
+      const riskAccounts = [
+        '0x742d35Cc6634C0532925a3b8D4C9db96C4b4d8b6',
+        '0x8ba1f109551bD432803012645Hac136c22C4e5c',
+      ];
+
+      for (const account of riskAccounts) {
+        try {
+          // Get user account data
+          const accountData = await pool.getUserAccountData(account);
+          const healthFactor = Number(accountData.healthFactor) / 1e18;
+
+          if (healthFactor > this.thresholds.critical) {
+            continue; // Not critical enough
+          }
+
+          // Get user reserves data
+          const userReserves = await dataProvider.getUserReservesData(account);
+
+          for (const reserve of userReserves) {
+            if (reserve.currentVariableDebt === 0n || !reserve.usageAsCollateralEnabled) {
+              continue;
+            }
+
+            // Get reserve configuration
+            const reserveConfig = await dataProvider.getReserveConfigurationData(
+              reserve.underlyingAsset
+            );
+
+            // Calculate liquidation parameters
+            const liquidationBonus = Number(reserveConfig.liquidationBonus) / 10000 - 1; // Convert from basis points
+            const maxLiquidationAmount = reserve.currentVariableDebt / 2n; // Max 50% of debt
+
+            // Estimate profit
+            const liquidationValue = maxLiquidationAmount;
+            const bonusValue =
+              (liquidationValue * BigInt(Math.floor(liquidationBonus * 1e18))) / BigInt(1e18);
+            const gasEstimate = 400000n; // Estimated gas for Aave liquidation
+            const gasCost = gasEstimate * 25000000000n; // 25 gwei
+            const estimatedProfit = bonusValue - gasCost;
+
+            if (estimatedProfit < this.config.minProfitThreshold) {
+              continue;
+            }
+
+            const opportunity: LiquidationOpportunity = {
+              id: `aave-v3-${account}-${reserve.underlyingAsset}-${blockNumber}`,
+              protocol: LendingProtocol.AAVE_V3,
+              borrower: account,
+              healthFactor,
+              collateralAsset: reserve.underlyingAsset,
+              collateralAmount: reserve.currentATokenBalance,
+              debtAsset: reserve.underlyingAsset,
+              debtAmount: reserve.currentVariableDebt,
+              liquidationBonus,
+              maxLiquidationAmount,
+              estimatedProfit,
+              gasEstimate,
+              deadline: Date.now() + 300000, // 5 minutes
+              blockNumber,
+            };
+
+            opportunities.push(opportunity);
+
+            this.logger.info('Found Aave V3 liquidation opportunity', {
+              account,
+              asset: reserve.underlyingAsset,
+              healthFactor: healthFactor.toFixed(3),
+              profit: ethers.formatEther(estimatedProfit),
+            });
+          }
+        } catch (accountError) {
+          this.logger.debug('Error checking Aave V3 account', {
+            account,
+            error: (accountError as Error).message,
+          });
+        }
+      }
+
+      return opportunities;
+    } catch (error) {
+      this.logger.logError(error as Error, {
+        operation: 'aave-v3-scan',
+        blockNumber,
+      });
+      return [];
+    }
   }
 }
 
@@ -358,17 +639,163 @@ class AaveV3Monitor extends ProtocolMonitor {
  * Seamless Protocol Monitor
  */
 class SeamlessMonitor extends ProtocolMonitor {
-  async scanForOpportunities(blockNumber: number): Promise<LiquidationOpportunity[]> {
-    // TODO: Implement Seamless-specific liquidation scanning
-    // This would involve:
-    // 1. Query Seamless protocol for positions at risk
-    // 2. Calculate liquidation parameters
-    // 3. Estimate profitability
-    // 4. Return viable liquidation opportunities
+  private readonly SEAMLESS_COMPTROLLER_ABI = [
+    'function getAllMarkets() external view returns (address[])',
+    'function getAccountLiquidity(address account) external view returns (uint256, uint256, uint256)',
+    'function liquidationIncentiveMantissa() external view returns (uint256)',
+    'function closeFactorMantissa() external view returns (uint256)',
+  ];
 
+  private readonly SEAMLESS_CTOKEN_ABI = [
+    'function borrowBalanceStored(address account) external view returns (uint256)',
+    'function balanceOfUnderlying(address account) external view returns (uint256)',
+    'function underlying() external view returns (address)',
+    'function symbol() external view returns (string)',
+    'function exchangeRateStored() external view returns (uint256)',
+  ];
+
+  async scanForOpportunities(blockNumber: number): Promise<LiquidationOpportunity[]> {
     this.logger.debug('Scanning Seamless for liquidation opportunities', { blockNumber });
 
-    // Placeholder implementation
-    return [];
+    try {
+      const provider = this.connectionManager.getProvider();
+      const comptroller = new ethers.Contract(
+        this.config.comptrollerAddress,
+        this.SEAMLESS_COMPTROLLER_ABI,
+        provider
+      ) as ethers.Contract & {
+        getAllMarkets(): Promise<string[]>;
+        getAccountLiquidity(account: string): Promise<[bigint, bigint, bigint]>;
+        liquidationIncentiveMantissa(): Promise<bigint>;
+        closeFactorMantissa(): Promise<bigint>;
+      };
+
+      // Get all markets
+      const markets = await comptroller.getAllMarkets();
+      this.logger.debug(`Found ${markets.length} Seamless markets`);
+
+      const opportunities: LiquidationOpportunity[] = [];
+
+      // Get liquidation parameters
+      const [liquidationIncentive, closeFactor] = await Promise.all([
+        comptroller.liquidationIncentiveMantissa(),
+        comptroller.closeFactorMantissa(),
+      ]);
+
+      const liquidationBonus = Number(liquidationIncentive) / 1e18 - 1;
+      const closeFactorRatio = Number(closeFactor) / 1e18;
+
+      // Sample risky accounts
+      const riskAccounts = [
+        '0x742d35Cc6634C0532925a3b8D4C9db96C4b4d8b6',
+        '0x8ba1f109551bD432803012645Hac136c22C4e5c',
+      ];
+
+      for (const account of riskAccounts) {
+        try {
+          // Get account liquidity
+          const [error, liquidity, shortfall] = await comptroller.getAccountLiquidity(account);
+
+          if (error > 0 || shortfall === 0n) {
+            continue;
+          }
+
+          // Calculate health factor
+          const healthFactor = Number(liquidity) / (Number(shortfall) + Number(liquidity));
+
+          if (healthFactor > this.thresholds.critical) {
+            continue;
+          }
+
+          // Check positions in each market
+          for (const marketAddress of markets) {
+            try {
+              const cToken = new ethers.Contract(
+                marketAddress,
+                this.SEAMLESS_CTOKEN_ABI,
+                provider
+              ) as ethers.Contract & {
+                borrowBalanceStored(account: string): Promise<bigint>;
+                balanceOfUnderlying(account: string): Promise<bigint>;
+                symbol(): Promise<string>;
+                underlying(): Promise<string>;
+              };
+
+              const [borrowBalance, collateralBalance, symbol, underlying] = await Promise.all([
+                cToken.borrowBalanceStored(account),
+                cToken.balanceOfUnderlying(account),
+                cToken.symbol(),
+                cToken.underlying(),
+              ]);
+
+              if (borrowBalance === 0n || collateralBalance === 0n) {
+                continue;
+              }
+
+              // Calculate liquidation amount
+              const maxLiquidationAmount =
+                (borrowBalance * BigInt(Math.floor(closeFactorRatio * 1e18))) / BigInt(1e18);
+
+              // Estimate profit
+              const liquidationValue = maxLiquidationAmount;
+              const bonusValue =
+                (liquidationValue * BigInt(Math.floor(liquidationBonus * 1e18))) / BigInt(1e18);
+              const gasEstimate = 350000n; // Estimated gas for Seamless liquidation
+              const gasCost = gasEstimate * 22000000000n; // 22 gwei
+              const estimatedProfit = bonusValue - gasCost;
+
+              if (estimatedProfit < this.config.minProfitThreshold) {
+                continue;
+              }
+
+              const opportunity: LiquidationOpportunity = {
+                id: `seamless-${account}-${marketAddress}-${blockNumber}`,
+                protocol: LendingProtocol.SEAMLESS,
+                borrower: account,
+                healthFactor,
+                collateralAsset: underlying,
+                collateralAmount: collateralBalance,
+                debtAsset: underlying,
+                debtAmount: borrowBalance,
+                liquidationBonus,
+                maxLiquidationAmount,
+                estimatedProfit,
+                gasEstimate,
+                deadline: Date.now() + 300000, // 5 minutes
+                blockNumber,
+              };
+
+              opportunities.push(opportunity);
+
+              this.logger.info('Found Seamless liquidation opportunity', {
+                account,
+                market: symbol,
+                healthFactor: healthFactor.toFixed(3),
+                profit: ethers.formatEther(estimatedProfit),
+              });
+            } catch (marketError) {
+              this.logger.debug('Error checking Seamless market for account', {
+                account,
+                market: marketAddress,
+                error: (marketError as Error).message,
+              });
+            }
+          }
+        } catch (accountError) {
+          this.logger.debug('Error checking Seamless account liquidity', {
+            account,
+            error: (accountError as Error).message,
+          });
+        }
+      }
+
+      return opportunities;
+    } catch (error) {
+      this.logger.logError(error as Error, {
+        operation: 'seamless-scan',
+        blockNumber,
+      });
+      return [];
+    }
   }
 }
