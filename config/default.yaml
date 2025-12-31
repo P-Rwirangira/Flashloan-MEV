@@ -1,6 +1,35 @@
 # Base MEV Platform Configuration
 # This is the default configuration for the Base MEV platform
 
+# Phase Configuration
+phases:
+  arbitrage:
+    enabled: true
+    priority: 1
+  liquidations:
+    enabled: false  # Enable for Phase 2
+    priority: 2
+  stablePoolRebalancing:
+    enabled: false  # Enable for Phase 3
+    priority: 3
+
+# Feature Flags
+featureFlags:
+  enableLiquidationMonitoring: false
+  enableStablePoolMonitoring: false
+  enableAdvancedRouting: true
+  enablePerformanceOptimizations: true
+  enableMempoolMonitoring: true
+  enableCompetitionTracking: true
+
+# Graceful Degradation
+gracefulDegradation:
+  enabled: true
+  fallbackToArbitrageOnly: true
+  maxConsecutiveFailures: 10
+  autoRecovery: true
+  recoveryCheckIntervalMs: 60000
+
 # Network configuration
 network:
   chainId: 8453  # Base mainnet
