@@ -14,6 +14,8 @@ import { ArbitrageScanner } from './scanner/arbitrage-scanner';
 import { MetricsCollector } from './monitoring/metrics-collector';
 import { CircuitBreaker } from './monitoring/circuit-breaker';
 import { AlertingSystem } from './monitoring/alerting-system';
+import { HealthCheckSystem } from './monitoring/health-check';
+import { HealthServer } from './monitoring/health-server';
 import { RelayProvider } from './bundler/private-relay';
 import { LendingProtocolMonitor } from './scanner/lending-monitor';
 import { StablePoolMonitor } from './scanner/stable-pool-monitor';
@@ -50,6 +52,8 @@ class BaseMEVPlatform extends EventEmitter {
   private metricsCollector: MetricsCollector;
   private circuitBreaker: CircuitBreaker;
   private alertingSystem: AlertingSystem;
+  private healthCheckSystem: HealthCheckSystem;
+  private healthServer: HealthServer;
 
   // Phase-specific components
   private arbitrageScanner?: ArbitrageScanner;
@@ -99,6 +103,21 @@ class BaseMEVPlatform extends EventEmitter {
     });
 
     this.alertingSystem = new AlertingSystem(this.metricsCollector);
+
+    this.healthCheckSystem = new HealthCheckSystem({
+      metricsCollector: this.metricsCollector,
+      circuitBreaker: this.circuitBreaker,
+      checkIntervalMs: 30000,
+      unhealthyThreshold: 3,
+      degradedThreshold: 2,
+    });
+
+    this.healthServer = new HealthServer({
+      port: parseInt(process.env['HEALTH_PORT'] || '3002', 10),
+      host: process.env['HEALTH_HOST'] || '0.0.0.0',
+      healthCheckSystem: this.healthCheckSystem,
+      metricsCollector: this.metricsCollector,
+    });
 
     this.setupEventHandlers();
   }
@@ -361,8 +380,23 @@ class BaseMEVPlatform extends EventEmitter {
     return globalPerformanceTracker.trackOperation('platform-startup', async () => {
       this.platformLogger.info('Starting Base MEV Platform...');
 
+      // Start health check server
+      try {
+        await this.healthServer.start();
+        this.platformLogger.info('Health check server started successfully');
+      } catch (error) {
+        this.platformLogger.logError(error as Error, {
+          operation: 'health-server-startup',
+        });
+        // Don't throw - health server is optional
+        this.platformLogger.warn('Continuing without health check server');
+      }
+
       // Start phase-specific components
       await this.startPhaseComponents();
+
+      // Update health check with active phases
+      this.healthCheckSystem.updateActivePhases(this.getActivePhases());
 
       this.isRunning = true;
       this.platformLogger.info('Base MEV Platform started successfully', {
@@ -762,6 +796,19 @@ class BaseMEVPlatform extends EventEmitter {
       // Stop Phase 3: Stable pool monitoring
       if (this.stablePoolMonitor) {
         this.stablePoolMonitor.stopScanning();
+      }
+
+      // Stop health check system
+      this.healthCheckSystem.stop();
+
+      // Stop health check server
+      try {
+        await this.healthServer.stop();
+        this.platformLogger.info('Health check server stopped');
+      } catch (error) {
+        this.platformLogger.logError(error as Error, {
+          operation: 'health-server-shutdown',
+        });
       }
 
       this.isRunning = false;
