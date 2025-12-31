@@ -23,6 +23,11 @@ import { MempoolMonitor } from './scanner/mempool-monitor';
 import { LiquidationProfitCalculator } from './simulator/liquidation-calculator';
 import { StablePoolRebalancingCalculator } from './simulator/stable-pool-calculator';
 import { ExecutionOrchestrator } from './execution/execution-orchestrator';
+import { FlashLoanArbitrageEngine } from './execution/flash-loan-arbitrage-engine';
+import { OpportunityStateMachine } from './execution/opportunity-state-machine';
+import { FlashLoanManager } from './execution/flash-loan-manager';
+import { TransactionLifecycleManager } from './execution/transaction-lifecycle-manager';
+import { OpportunityType } from './types/execution';
 import { EventEmitter } from 'events';
 import { ethers } from 'ethers';
 import path from 'path';
@@ -73,6 +78,10 @@ class BaseMEVPlatform extends EventEmitter {
 
   // Execution engine
   private executionOrchestrator?: ExecutionOrchestrator;
+  private flashLoanArbitrageEngine?: FlashLoanArbitrageEngine;
+  private opportunityStateMachine?: OpportunityStateMachine;
+  private flashLoanManager?: FlashLoanManager;
+  private transactionLifecycleManager?: TransactionLifecycleManager;
 
   // Phase-specific components
   private arbitrageScanner?: ArbitrageScanner;
@@ -417,56 +426,168 @@ class BaseMEVPlatform extends EventEmitter {
         return;
       }
 
-      // Initialize execution orchestrator (signer will be created by individual engines as needed)
-      this.executionOrchestrator = new ExecutionOrchestrator({
-        maxConcurrentExecutions: this.config.execution.maxConcurrentExecutions,
-        enableCircuitBreaker: true,
-        circuitBreakerThreshold: 3,
-        circuitBreakerRecoveryTimeMs: 300000, // 5 minutes
-        executionTimeoutMs: 45000,
-        queueMaxSize: 100,
-        enableGracefulShutdown: true,
-        shutdownTimeoutMs: 30000,
-      });
+      try {
+        // Create provider and signer for execution
+        const provider = this.connectionManager.getProvider();
+        const signer = new ethers.Wallet(privateKey, provider);
 
-      // Set up execution event handlers
-      this.executionOrchestrator.on('opportunityExecuted', result => {
-        this.platformLogger.info('Opportunity executed successfully', {
-          opportunityId: result.opportunityId,
-          profit: result.profit?.toString(),
-          gasUsed: result.gasUsed?.toString(),
-          executionTime: result.executionTime,
+        this.platformLogger.info('Execution signer initialized', {
+          address: await signer.getAddress(),
         });
 
-        // Update metrics
-        if (result.profit && result.gasUsed) {
-          this.metricsCollector.recordOpportunitySuccess(
-            RelayProvider.FLASHBOTS_PROTECT,
-            result.profit,
-            result.gasUsed,
-            0n, // bribe
-            Date.now(),
-            result.executionTime || 0
-          );
+        // Initialize core execution components
+        this.opportunityStateMachine = new OpportunityStateMachine();
+
+        this.flashLoanManager = new FlashLoanManager({
+          preferredProvider: 'uniswap-v3' as any,
+          maxBorrowAmountUsd: 1000000, // $1M max
+          enableSplitting: true,
+          maxSplits: 3,
+          feeThresholdBps: 50, // 0.5% max fee
+          capacityRefreshIntervalMs: 30000,
+          enableFallback: true,
+          providers: {
+            'uniswap-v3': {
+              enabled: true,
+              feeRate: 0.0005,
+              factoryAddress: '0x33128a8fC17869897dcE68Ed026d694621f6FDfD' as any,
+              quoterAddress: '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a' as any,
+            },
+            balancer: {
+              enabled: true,
+              feeRate: 0.0001,
+              vaultAddress: '0xBA12222222228d8Ba445958a75a0704d566BF2C8' as any,
+            },
+            aave: {
+              enabled: true,
+              feeRate: 0.0009,
+              poolAddress: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5' as any,
+            },
+          },
+        });
+
+        this.transactionLifecycleManager = new TransactionLifecycleManager(provider, signer, {
+          maxSubmissionAttempts: 3,
+          submissionRetryDelayMs: 5000,
+          confirmationTimeoutMs: 60000,
+          confirmationBlocks: 1,
+          enableSimulation: true,
+          enableReplacement: true,
+          enableNonceManagement: true,
+        });
+
+        // Get Flash Executor contract address from environment or config
+        const flashExecutorAddress =
+          process.env['FLASH_EXECUTOR_ADDRESS'] ||
+          (rawConfig as any).contracts?.flashExecutor?.address;
+
+        if (!flashExecutorAddress) {
+          throw new Error('Flash Executor contract address not configured');
         }
-      });
 
-      this.executionOrchestrator.on('opportunityFailed', result => {
-        this.platformLogger.warn('Opportunity execution failed', {
-          opportunityId: result.opportunityId,
-          reason: result.failureReason,
-          gasUsed: result.gasUsed?.toString(),
+        // Initialize Flash Loan Arbitrage Engine
+        this.flashLoanArbitrageEngine = new FlashLoanArbitrageEngine(
+          this.opportunityStateMachine,
+          this.flashLoanManager,
+          this.transactionLifecycleManager,
+          {
+            flashExecutorAddress: flashExecutorAddress as any,
+            maxSlippageBps: 250, // 2.5%
+            minProfitThresholdUsd: 5.0,
+            gasOptimizationEnabled: true,
+            enableProfitValidation: true,
+            maxRouteHops: 3,
+            enableMultiDexRouting: true,
+            supportedDexes: ['uniswap-v3', 'aerodrome'],
+          }
+        );
+
+        // Initialize execution orchestrator
+        this.executionOrchestrator = new ExecutionOrchestrator(
+          {
+            maxConcurrentExecutions: this.config.execution.maxConcurrentExecutions,
+            enableCircuitBreaker: true,
+            circuitBreakerThreshold: 3,
+            circuitBreakerRecoveryTimeMs: 300000, // 5 minutes
+            executionTimeoutMs: 45000,
+            queueMaxSize: 100,
+            enableGracefulShutdown: true,
+            shutdownTimeoutMs: 30000,
+          },
+          this.opportunityStateMachine
+        );
+
+        // Register the Flash Loan Arbitrage Engine
+        this.executionOrchestrator.registerExecutionEngine(
+          OpportunityType.ARBITRAGE,
+          this.flashLoanArbitrageEngine
+        );
+
+        this.platformLogger.info('Flash Loan Arbitrage Engine registered successfully');
+
+        // Set up execution event handlers
+        this.executionOrchestrator.on('executionSuccess', ({ opportunity, result }) => {
+          this.platformLogger.info('Opportunity executed successfully', {
+            opportunityId: opportunity.id,
+            profit: result.profit?.toString(),
+            gasUsed: result.gasUsed?.toString(),
+            executionTime: result.executionTime,
+          });
+
+          // Update metrics
+          if (result.profit && result.gasUsed) {
+            this.metricsCollector.recordOpportunitySuccess(
+              RelayProvider.FLASHBOTS_PROTECT,
+              result.profit,
+              result.gasUsed,
+              0n, // bribe
+              Date.now(),
+              result.executionTime || 0
+            );
+          }
         });
 
-        // Update metrics
-        this.metricsCollector.recordOpportunityFailure(
-          RelayProvider.FLASHBOTS_PROTECT,
-          result.failureReason || 'Unknown error',
-          result.gasUsed || 0n
-        );
-      });
+        this.executionOrchestrator.on('executionFailure', ({ opportunity, result }) => {
+          this.platformLogger.warn('Opportunity execution failed', {
+            opportunityId: opportunity.id,
+            reason: result.failureReason,
+            gasUsed: result.gasUsed?.toString(),
+          });
 
-      this.platformLogger.info('Execution engine initialized successfully');
+          // Update metrics
+          this.metricsCollector.recordOpportunityFailure(
+            RelayProvider.FLASHBOTS_PROTECT,
+            result.failureReason || 'Unknown error',
+            result.gasUsed || 0n
+          );
+        });
+
+        // Set up circuit breaker events
+        this.executionOrchestrator.on('circuitBreakerActivated', ({ reason }) => {
+          this.platformLogger.error('Execution circuit breaker activated', { reason });
+          // Emit event that AlertingSystem will pick up through its monitoring
+          this.emit('executionCircuitBreakerActivated', { reason });
+        });
+
+        this.executionOrchestrator.on('circuitBreakerRecovered', () => {
+          this.platformLogger.info('Execution circuit breaker recovered');
+          // Emit event that AlertingSystem will pick up through its monitoring
+          this.emit('executionCircuitBreakerRecovered');
+        });
+
+        this.platformLogger.info('Execution engine initialized successfully', {
+          flashExecutorAddress,
+          signerAddress: await signer.getAddress(),
+          registeredEngines: ['arbitrage'],
+        });
+      } catch (error) {
+        this.platformLogger.logError(error as Error, {
+          operation: 'execution-engine-initialization',
+        });
+        throw new Error(
+          `Failed to initialize execution engine: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
     }
   }
 
@@ -559,7 +680,22 @@ class BaseMEVPlatform extends EventEmitter {
     if (this.config.featureFlags.enableExecutionEngine && this.executionOrchestrator) {
       this.platformLogger.info('Starting execution engine');
       try {
+        // Start transaction lifecycle manager
+        if (this.transactionLifecycleManager) {
+          await this.transactionLifecycleManager.start();
+          this.platformLogger.info('Transaction lifecycle manager started');
+        }
+
+        // Start flash loan manager
+        if (this.flashLoanManager) {
+          await this.flashLoanManager.start();
+          this.platformLogger.info('Flash loan manager started');
+        }
+
+        // Start execution orchestrator
         await this.executionOrchestrator.start();
+        this.platformLogger.info('Execution orchestrator started successfully');
+
         this.platformLogger.info('Execution engine started successfully');
       } catch (error) {
         this.platformLogger.logError(error as Error, {
@@ -930,7 +1066,22 @@ class BaseMEVPlatform extends EventEmitter {
       if (this.executionOrchestrator) {
         this.platformLogger.info('Stopping execution engine');
         try {
+          // Stop execution orchestrator first
           await this.executionOrchestrator.stop();
+          this.platformLogger.info('Execution orchestrator stopped');
+
+          // Stop transaction lifecycle manager
+          if (this.transactionLifecycleManager) {
+            await this.transactionLifecycleManager.stop();
+            this.platformLogger.info('Transaction lifecycle manager stopped');
+          }
+
+          // Stop flash loan manager
+          if (this.flashLoanManager) {
+            await this.flashLoanManager.stop();
+            this.platformLogger.info('Flash loan manager stopped');
+          }
+
           this.platformLogger.info('Execution engine stopped successfully');
         } catch (error) {
           this.platformLogger.logError(error as Error, {
