@@ -13,6 +13,7 @@ import { RpcConnectionManager } from './rpc/connection-manager';
 import { ArbitrageScanner } from './scanner/arbitrage-scanner';
 import { MetricsCollector } from './monitoring/metrics-collector';
 import { CircuitBreaker } from './monitoring/circuit-breaker';
+import { AlertingSystem } from './monitoring/alerting-system';
 import { RelayProvider } from './bundler/private-relay';
 import { LendingProtocolMonitor } from './scanner/lending-monitor';
 import { StablePoolMonitor } from './scanner/stable-pool-monitor';
@@ -48,6 +49,7 @@ class BaseMEVPlatform extends EventEmitter {
   private connectionManager: RpcConnectionManager;
   private metricsCollector: MetricsCollector;
   private circuitBreaker: CircuitBreaker;
+  private alertingSystem: AlertingSystem;
 
   // Phase-specific components
   private arbitrageScanner?: ArbitrageScanner;
@@ -96,19 +98,44 @@ class BaseMEVPlatform extends EventEmitter {
       recoveryTimeout: 60000,
     });
 
+    this.alertingSystem = new AlertingSystem(this.metricsCollector);
+
     this.setupEventHandlers();
   }
 
   private setupEventHandlers(): void {
     // Circuit breaker events
-    this.circuitBreaker.on('stateChanged', state => {
-      this.metricsCollector.updateCircuitBreakerStatus(state);
-      this.platformLogger.logCircuitBreakerStateChange('platform', state, 'State change detected');
+    this.circuitBreaker.on('stateChanged', data => {
+      this.metricsCollector.updateCircuitBreakerStatus(data.newState);
+      this.platformLogger.logCircuitBreakerStateChange(
+        'platform',
+        data.newState,
+        'State change detected'
+      );
 
       // Handle graceful degradation
-      if (state === 'open' && this.config?.gracefulDegradation.enabled) {
+      if (data.newState === 'open' && this.config?.gracefulDegradation.enabled) {
         this.handleGracefulDegradation();
       }
+    });
+
+    // Alerting system events
+    this.alertingSystem.on('alertTriggered', alert => {
+      this.platformLogger.warn('Alert triggered', {
+        type: alert.type,
+        severity: alert.severity,
+        message: alert.message,
+        timestamp: alert.timestamp,
+      });
+    });
+
+    // Metrics collector events
+    this.metricsCollector.on('opportunityFailure', data => {
+      this.platformLogger.warn('Opportunity execution failed', {
+        relay: data.relay,
+        reason: data.reason,
+        gasCost: data.gasCost?.toString(),
+      });
     });
 
     // Log metrics periodically with enhanced formatting
