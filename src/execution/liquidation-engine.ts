@@ -575,21 +575,23 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
    * Submit transaction via transaction manager (wrapper method)
    */
   private async submitTransactionViaManager(transaction: TransactionRequest): Promise<string> {
-    // For now, simulate transaction submission
-    // In production, this would integrate with the actual transaction lifecycle manager
+    try {
+      const result = await this.transactionManager.processTransaction(
+        `liquidation-${Date.now()}`,
+        async () => transaction
+      );
 
-    this.logger.debug('Submitting liquidation transaction', {
-      to: transaction.to,
-      gasLimit: transaction.gasLimit.toString(),
-    });
+      if (!result.success || !result.receipt?.transactionHash) {
+        throw new Error(result.failureReason || 'Transaction submission failed');
+      }
 
-    // Simulate transaction hash
-    const transactionHash = '0x' + Math.random().toString(16).slice(2, 66);
-
-    // Simulate submission delay
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    return transactionHash;
+      return result.receipt.transactionHash;
+    } catch (error) {
+      this.logger.error('Failed to submit liquidation transaction via manager', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   /**

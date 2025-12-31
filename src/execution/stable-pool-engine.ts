@@ -16,6 +16,7 @@ import {
 } from '../types/execution';
 import { FlashLoanManager } from './flash-loan-manager';
 import { TransactionLifecycleManager } from './transaction-lifecycle-manager';
+import { TransactionRequest } from '../types/transaction';
 import { Address } from '../types/common';
 
 export interface StablePoolEngineConfig {
@@ -460,36 +461,103 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
     opportunity: StablePoolRebalancingOpportunity,
     trade: RebalancingTrade
   ): Promise<ExecutionResult> {
-    try {
-      // For now, return a simulated successful execution
-      // In production, this would execute the actual rebalancing transaction
+    const startTime = Date.now();
 
+    try {
+      // Build rebalancing transaction
+      const transaction = await this.buildRebalancingTransaction(opportunity, trade);
+
+      // Submit transaction via lifecycle manager
+      const result = await this.transactionManager.processTransaction(
+        `stable-rebalance-${Date.now()}`,
+        async () => transaction
+      );
+
+      if (!result.success || !result.receipt) {
+        return {
+          success: false,
+          failureReason: result.failureReason || 'Transaction submission failed',
+          gasUsed: trade.gasEstimate,
+          executionTime: Date.now() - startTime,
+          opportunityId: opportunity.id,
+        };
+      }
+
+      // Calculate actual profit
       const profit = await this.calculateRebalancingProfit(trade);
 
-      this.logger.debug('Executing rebalancing trade', {
+      this.logger.info('Rebalancing trade executed successfully', {
         opportunityId: opportunity.id,
-        poolAddress: trade.poolAddress,
-        amountIn: trade.amountIn.toString(),
-        expectedAmountOut: trade.expectedAmountOut.toString(),
-        estimatedProfit: profit.toString(),
+        transactionHash: result.receipt.transactionHash,
+        profit: profit.toString(),
+        gasUsed: result.receipt.gasUsed?.toString(),
       });
 
       return {
         success: true,
-        transactionHash: '0x' + Math.random().toString(16).slice(2, 66),
+        transactionHash: result.receipt.transactionHash,
         profit,
-        gasUsed: trade.gasEstimate,
-        executionTime: 2000, // 2 seconds
+        gasUsed: result.receipt.gasUsed || trade.gasEstimate,
+        executionTime: Date.now() - startTime,
         opportunityId: opportunity.id,
+        blockNumber: result.receipt.blockNumber,
+        effectiveGasPrice: result.receipt.effectiveGasPrice,
       };
     } catch (error) {
+      this.logger.error('Rebalancing trade execution failed', {
+        opportunityId: opportunity.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
       return {
         success: false,
         failureReason: error instanceof Error ? error.message : 'Execution failed',
         gasUsed: trade.gasEstimate,
-        executionTime: 2000,
+        executionTime: Date.now() - startTime,
         opportunityId: opportunity.id,
       };
+    }
+  }
+
+  /**
+   * Build rebalancing transaction
+   */
+  private async buildRebalancingTransaction(
+    opportunity: StablePoolRebalancingOpportunity,
+    trade: RebalancingTrade
+  ): Promise<TransactionRequest> {
+    try {
+      // Build transaction data for stable pool rebalancing
+      // This would encode the swap call for Aerodrome stable pools
+      const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+
+      // Encode swap parameters
+      const swapData = abiCoder.encode(
+        ['address', 'address', 'uint256', 'uint256', 'address'],
+        [
+          trade.tokenIn,
+          trade.tokenOut,
+          trade.amountIn,
+          trade.expectedAmountOut,
+          opportunity.poolAddress,
+        ]
+      );
+
+      return {
+        to: opportunity.poolAddress,
+        data: swapData,
+        value: 0n,
+        gasLimit: trade.gasEstimate,
+        maxFeePerGas: BigInt(50e9), // 50 gwei
+        maxPriorityFeePerGas: BigInt(2e9), // 2 gwei
+        type: 2,
+      };
+    } catch (error) {
+      this.logger.error('Failed to build rebalancing transaction', {
+        opportunityId: opportunity.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
     }
   }
 
