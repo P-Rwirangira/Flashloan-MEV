@@ -16,9 +16,11 @@ import { CircuitBreaker } from './monitoring/circuit-breaker';
 import { RelayProvider } from './bundler/private-relay';
 import { LendingProtocolMonitor } from './scanner/lending-monitor';
 import { StablePoolMonitor } from './scanner/stable-pool-monitor';
+import { MempoolMonitor } from './scanner/mempool-monitor';
 import { LiquidationProfitCalculator } from './simulator/liquidation-calculator';
 import { StablePoolRebalancingCalculator } from './simulator/stable-pool-calculator';
 import { EventEmitter } from 'events';
+import { ethers } from 'ethers';
 import path from 'path';
 
 // Platform configuration
@@ -49,6 +51,7 @@ class BaseMEVPlatform extends EventEmitter {
 
   // Phase-specific components
   private arbitrageScanner?: ArbitrageScanner;
+  private mempoolMonitor?: MempoolMonitor;
   private lendingMonitor?: LendingProtocolMonitor;
   private stablePoolMonitor?: StablePoolMonitor;
   private liquidationCalculator?: LiquidationProfitCalculator;
@@ -208,6 +211,25 @@ class BaseMEVPlatform extends EventEmitter {
       });
 
       this.platformLogger.info('Phase 1 arbitrage scanner initialized successfully');
+
+      // Initialize mempool monitor for backrun opportunities
+      this.mempoolMonitor = new MempoolMonitor({
+        connectionManager: this.connectionManager,
+        enabledProtocols: ['uniswap-v3' as any, 'aerodrome' as any],
+        minSwapValue: ethers.parseEther('0.1'), // 0.1 ETH minimum
+        maxPendingTxs: 500,
+        filterSpam: true,
+        enableBackrun: true,
+        enableFrontrun: false, // Disabled for ethical reasons
+        enableSandwich: false, // Disabled for ethical reasons
+      });
+
+      // Set up event listener for mempool opportunities
+      this.mempoolMonitor.on('opportunityDetected', async (opportunity: any) => {
+        await this.handleMempoolOpportunity(opportunity);
+      });
+
+      this.platformLogger.info('Mempool monitor initialized successfully');
     }
 
     // Phase 2: Liquidations
@@ -346,6 +368,21 @@ class BaseMEVPlatform extends EventEmitter {
       }
     }
 
+    // Start mempool monitoring
+    if (this.config.phases.arbitrage.enabled && this.mempoolMonitor) {
+      this.platformLogger.info('Starting mempool monitoring');
+      try {
+        await this.mempoolMonitor.startMonitoring();
+        this.platformLogger.info('Mempool monitoring started successfully');
+      } catch (error) {
+        this.platformLogger.logError(error as Error, {
+          operation: 'mempool-monitor-startup',
+        });
+        // Don't throw - mempool monitoring is optional
+        this.platformLogger.warn('Continuing without mempool monitoring');
+      }
+    }
+
     // Start Phase 2: Liquidation monitoring
     if (this.config.phases.liquidations.enabled && this.lendingMonitor) {
       this.platformLogger.info('Starting liquidation monitoring');
@@ -416,6 +453,58 @@ class BaseMEVPlatform extends EventEmitter {
       this.platformLogger.logError(error as Error, {
         opportunityId: opportunity.id,
         operation: 'arbitrage-processing',
+      });
+    }
+  }
+
+  private async handleMempoolOpportunity(opportunity: any): Promise<void> {
+    try {
+      const operationId = `mempool-${opportunity.id}`;
+      this.platformLogger.startPerformanceTracking(operationId);
+
+      // Check circuit breaker
+      const canExecute = await new Promise<boolean>(resolve => {
+        this.circuitBreaker
+          .execute(async () => {
+            resolve(true);
+            return true;
+          })
+          .catch(() => resolve(false));
+      });
+
+      if (!canExecute) {
+        this.platformLogger.warn('Circuit breaker open, skipping mempool opportunity', {
+          opportunityId: opportunity.id,
+        });
+        return;
+      }
+
+      // Check if backrun is profitable
+      if (opportunity.backrunProfit && opportunity.backrunProfit > 0n) {
+        this.platformLogger.info('Profitable backrun opportunity detected', {
+          opportunityId: opportunity.id,
+          txHash: opportunity.txHash,
+          protocol: opportunity.dexProtocol,
+          backrunProfit: ethers.formatEther(opportunity.backrunProfit),
+          gasPrice: ethers.formatUnits(opportunity.gasPrice, 'gwei'),
+        });
+
+        // Record opportunity
+        this.metricsCollector.recordOpportunitySuccess(
+          RelayProvider.FLASHBOTS_PROTECT,
+          opportunity.backrunProfit,
+          BigInt(Math.floor(Number(opportunity.gasPrice) * Number(opportunity.gasLimit))),
+          0n, // bribe
+          Date.now(),
+          1000 // latency
+        );
+      }
+
+      this.platformLogger.endPerformanceTracking(operationId);
+    } catch (error) {
+      this.platformLogger.logError(error as Error, {
+        opportunityId: opportunity.id,
+        operation: 'mempool-processing',
       });
     }
   }
@@ -630,6 +719,12 @@ class BaseMEVPlatform extends EventEmitter {
       if (this.arbitrageScanner) {
         this.platformLogger.info('Stopping arbitrage scanner');
         await this.arbitrageScanner.stopScanning();
+      }
+
+      // Stop mempool monitoring
+      if (this.mempoolMonitor) {
+        this.platformLogger.info('Stopping mempool monitoring');
+        this.mempoolMonitor.stopMonitoring();
       }
 
       // Stop Phase 2: Liquidation monitoring
