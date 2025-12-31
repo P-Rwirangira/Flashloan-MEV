@@ -82,90 +82,6 @@ export class RpcConnectionManager extends EventEmitter {
   }
 
   /**
-   * Get the current active provider
-   */
-  getProvider(): ethers.JsonRpcProvider {
-    if (!this.currentProvider) {
-      throw new Error('No active RPC provider available');
-    }
-    return this.currentProvider;
-  }
-
-  /**
-   * Get primary RPC URL
-   */
-  getPrimaryRpcUrl(): string {
-    return this.network.rpcUrl;
-  }
-
-  /**
-   * Get WebSocket connection for real-time data
-   */
-  getWebSocket(): WebSocket | undefined {
-    return this.primaryWs;
-  }
-
-  /**
-   * Get connection health status for all endpoints
-   */
-  getConnectionHealth(): ConnectionHealth[] {
-    return Array.from(this.connectionHealth.values());
-  }
-
-  /**
-   * Get provider URL from ethers provider
-   */
-  private getProviderUrl(provider: ethers.JsonRpcProvider): string {
-    // Access the internal connection URL
-    return (provider as any)._getConnection().url;
-  }
-
-  /**
-   * Manually trigger failover to next available provider
-   */
-  async triggerFailover(): Promise<void> {
-    const healthyProviders = this.fallbackProviders.filter(provider => {
-      const health = this.connectionHealth.get(this.getProviderUrl(provider));
-      return health && health.connected && health.consecutiveFailures < this.maxConsecutiveFailures;
-    });
-
-    if (healthyProviders.length === 0) {
-      throw new Error('No healthy fallback providers available');
-    }
-
-    const newProvider = healthyProviders[0];
-    const oldProvider = this.currentProvider;
-
-    this.currentProvider = newProvider;
-    this.emit('providerChanged', newProvider, oldProvider);
-  }
-
-  /**
-   * Shutdown all connections
-   */
-  async shutdown(): Promise<void> {
-    this.isShuttingDown = true;
-
-    // Stop health monitoring
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-    }
-
-    // Close WebSocket connection
-    if (this.primaryWs) {
-      this.primaryWs.close();
-    }
-
-    // Cleanup providers
-    this.primaryProvider = undefined;
-    this.currentProvider = undefined;
-    this.fallbackProviders.length = 0;
-    this.connectionHealth.clear();
-
-    this.emit('shutdown');
-  }
-
-  /**
    * Initialize primary HTTP provider
    */
   private async initializePrimaryProvider(): Promise<void> {
@@ -205,7 +121,7 @@ export class RpcConnectionManager extends EventEmitter {
         this.setupWebSocketHandlers(ws);
         this.updateConnectionHealth(this.network.wsUrl!, 'websocket', true, 0);
         this.emit('websocketConnected');
-        resolve();
+        resolve(undefined);
       });
 
       ws.on('error', (error: Error) => {
@@ -422,5 +338,89 @@ export class RpcConnectionManager extends EventEmitter {
     });
 
     this.emit('healthUpdate', this.connectionHealth.get(endpoint));
+  }
+
+  /**
+   * Get provider URL from ethers provider
+   */
+  private getProviderUrl(provider: ethers.JsonRpcProvider): string {
+    // Access the internal connection URL
+    return (provider as any)._getConnection().url;
+  }
+
+  /**
+   * Manually trigger failover to next available provider
+   */
+  async triggerFailover(): Promise<void> {
+    const healthyProviders = this.fallbackProviders.filter(provider => {
+      const health = this.connectionHealth.get(this.getProviderUrl(provider));
+      return health && health.connected && health.consecutiveFailures < this.maxConsecutiveFailures;
+    });
+
+    if (healthyProviders.length === 0) {
+      throw new Error('No healthy fallback providers available');
+    }
+
+    const newProvider = healthyProviders[0];
+    const oldProvider = this.currentProvider;
+
+    this.currentProvider = newProvider;
+    this.emit('providerChanged', newProvider, oldProvider);
+  }
+
+  /**
+   * Get the current active provider
+   */
+  getProvider(): ethers.JsonRpcProvider {
+    if (!this.currentProvider) {
+      throw new Error('No active RPC provider available');
+    }
+    return this.currentProvider;
+  }
+
+  /**
+   * Get primary RPC URL
+   */
+  getPrimaryRpcUrl(): string {
+    return this.network.rpcUrl;
+  }
+
+  /**
+   * Get WebSocket connection for real-time data
+   */
+  getWebSocket(): WebSocket | undefined {
+    return this.primaryWs;
+  }
+
+  /**
+   * Get connection health status for all endpoints
+   */
+  getConnectionHealth(): ConnectionHealth[] {
+    return Array.from(this.connectionHealth.values());
+  }
+
+  /**
+   * Shutdown all connections
+   */
+  async shutdown(): Promise<void> {
+    this.isShuttingDown = true;
+
+    // Stop health monitoring
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+    }
+
+    // Close WebSocket connection
+    if (this.primaryWs) {
+      this.primaryWs.close();
+    }
+
+    // Cleanup providers
+    this.primaryProvider = undefined;
+    this.currentProvider = undefined;
+    this.fallbackProviders.length = 0;
+    this.connectionHealth.clear();
+
+    this.emit('shutdown');
   }
 }

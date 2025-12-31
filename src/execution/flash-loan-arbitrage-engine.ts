@@ -339,41 +339,49 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
     opportunity: ArbitrageOpportunity,
     context: ExecutionContext
   ): Promise<RouteExecutionPlan> {
-    // Get optimal flash loan source
-    const flashLoanSource = await this.flashLoanManager.getOptimalSource(
-      opportunity.tokenIn,
-      opportunity.amountIn
-    );
+    try {
+      // Get optimal flash loan source
+      const flashLoanSource = await this.flashLoanManager.getOptimalSource(
+        opportunity.tokenIn,
+        opportunity.amountIn
+      );
 
-    // Calculate total gas cost
-    const gasEstimate = await this.estimateGas(opportunity);
-    const totalGasCost = gasEstimate * context.maxFeePerGas;
+      // Calculate total gas cost
+      const gasEstimate = await this.estimateGas(opportunity);
+      const totalGasCost = gasEstimate * context.maxFeePerGas;
 
-    // Build execution data for flash loan callback
-    const executionData = await this.buildExecutionData(opportunity.route);
+      // Build execution data for flash loan callback
+      const executionData = await this.buildExecutionData(opportunity.route);
 
-    // Calculate expected profit after fees
-    const flashLoanFee = (flashLoanSource.fee * opportunity.amountIn) / flashLoanSource.maxAmount;
-    const expectedProfit = opportunity.estimatedProfit - flashLoanFee - totalGasCost;
+      // Calculate expected profit after fees
+      const flashLoanFee = (flashLoanSource.fee * opportunity.amountIn) / flashLoanSource.maxAmount;
+      const expectedProfit = opportunity.estimatedProfit - flashLoanFee - totalGasCost;
 
-    const plan: RouteExecutionPlan = {
-      flashLoanSource,
-      swapRoute: opportunity.route,
-      expectedProfit: opportunity.estimatedProfit,
-      totalGasCost,
-      netProfit: expectedProfit,
-      executionData,
-    };
+      const plan: RouteExecutionPlan = {
+        flashLoanSource,
+        swapRoute: opportunity.route,
+        expectedProfit: opportunity.estimatedProfit,
+        totalGasCost,
+        netProfit: expectedProfit,
+        executionData,
+      };
 
-    this.logger.debug('Execution plan built', {
-      opportunityId: opportunity.id,
-      flashLoanProvider: flashLoanSource.provider,
-      flashLoanFee: flashLoanFee.toString(),
-      totalGasCost: totalGasCost.toString(),
-      netProfit: expectedProfit.toString(),
-    });
+      this.logger.debug('Execution plan built', {
+        opportunityId: opportunity.id,
+        flashLoanProvider: flashLoanSource.provider,
+        flashLoanFee: flashLoanFee.toString(),
+        totalGasCost: totalGasCost.toString(),
+        netProfit: expectedProfit.toString(),
+      });
 
-    return plan;
+      return plan;
+    } catch (error) {
+      this.logger.error('Failed to build execution plan', {
+        opportunityId: opportunity.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
   }
 
   /**

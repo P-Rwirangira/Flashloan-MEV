@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3FlashCallback.sol";
@@ -11,35 +11,34 @@ import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 
 /**
  * @title FlashExecutor
- * @dev Gas-optimized flash loan arbitrage executor for Base L2
- * @notice Executes atomic arbitrage trades using Uniswap V3 flash loans
+ * @dev Executes flash loan arbitrage on Base blockchain
  */
-contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ownable {
+contract FlashExecutor is IUniswapV3FlashCallback, Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
-    // Constants for gas optimization
-    uint160 internal constant MIN_SQRT_RATIO = 4295128739;
-    uint160 internal constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
-
-    // State variables
-    uint256 public minProfit;
-    mapping(address => bool) public authorizedPools;
-    
-    // Statistics
-    uint256 public totalExecutions;
-    uint256 public totalProfit;
-    uint256 public totalGasUsed;
-
-    // Swap route structure
-    struct SwapRoute {
+    struct RouteData {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint256 minAmountOut;
         address[] pools;
-        address[] tokens; // Token path for multi-hop routes
+        uint24[] fees;
         bool[] directions;
-        uint256 minProfit;
         uint256 deadline;
     }
 
-    // Events
+    struct FlashParams {
+        address tokenIn;
+        address tokenOut;
+        uint256 amountIn;
+        uint256 minProfit;
+        RouteData route;
+    }
+
+    mapping(address => bool) public authorizedPools;
+    mapping(address => bool) public authorizedCallers;
+    uint256 public minProfit;
+    
     event ArbitrageExecuted(
         address indexed caller,
         address indexed tokenIn,
@@ -48,242 +47,186 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
         uint256 profit,
         uint256 gasUsed
     );
-
+    
     event ArbitrageFailed(
         address indexed caller,
         string reason,
         uint256 gasUsed
     );
-
+    
     event UnauthorizedCallbackAttempt(
         address indexed caller,
         address indexed pool
     );
-
+    
     event InsufficientProfitEvent(
         uint256 actualProfit,
         uint256 minProfit
     );
-
+    
     event PoolAuthorizationChanged(
         address indexed pool,
         bool isAuthorized
     );
 
-    // Custom errors for gas efficiency
-    error UnauthorizedCallback();
-    error InsufficientProfit(uint256 actual, uint256 required);
-    error SwapFailed(address pool, bytes reason);
-    error FlashLoanRepaymentFailed(uint256 owed, uint256 available);
-    error InvalidRoute();
-    error DeadlineExceeded();
-    error InvalidAmount();
+    modifier onlyAuthorizedCaller() {
+        require(authorizedCallers[msg.sender] || msg.sender == owner(), "Unauthorized caller");
+        _;
+    }
+
+    modifier onlyAuthorizedPool() {
+        require(authorizedPools[msg.sender], "Unauthorized pool");
+        _;
+    }
 
     constructor(uint256 _minProfit) Ownable(msg.sender) {
         minProfit = _minProfit;
+        authorizedCallers[msg.sender] = true;
     }
 
     /**
-     * @dev Execute arbitrage using Uniswap V3 flash loan
-     * @param flashPool The pool to borrow from
-     * @param amount0 Amount of token0 to borrow
-     * @param amount1 Amount of token1 to borrow
-     * @param routeData Encoded swap route data
+     * @dev Execute arbitrage using flash loan
      */
     function executeArbitrage(
         address flashPool,
         uint256 amount0,
         uint256 amount1,
         bytes calldata routeData
-    ) external nonReentrant whenNotPaused {
-        if (!authorizedPools[flashPool]) {
-            revert UnauthorizedCallback();
-        }
-
-        if (amount0 == 0 && amount1 == 0) {
-            revert InvalidAmount();
-        }
-
+    ) external nonReentrant whenNotPaused onlyAuthorizedCaller {
+        require(authorizedPools[flashPool], "Pool not authorized");
+        require(amount0 > 0 || amount1 > 0, "Invalid amounts");
+        
         uint256 gasStart = gasleft();
-
+        
         try IUniswapV3Pool(flashPool).flash(
             address(this),
             amount0,
             amount1,
             routeData
         ) {
-            // Success - update statistics
-            unchecked {
-                totalExecutions++;
-                totalGasUsed += gasStart - gasleft();
-            }
-        } catch (bytes memory reason) {
-            emit ArbitrageFailed(msg.sender, string(reason), gasStart - gasleft());
-            revert SwapFailed(flashPool, reason);
+            // Success handled in callback
+        } catch Error(string memory reason) {
+            emit ArbitrageFailed(msg.sender, reason, gasStart - gasleft());
+            revert(reason);
         }
     }
 
     /**
-     * @dev Uniswap V3 flash callback - executes the arbitrage logic
-     * @param fee0 Fee for token0
-     * @param fee1 Fee for token1
-     * @param data Encoded route data
+     * @dev Uniswap V3 flash callback
      */
     function uniswapV3FlashCallback(
         uint256 fee0,
         uint256 fee1,
         bytes calldata data
-    ) external override {
-        // Validate caller is authorized pool
-        if (!authorizedPools[msg.sender]) {
-            emit UnauthorizedCallbackAttempt(tx.origin, msg.sender);
-            revert UnauthorizedCallback();
-        }
-
-        // Decode route data
-        SwapRoute memory route = abi.decode(data, (SwapRoute));
-
-        // Check deadline
-        if (block.timestamp > route.deadline) {
-            revert DeadlineExceeded();
-        }
-
-        // Validate route
-        if (route.pools.length == 0 || route.pools.length != route.directions.length || route.tokens.length == 0) {
-            revert InvalidRoute();
-        }
-
-        // Determine borrowed token from amounts and pool tokens
-        address token0 = IUniswapV3Pool(msg.sender).token0();
-        address token1 = IUniswapV3Pool(msg.sender).token1();
-        address borrowedToken;
-        uint256 borrowedAmount;
+    ) external override onlyAuthorizedPool {
+        FlashParams memory params = abi.decode(data, (FlashParams));
         
-        // Get borrowed amounts from flash loan parameters
-        uint256 amount0 = IERC20(token0).balanceOf(address(this));
-        uint256 amount1 = IERC20(token1).balanceOf(address(this));
+        uint256 gasStart = gasleft();
+        uint256 amountOwed = params.amountIn + (fee0 > 0 ? fee0 : fee1);
         
-        if (amount0 > 0 && amount1 == 0) {
-            borrowedToken = token0;
-            borrowedAmount = amount0;
-        } else if (amount1 > 0 && amount0 == 0) {
-            borrowedToken = token1;
-            borrowedAmount = amount1;
-        } else if (amount0 > 0 && amount1 > 0) {
-            // Both tokens borrowed - use the first token in route
-            borrowedToken = route.tokens[0];
-            borrowedAmount = borrowedToken == token0 ? amount0 : amount1;
-        } else {
-            revert InvalidAmount();
-        }
-
-        uint256 initialBalance = borrowedAmount;
-
-        // Execute swaps
-        _executeSwaps(route);
-
+        // Record initial balance
+        uint256 initialBalance = IERC20(params.tokenIn).balanceOf(address(this));
+        
+        // Execute arbitrage route
+        uint256 amountOut = _executeRoute(params.route);
+        
         // Calculate profit
-        uint256 finalBalance = IERC20(borrowedToken).balanceOf(address(this));
-        uint256 totalFee = fee0 + fee1;
+        uint256 finalBalance = IERC20(params.tokenIn).balanceOf(address(this));
+        require(finalBalance >= amountOwed, "Insufficient funds to repay");
         
-        if (finalBalance < initialBalance + totalFee) {
-            revert FlashLoanRepaymentFailed(initialBalance + totalFee, finalBalance);
-        }
-
-        uint256 profit = finalBalance - initialBalance - totalFee;
+        uint256 profit = finalBalance - initialBalance;
+        require(profit >= params.minProfit, "Insufficient profit");
         
-        if (profit < route.minProfit) {
-            emit InsufficientProfitEvent(profit, route.minProfit);
-            revert InsufficientProfit(profit, route.minProfit);
-        }
-
-        if (profit < minProfit) {
-            emit InsufficientProfitEvent(profit, minProfit);
-            revert InsufficientProfit(profit, minProfit);
-        }
-
         // Repay flash loan
-        IERC20(borrowedToken).safeTransfer(msg.sender, initialBalance + totalFee);
-
-        // Update profit statistics
-        unchecked {
-            totalProfit += profit;
+        IERC20(params.tokenIn).safeTransfer(msg.sender, amountOwed);
+        
+        // Transfer profit to caller
+        if (profit > 0) {
+            IERC20(params.tokenIn).safeTransfer(tx.origin, profit);
         }
-
-        // Emit success event
+        
         emit ArbitrageExecuted(
             tx.origin,
-            borrowedToken,
-            borrowedToken, // Same token for arbitrage
-            initialBalance,
+            params.tokenIn,
+            params.tokenOut,
+            params.amountIn,
             profit,
-            0 // Gas will be calculated in main function
+            gasStart - gasleft()
         );
     }
 
     /**
-     * @dev Execute swap sequence with proper token tracking and approvals
-     * @param route The swap route to execute
+     * @dev Execute arbitrage route through multiple pools
      */
-    function _executeSwaps(SwapRoute memory route) internal {
-        address currentToken = route.tokens[0];
+    function _executeRoute(RouteData memory route) internal returns (uint256 amountOut) {
+        require(route.deadline >= block.timestamp, "Transaction expired");
+        require(route.pools.length > 0, "Empty route");
         
-        for (uint256 i = 0; i < route.pools.length;) {
+        uint256 currentAmount = route.amountIn;
+        address currentToken = route.tokenIn;
+        
+        for (uint256 i = 0; i < route.pools.length; i++) {
             address pool = route.pools[i];
-            bool direction = route.directions[i];
+            require(authorizedPools[pool], "Unauthorized pool in route");
             
-            uint256 amountIn = IERC20(currentToken).balanceOf(address(this));
+            // Execute swap on pool
+            currentAmount = _swapOnPool(
+                pool,
+                currentToken,
+                currentAmount,
+                route.directions[i]
+            );
             
-            if (amountIn == 0) {
-                revert InvalidAmount();
-            }
-
-            // Approve the pool to spend the input token
-            IERC20(currentToken).safeApprove(pool, amountIn);
-
-            try IUniswapV3Pool(pool).swap(
-                address(this),
-                direction,
-                int256(amountIn),
-                direction ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
-                ""
-            ) {
-                // Reset approval after successful swap
-                IERC20(currentToken).safeApprove(pool, 0);
-                
-                // Update current token for next iteration
-                if (i + 1 < route.tokens.length) {
-                    currentToken = route.tokens[i + 1];
-                }
-            } catch (bytes memory reason) {
-                // Reset approval on failure
-                IERC20(currentToken).safeApprove(pool, 0);
-                revert SwapFailed(pool, reason);
-            }
-
-            unchecked {
-                i++;
-            }
+            // Update current token for next iteration
+            currentToken = _getOtherToken(pool, currentToken);
         }
+        
+        require(currentAmount >= route.minAmountOut, "Insufficient output amount");
+        return currentAmount;
     }
 
     /**
-     * @dev Get token address from pool based on which token has fee
-     * @param pool The pool address
-     * @param isToken0 Whether token0 has the fee
-     * @return token The token address
+     * @dev Execute swap on a single pool
      */
-    function _getTokenFromPool(address pool, bool isToken0) internal view returns (address token) {
-        if (isToken0) {
-            token = IUniswapV3Pool(pool).token0();
+    function _swapOnPool(
+        address pool,
+        address tokenIn,
+        uint256 amountIn,
+        bool zeroForOne
+    ) internal returns (uint256 amountOut) {
+        // Transfer tokens to pool
+        IERC20(tokenIn).safeTransfer(pool, amountIn);
+        
+        // Execute swap
+        (int256 amount0, int256 amount1) = IUniswapV3Pool(pool).swap(
+            address(this),
+            zeroForOne,
+            int256(amountIn),
+            zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341, // sqrt price limits
+            ""
+        );
+        
+        return uint256(-(zeroForOne ? amount1 : amount0));
+    }
+
+    /**
+     * @dev Get the other token in a pool
+     */
+    function _getOtherToken(address pool, address token) internal view returns (address) {
+        address token0 = IUniswapV3Pool(pool).token0();
+        address token1 = IUniswapV3Pool(pool).token1();
+        
+        if (token == token0) {
+            return token1;
+        } else if (token == token1) {
+            return token0;
         } else {
-            token = IUniswapV3Pool(pool).token1();
+            revert("Token not in pool");
         }
     }
 
     /**
-     * @dev Add authorized pool (owner only)
-     * @param pool Pool address to authorize
+     * @dev Add authorized pool
      */
     function addAuthorizedPool(address pool) external onlyOwner {
         authorizedPools[pool] = true;
@@ -291,8 +234,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
     }
 
     /**
-     * @dev Remove authorized pool (owner only)
-     * @param pool Pool address to deauthorize
+     * @dev Remove authorized pool
      */
     function removeAuthorizedPool(address pool) external onlyOwner {
         authorizedPools[pool] = false;
@@ -300,56 +242,35 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
     }
 
     /**
-     * @dev Set minimum profit requirement (owner only)
-     * @param _minProfit New minimum profit in wei
+     * @dev Add authorized caller
+     */
+    function addAuthorizedCaller(address caller) external onlyOwner {
+        authorizedCallers[caller] = true;
+    }
+
+    /**
+     * @dev Remove authorized caller
+     */
+    function removeAuthorizedCaller(address caller) external onlyOwner {
+        authorizedCallers[caller] = false;
+    }
+
+    /**
+     * @dev Set minimum profit threshold
      */
     function setMinProfit(uint256 _minProfit) external onlyOwner {
         minProfit = _minProfit;
     }
 
     /**
-     * @dev Check if pool is authorized
-     * @param pool Pool address to check
-     * @return Whether pool is authorized
-     */
-    function isAuthorizedPool(address pool) external view returns (bool) {
-        return authorizedPools[pool];
-    }
-
-    /**
-     * @dev Get minimum profit requirement
-     * @return Current minimum profit in wei
-     */
-    function getMinProfit() external view returns (uint256) {
-        return minProfit;
-    }
-
-    /**
-     * @dev Pause contract (owner only)
-     */
-    function pause() external onlyOwner {
-        _pause();
-    }
-
-    /**
-     * @dev Unpause contract (owner only)
-     */
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    /**
-     * @dev Emergency withdraw specific amount (owner only)
-     * @param token Token to withdraw
-     * @param amount Amount to withdraw
+     * @dev Emergency withdraw tokens
      */
     function emergencyWithdraw(address token, uint256 amount) external onlyOwner {
         IERC20(token).safeTransfer(owner(), amount);
     }
 
     /**
-     * @dev Emergency withdraw all tokens (owner only)
-     * @param token Token to withdraw
+     * @dev Emergency withdraw all tokens
      */
     function emergencyWithdrawAll(address token) external onlyOwner {
         uint256 balance = IERC20(token).balanceOf(address(this));
@@ -359,21 +280,30 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
     }
 
     /**
-     * @dev Get contract statistics
-     * @return executions Total number of executions
-     * @return profit Total profit generated
-     * @return gasUsed Total gas used
+     * @dev Pause contract
      */
-    function getStats() external view returns (
-        uint256 executions,
-        uint256 profit,
-        uint256 gasUsed
-    ) {
-        return (totalExecutions, totalProfit, totalGasUsed);
+    function pause() external onlyOwner {
+        _pause();
     }
 
     /**
-     * @dev Receive function to accept ETH
+     * @dev Unpause contract
      */
-    receive() external payable {}
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+
+    /**
+     * @dev Check if pool is authorized
+     */
+    function isAuthorizedPool(address pool) external view returns (bool) {
+        return authorizedPools[pool];
+    }
+
+    /**
+     * @dev Get minimum profit
+     */
+    function getMinProfit() external view returns (uint256) {
+        return minProfit;
+    }
 }
