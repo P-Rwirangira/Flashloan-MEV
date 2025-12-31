@@ -38,6 +38,7 @@ The platform consists of modular components:
 - Node.js 18+
 - Local Base node (op-geth + op-node) or RPC access
 - Private keys for transaction signing
+- Docker and Docker Compose (optional, for containerized deployment)
 
 ### Installation
 
@@ -60,11 +61,14 @@ nano config/default.yaml
 ### Development
 
 ```bash
-# Start in development mode
-npm run dev
+# Type check
+npm run typecheck
 
 # Build for production
 npm run build
+
+# Start in development mode
+npm run dev
 
 # Run tests
 npm test
@@ -73,6 +77,37 @@ npm test
 npm run lint
 npm run format
 ```
+
+### Docker Deployment
+
+```bash
+# Build and start all services
+docker-compose up -d
+
+# Check health
+curl http://localhost:3002/health
+
+# View logs
+docker-compose logs -f base-mev-platform
+```
+
+## Documentation
+
+- **[API Reference](docs/API.md)** - Health check and metrics endpoints
+- **[Operations Guide](docs/OPERATIONS.md)** - Monitoring, troubleshooting, and maintenance
+- **[Deployment Guide](docs/DEPLOYMENT.md)** - Local, Docker, and Kubernetes deployment
+
+### Health Monitoring
+
+The platform exposes health check endpoints:
+
+- `GET /health` - Comprehensive health status
+- `GET /ready` - Readiness probe (Kubernetes)
+- `GET /live` - Liveness probe (Kubernetes)
+- `GET /metrics` - Platform metrics
+- `GET /status` - Simple status check
+
+Default health check port: `3002` (configurable via `HEALTH_CHECK_PORT`)
 
 ### Configuration
 
