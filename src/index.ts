@@ -293,17 +293,89 @@ class BaseMEVPlatform extends EventEmitter {
 
       await poolManager.initialize();
 
-      // Initialize arbitrage scanner
+      // Initialize arbitrage scanner with MEV protection
       this.arbitrageScanner = new ArbitrageScanner({
         poolManager,
         connectionManager: this.connectionManager,
-        config: rawConfig.strategies.arbitrage,
-        scanIntervalMs: 1000,
+        config: {
+          ...rawConfig.strategies.arbitrage,
+          // MEV Protection Features
+          enableMEVProtection: true,
+          enableSandwichDetection: true,
+          enableFrontRunningProtection: true,
+          mempoolMonitoringEnabled: true,
+          competitorAnalysisEnabled: true,
+          adaptiveGasPricing: true,
+          maxCompetitorGasMultiplier: 1.2, // Max 20% above competitor gas
+          sandwichDetectionThreshold: 0.02, // 2% price impact threshold
+          frontRunningTimeWindow: 3000, // 3 second window for front-run detection
+          enablePrivateMempool: true, // Use private mempool when available
+          enableMultiHop: true,
+          maxHops: 3,
+          multiHopMinProfitMultiplier: 1.5,
+          enableTriangularArbitrage: true,
+          enablePathOptimization: true,
+          pathOptimizationDepth: 2,
+        },
+        scanIntervalMs: 600, // Faster scanning for MEV opportunities
       });
 
       // Set up event listener for arbitrage opportunities
       this.arbitrageScanner.on('opportunityDetected', async (opportunity: any) => {
         await this.handleArbitrageOpportunity(opportunity);
+      });
+
+      // Set up MEV protection event handlers
+      this.arbitrageScanner.on('sandwichAttackDetected', ({ txHash, attacker, victim, profit }) => {
+        this.platformLogger.warn('Sandwich attack detected', {
+          txHash,
+          attacker,
+          victim,
+          profit: profit.toString(),
+        });
+      });
+
+      this.arbitrageScanner.on(
+        'frontRunningDetected',
+        ({ originalTx, frontRunnerTx, gasIncrease }) => {
+          this.platformLogger.warn('Front-running attempt detected', {
+            originalTx,
+            frontRunnerTx,
+            gasIncrease: gasIncrease.toString(),
+          });
+        }
+      );
+
+      this.arbitrageScanner.on(
+        'competitorAnalysis',
+        ({ competitor, strategy, frequency, successRate }) => {
+          this.platformLogger.info('Competitor analysis update', {
+            competitor,
+            strategy,
+            frequency,
+            successRate,
+          });
+        }
+      );
+
+      this.arbitrageScanner.on(
+        'adaptiveGasAdjustment',
+        ({ oldGasPrice, newGasPrice, reason, competitorGas }) => {
+          this.platformLogger.info('Adaptive gas pricing adjustment', {
+            oldGasPrice: oldGasPrice.toString(),
+            newGasPrice: newGasPrice.toString(),
+            reason,
+            competitorGas: competitorGas?.toString(),
+          });
+        }
+      );
+
+      this.arbitrageScanner.on('privateMempoolUsed', ({ reason, relay, latency }) => {
+        this.platformLogger.info('Private mempool utilized', {
+          reason,
+          relay,
+          latency,
+        });
       });
 
       this.platformLogger.info('Phase 1 arbitrage scanner initialized successfully');
