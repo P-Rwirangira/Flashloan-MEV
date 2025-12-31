@@ -17,6 +17,7 @@ import {
   ExecutionPriority,
   QueuedOpportunity,
   IExecutionEngine,
+  ExecutionEngine,
   ExecutionOrchestratorConfig,
   ResourceAllocation,
   ExecutionMetrics,
@@ -149,8 +150,8 @@ export class ExecutionOrchestrator extends EventEmitter {
   /**
    * Register execution engine for opportunity type
    */
-  registerExecutionEngine(type: OpportunityType, engine: IExecutionEngine): void {
-    this.executionEngines.set(type, engine);
+  registerExecutionEngine(type: OpportunityType, engine: ExecutionEngine | IExecutionEngine): void {
+    this.executionEngines.set(type, engine as IExecutionEngine);
     this.logger.info('Execution engine registered', { type });
   }
 

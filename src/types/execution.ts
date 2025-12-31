@@ -111,6 +111,10 @@ export interface LiquidationOpportunity extends BaseOpportunity {
   debtAmount: bigint;
   liquidationBonus: number;
   healthFactor: number;
+  maxLiquidationAmount: bigint;
+  collateralToSeize: bigint;
+  debtAsset: Address;
+  collateralAsset: Address;
 }
 
 /**
@@ -124,6 +128,33 @@ export interface StablePoolRebalancingOpportunity extends BaseOpportunity {
   imbalanceRatio: number;
   rebalanceAmount: bigint;
   incentiveReward: bigint;
+  currentImbalance: number;
+  swapDirection: 'token0_to_token1' | 'token1_to_token0';
+  expectedIncentives: bigint;
+}
+
+/**
+ * Mempool backrun opportunity
+ */
+export interface MempoolBackrunOpportunity extends BaseOpportunity {
+  type: OpportunityType.MEMPOOL_BACKRUN;
+  targetTransaction: string;
+  backrunType: 'arbitrage' | 'liquidation' | 'rebalancing' | 'sandwich' | 'frontrun';
+  tokenIn?: Address;
+  tokenOut?: Address;
+  backrunAmount?: bigint;
+  expectedAmountOut?: bigint;
+  dexProtocol?: string;
+  poolAddress?: Address;
+  gasEstimate?: bigint;
+  gasPrice?: bigint;
+  timingRisk?: number;
+  slippageRisk?: number;
+  gasPriceVolatility?: number;
+  liquidityRisk?: number;
+  competitionRisk?: number;
+  slippageImprovement?: number;
+  targetTransactionValue?: bigint;
 }
 
 /**
@@ -144,7 +175,7 @@ export interface SwapRoute {
  * Execution result
  */
 export interface ExecutionResult {
-  opportunityId: string;
+  opportunityId?: string;
   success: boolean;
   profit?: bigint | undefined;
   profitUSD?: number | undefined; // USD value of profit
@@ -220,6 +251,15 @@ export interface QueuedOpportunity {
 
 /**
  * Execution engine interface
+ */
+export interface ExecutionEngine {
+  executeOpportunity(opportunity: BaseOpportunity): Promise<ExecutionResult>;
+  getSupportedOpportunityTypes(): OpportunityType[];
+  canHandleOpportunity(opportunity: any): boolean;
+}
+
+/**
+ * Execution engine interface (legacy)
  */
 export interface IExecutionEngine {
   canExecute(opportunity: BaseOpportunity): Promise<boolean>;

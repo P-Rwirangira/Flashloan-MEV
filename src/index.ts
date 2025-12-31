@@ -24,6 +24,9 @@ import { LiquidationProfitCalculator } from './simulator/liquidation-calculator'
 import { StablePoolRebalancingCalculator } from './simulator/stable-pool-calculator';
 import { ExecutionOrchestrator } from './execution/execution-orchestrator';
 import { FlashLoanArbitrageEngine } from './execution/flash-loan-arbitrage-engine';
+import { LiquidationEngine } from './execution/liquidation-engine';
+import { StablePoolEngine } from './execution/stable-pool-engine';
+import { BackrunEngine } from './execution/backrun-engine';
 import { OpportunityStateMachine } from './execution/opportunity-state-machine';
 import { FlashLoanManager } from './execution/flash-loan-manager';
 import { TransactionLifecycleManager } from './execution/transaction-lifecycle-manager';
@@ -70,7 +73,7 @@ interface PlatformConfig {
   };
 }
 
-class BaseMEVPlatform extends EventEmitter {
+export class BaseMEVPlatform extends EventEmitter {
   private configLoader: ConfigLoader;
   private connectionManager: RpcConnectionManager;
   private metricsCollector: MetricsCollector;
@@ -82,6 +85,9 @@ class BaseMEVPlatform extends EventEmitter {
   // Execution engine
   private executionOrchestrator?: ExecutionOrchestrator;
   private flashLoanArbitrageEngine?: FlashLoanArbitrageEngine;
+  private liquidationEngine?: LiquidationEngine;
+  private stablePoolEngine?: StablePoolEngine;
+  private backrunEngine?: BackrunEngine;
   private opportunityStateMachine?: OpportunityStateMachine;
   private flashLoanManager?: FlashLoanManager;
   private transactionLifecycleManager?: TransactionLifecycleManager;
@@ -734,6 +740,54 @@ class BaseMEVPlatform extends EventEmitter {
           }
         );
 
+        // Initialize Liquidation Engine
+        this.liquidationEngine = new LiquidationEngine(
+          {
+            maxSlippageBps: 250, // 2.5%
+            minProfitThresholdUsd: 25.0,
+            gasOptimizationEnabled: true,
+            enableProfitValidation: true,
+            maxLiquidationAmount: ethers.parseEther('100000'), // 100K tokens max
+            supportedProtocols: ['moonwell', 'aave-v3', 'seamless'],
+            healthFactorBuffer: 0.05, // 5% buffer
+            liquidationBonusThreshold: 0.02, // 2% minimum bonus
+          },
+          this.flashLoanManager,
+          this.transactionLifecycleManager
+        );
+
+        // Initialize Stable Pool Engine
+        this.stablePoolEngine = new StablePoolEngine(
+          {
+            maxSlippageBps: 100, // 1%
+            minProfitThresholdUsd: 10.0,
+            gasOptimizationEnabled: true,
+            enableIncentiveCapture: true,
+            maxRebalancingAmount: ethers.parseEther('500000'), // 500K tokens max
+            minImbalanceThreshold: 0.02, // 2% minimum imbalance
+            maxPriceImpactBps: 50, // 0.5% max price impact
+            incentiveMultiplier: 1.2, // 20% bonus on incentives
+          },
+          this.flashLoanManager,
+          this.transactionLifecycleManager
+        );
+
+        // Initialize Backrun Engine
+        this.backrunEngine = new BackrunEngine(
+          {
+            maxSlippageBps: 200, // 2%
+            minProfitThresholdUsd: 15.0,
+            gasOptimizationEnabled: true,
+            enableEthicalValidation: true,
+            maxBackrunAmount: ethers.parseEther('50000'), // 50K tokens max
+            safetyScoreThreshold: 70, // 70/100 minimum safety score
+            maxTimingRiskMs: 3000, // 3 seconds max timing risk
+            enableMEVProtectionDetection: true,
+          },
+          this.flashLoanManager,
+          this.transactionLifecycleManager
+        );
+
         // Initialize execution orchestrator
         this.executionOrchestrator = new ExecutionOrchestrator(
           {
@@ -755,7 +809,32 @@ class BaseMEVPlatform extends EventEmitter {
           this.flashLoanArbitrageEngine
         );
 
-        this.platformLogger.info('Flash Loan Arbitrage Engine registered successfully');
+        // Register the Liquidation Engine
+        this.executionOrchestrator.registerExecutionEngine(
+          OpportunityType.LIQUIDATION,
+          this.liquidationEngine
+        );
+
+        // Register the Stable Pool Engine
+        this.executionOrchestrator.registerExecutionEngine(
+          OpportunityType.STABLE_POOL_REBALANCING,
+          this.stablePoolEngine
+        );
+
+        // Register the Backrun Engine
+        this.executionOrchestrator.registerExecutionEngine(
+          OpportunityType.MEMPOOL_BACKRUN,
+          this.backrunEngine
+        );
+
+        this.platformLogger.info('All execution engines registered successfully', {
+          engines: [
+            'FlashLoanArbitrageEngine',
+            'LiquidationEngine',
+            'StablePoolEngine',
+            'BackrunEngine',
+          ],
+        });
 
         // Set up execution event handlers
         this.executionOrchestrator.on('executionSuccess', ({ opportunity, result }) => {
