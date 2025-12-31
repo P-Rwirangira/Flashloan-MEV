@@ -33,6 +33,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
     // Swap route structure
     struct SwapRoute {
         address[] pools;
+        address[] tokens; // Token path for multi-hop routes
         bool[] directions;
         uint256 minProfit;
         uint256 deadline;
@@ -148,19 +149,41 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
         }
 
         // Validate route
-        if (route.pools.length == 0 || route.pools.length != route.directions.length) {
+        if (route.pools.length == 0 || route.pools.length != route.directions.length || route.tokens.length == 0) {
             revert InvalidRoute();
         }
 
-        // Get initial balance
-        address token = _getTokenFromPool(msg.sender, fee0 > 0);
-        uint256 initialBalance = IERC20(token).balanceOf(address(this));
+        // Determine borrowed token from amounts and pool tokens
+        address token0 = IUniswapV3Pool(msg.sender).token0();
+        address token1 = IUniswapV3Pool(msg.sender).token1();
+        address borrowedToken;
+        uint256 borrowedAmount;
+        
+        // Get borrowed amounts from flash loan parameters
+        uint256 amount0 = IERC20(token0).balanceOf(address(this));
+        uint256 amount1 = IERC20(token1).balanceOf(address(this));
+        
+        if (amount0 > 0 && amount1 == 0) {
+            borrowedToken = token0;
+            borrowedAmount = amount0;
+        } else if (amount1 > 0 && amount0 == 0) {
+            borrowedToken = token1;
+            borrowedAmount = amount1;
+        } else if (amount0 > 0 && amount1 > 0) {
+            // Both tokens borrowed - use the first token in route
+            borrowedToken = route.tokens[0];
+            borrowedAmount = borrowedToken == token0 ? amount0 : amount1;
+        } else {
+            revert InvalidAmount();
+        }
+
+        uint256 initialBalance = borrowedAmount;
 
         // Execute swaps
-        _executeSwaps(route, token);
+        _executeSwaps(route);
 
         // Calculate profit
-        uint256 finalBalance = IERC20(token).balanceOf(address(this));
+        uint256 finalBalance = IERC20(borrowedToken).balanceOf(address(this));
         uint256 totalFee = fee0 + fee1;
         
         if (finalBalance < initialBalance + totalFee) {
@@ -180,7 +203,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
         }
 
         // Repay flash loan
-        IERC20(token).safeTransfer(msg.sender, initialBalance + totalFee);
+        IERC20(borrowedToken).safeTransfer(msg.sender, initialBalance + totalFee);
 
         // Update profit statistics
         unchecked {
@@ -190,8 +213,8 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
         // Emit success event
         emit ArbitrageExecuted(
             tx.origin,
-            token,
-            token, // Same token for arbitrage
+            borrowedToken,
+            borrowedToken, // Same token for arbitrage
             initialBalance,
             profit,
             0 // Gas will be calculated in main function
@@ -199,20 +222,24 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
     }
 
     /**
-     * @dev Execute swap sequence
+     * @dev Execute swap sequence with proper token tracking and approvals
      * @param route The swap route to execute
-     * @param token The token being arbitraged
      */
-    function _executeSwaps(SwapRoute memory route, address token) internal {
+    function _executeSwaps(SwapRoute memory route) internal {
+        address currentToken = route.tokens[0];
+        
         for (uint256 i = 0; i < route.pools.length;) {
             address pool = route.pools[i];
             bool direction = route.directions[i];
             
-            uint256 amountIn = IERC20(token).balanceOf(address(this));
+            uint256 amountIn = IERC20(currentToken).balanceOf(address(this));
             
             if (amountIn == 0) {
                 revert InvalidAmount();
             }
+
+            // Approve the pool to spend the input token
+            IERC20(currentToken).safeApprove(pool, amountIn);
 
             try IUniswapV3Pool(pool).swap(
                 address(this),
@@ -220,7 +247,17 @@ contract FlashExecutor is IUniswapV3FlashCallback, ReentrancyGuard, Pausable, Ow
                 int256(amountIn),
                 direction ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1,
                 ""
-            ) {} catch (bytes memory reason) {
+            ) {
+                // Reset approval after successful swap
+                IERC20(currentToken).safeApprove(pool, 0);
+                
+                // Update current token for next iteration
+                if (i + 1 < route.tokens.length) {
+                    currentToken = route.tokens[i + 1];
+                }
+            } catch (bytes memory reason) {
+                // Reset approval on failure
+                IERC20(currentToken).safeApprove(pool, 0);
                 revert SwapFailed(pool, reason);
             }
 

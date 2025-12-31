@@ -43,6 +43,8 @@ export class MempoolMonitor extends EventEmitter {
 
   private isMonitoring = false;
   private pendingTxs: Map<string, PendingTxOpportunity> = new Map();
+  private cleanupInterval?: NodeJS.Timeout;
+  private statsInterval?: NodeJS.Timeout;
   private stats: MempoolStats = {
     totalPendingTxs: 0,
     dexSwapTxs: 0,
@@ -123,6 +125,18 @@ export class MempoolMonitor extends EventEmitter {
     }
 
     this.logger.info('Stopping mempool monitoring...');
+
+    // Clear intervals
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = undefined;
+    }
+
+    if (this.statsInterval) {
+      clearInterval(this.statsInterval);
+      this.statsInterval = undefined;
+    }
+
     this.isMonitoring = false;
     this.pendingTxs.clear();
     this.logger.info('Mempool monitoring stopped');
@@ -141,7 +155,28 @@ export class MempoolMonitor extends EventEmitter {
       params: ['newPendingTransactions'],
     });
 
-    ws.send(subscribeMessage);
+    // Check WebSocket state before sending
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(subscribeMessage);
+      } catch (error) {
+        this.logger.logError(error as Error, {
+          operation: 'websocket-send',
+        });
+        throw error;
+      }
+    } else {
+      // Queue message for when connection opens
+      ws.on('open', () => {
+        try {
+          ws.send(subscribeMessage);
+        } catch (error) {
+          this.logger.logError(error as Error, {
+            operation: 'websocket-send-on-open',
+          });
+        }
+      });
+    }
 
     // Listen for WebSocket messages
     this.connectionManager.on('websocketMessage', async (message: any) => {
@@ -430,7 +465,7 @@ export class MempoolMonitor extends EventEmitter {
    * Start periodic cleanup of old pending transactions
    */
   private startPeriodicCleanup(): void {
-    setInterval(() => {
+    this.cleanupInterval = setInterval(() => {
       const now = Date.now();
       const maxAge = 60000; // 1 minute
 
@@ -449,7 +484,7 @@ export class MempoolMonitor extends EventEmitter {
    * Start periodic stats reporting
    */
   private startStatsReporting(): void {
-    setInterval(() => {
+    this.statsInterval = setInterval(() => {
       this.logger.debug('Mempool stats', {
         totalPendingTxs: this.stats.totalPendingTxs,
         dexSwapTxs: this.stats.dexSwapTxs,

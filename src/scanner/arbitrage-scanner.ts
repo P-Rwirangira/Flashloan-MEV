@@ -871,12 +871,19 @@ export class ArbitrageScanner extends EventEmitter {
 
     // Cap at maximum size (2% of liquidity)
     const maxAmount = (availableTokenAmount * BigInt(maxSizePercent)) / 100n;
+
+    // Ensure minimum viable size ($100 equivalent at ~$3000 ETH = 0.033 ETH)
+    const minAmountWei = 33000000000000000n; // 0.033 ETH minimum
+
+    // Check if minimum exceeds maximum - if so, skip this trade
+    if (minAmountWei > maxAmount) {
+      return 0n;
+    }
+
     if (optimalAmount > maxAmount) {
       optimalAmount = maxAmount;
     }
 
-    // Ensure minimum viable size ($100 equivalent at ~$3000 ETH = 0.033 ETH)
-    const minAmountWei = 33000000000000000n; // 0.033 ETH minimum
     if (optimalAmount < minAmountWei) {
       optimalAmount = minAmountWei;
     }

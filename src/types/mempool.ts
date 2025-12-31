@@ -5,6 +5,7 @@
  */
 
 import { DexType } from './dex';
+import { RpcConnectionManager } from '../rpc/connection-manager';
 
 export interface PendingTxOpportunity {
   readonly id: string;
@@ -38,7 +39,7 @@ export interface SwapDetails {
 }
 
 export interface MempoolMonitorOptions {
-  readonly connectionManager: any; // RpcConnectionManager
+  readonly connectionManager: RpcConnectionManager;
   readonly enabledProtocols: DexType[];
   readonly minGasPrice?: bigint | undefined;
   readonly maxGasPrice?: bigint | undefined;

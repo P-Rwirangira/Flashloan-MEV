@@ -47,6 +47,7 @@ export interface ArbitrageStep {
   readonly tokenOut: Address;
   readonly amountIn: bigint;
   readonly amountOut: bigint;
+  readonly direction: boolean; // true for token0->token1, false for token1->token0
   readonly fee?: number | undefined;
 }
 

@@ -9,10 +9,13 @@ import { spawn, ChildProcess } from 'child_process';
 import { ethers } from 'ethers';
 import { EventEmitter } from 'events';
 import { ArbitrageOpportunity } from '../types/opportunity';
+import { ArbitrageRoute } from '../types/execution';
 import { RpcConnectionManager } from '../rpc/connection-manager';
+import { ContractManager } from '../contracts/contract-manager';
 
 export interface FoundrySimulatorOptions {
   readonly connectionManager: RpcConnectionManager;
+  readonly contractManager?: ContractManager | undefined;
   readonly forkUrl?: string;
   readonly anvilPort?: number;
   readonly simulationTimeoutMs?: number;
@@ -62,6 +65,7 @@ export interface ForkState {
 
 export class FoundrySimulator extends EventEmitter {
   private readonly connectionManager: RpcConnectionManager;
+  private readonly contractManager?: ContractManager | undefined;
   private readonly forkUrl: string;
   private readonly anvilPort: number;
   private readonly simulationTimeoutMs: number;
@@ -89,6 +93,7 @@ export class FoundrySimulator extends EventEmitter {
     super();
 
     this.connectionManager = options.connectionManager;
+    this.contractManager = options.contractManager;
     this.forkUrl = options.forkUrl || this.connectionManager.getPrimaryRpcUrl();
     this.anvilPort = options.anvilPort || 8545;
     this.simulationTimeoutMs = options.simulationTimeoutMs || 50; // 50ms for latency requirement
@@ -170,6 +175,84 @@ export class FoundrySimulator extends EventEmitter {
   }
 
   /**
+   * Simulate an arbitrage route (enhanced method for Flash Executor integration)
+   */
+  async simulateArbitrageRoute(route: ArbitrageRoute): Promise<SimulationResult> {
+    if (!this.isInitialized) {
+      throw new Error('Simulator not initialized');
+    }
+
+    const startTime = Date.now();
+
+    try {
+      // Basic validation
+      if (route.path.length === 0) {
+        return {
+          success: false,
+          gasUsed: 0n,
+          actualProfit: 0n,
+          executionTime: Date.now() - startTime,
+          error: 'Route has no steps',
+        };
+      }
+
+      if (route.amountIn <= 0n) {
+        return {
+          success: false,
+          gasUsed: 0n,
+          actualProfit: 0n,
+          executionTime: Date.now() - startTime,
+          error: 'Amount in must be positive',
+        };
+      }
+
+      // Enhanced validation if contract manager is available
+      if (this.contractManager) {
+        // Could add additional validation here using contract manager
+        // For now, just log that we have access to contract configuration
+        const config = this.contractManager.getFlashExecutorConfig();
+        if (!config.address) {
+          return {
+            success: false,
+            gasUsed: 0n,
+            actualProfit: 0n,
+            executionTime: Date.now() - startTime,
+            error: 'Flash Executor contract not deployed',
+          };
+        }
+      }
+
+      // Estimate gas based on route complexity
+      const baseGas = 200000n;
+      const gasPerStep = 150000n;
+      const estimatedGas = baseGas + BigInt(route.path.length) * gasPerStep;
+
+      // Simulate gas cost impact on profit
+      const gasPrice = 2000000000n; // 2 gwei
+      const gasCost = estimatedGas * gasPrice;
+      const actualProfit = route.expectedProfit > gasCost ? route.expectedProfit - gasCost : 0n;
+
+      // Check if profitable after gas costs
+      const success = actualProfit > 0n;
+
+      return {
+        success,
+        gasUsed: estimatedGas,
+        actualProfit,
+        executionTime: Date.now() - startTime,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        gasUsed: 0n,
+        actualProfit: 0n,
+        executionTime: Date.now() - startTime,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
    * Create a new fork from current Base state
    */
   async createFork(): Promise<ForkState> {
@@ -241,8 +324,15 @@ export class FoundrySimulator extends EventEmitter {
       // Create fork for this simulation
       const fork = await this.createFork();
 
+      // Deploy Flash Executor contract to fork
+      const contractAddress = await this.deployFlashExecutorToFork(fork);
+
       // Simulate the arbitrage transaction
-      const simulationResult = await this.simulateArbitrageTransaction(opportunity, fork);
+      const simulationResult = await this.simulateArbitrageTransaction(
+        opportunity,
+        fork,
+        contractAddress
+      );
 
       // Clean up fork
       this.activeForks.delete(fork.forkId);
@@ -257,6 +347,7 @@ export class FoundrySimulator extends EventEmitter {
         success: finalResult.success,
         profit: finalResult.actualProfit.toString(),
         gasUsed: finalResult.gasUsed.toString(),
+        contractAddress,
       });
 
       return finalResult;
@@ -275,11 +366,70 @@ export class FoundrySimulator extends EventEmitter {
   }
 
   /**
+   * Deploy Flash Executor contract to fork
+   */
+  private async deployFlashExecutorToFork(fork: ForkState): Promise<string> {
+    try {
+      // Load contract artifacts
+      const FlashExecutorArtifact = require('../../artifacts/contracts/FlashExecutor.sol/FlashExecutor.json');
+
+      // Create a test wallet for deployment
+      const deployerWallet = ethers.Wallet.createRandom().connect(fork.provider);
+
+      // Fund the deployer wallet with ETH
+      await fork.provider.send('anvil_setBalance', [
+        deployerWallet.address,
+        ethers.toBeHex(ethers.parseEther('100')), // 100 ETH for deployment and gas
+      ]);
+
+      // Create contract factory
+      const contractFactory = new ethers.ContractFactory(
+        FlashExecutorArtifact.abi,
+        FlashExecutorArtifact.bytecode,
+        deployerWallet
+      );
+
+      // Deploy with minimum profit of 1 wei (will be overridden by route data)
+      const contract = await contractFactory.deploy(1n);
+      await contract.waitForDeployment();
+
+      const contractAddress = await contract.getAddress();
+
+      // Authorize test pools if contract manager is available
+      if (this.contractManager) {
+        const authorizedPools = this.contractManager.getAllAuthorizedPoolAddresses();
+        for (const poolAddress of authorizedPools) {
+          try {
+            const tx = await (contract as any).addAuthorizedPool(poolAddress);
+            await tx.wait();
+          } catch (error) {
+            // Log but don't fail deployment if pool authorization fails
+            this.emit('poolAuthorizationFailed', {
+              poolAddress,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+
+      this.emit('contractDeployed', {
+        forkId: fork.forkId,
+        contractAddress,
+        deployerAddress: deployerWallet.address,
+      });
+
+      return contractAddress;
+    } catch (error) {
+      throw new Error(`Failed to deploy Flash Executor to fork: ${error}`);
+    }
+  }
+  /**
    * Simulate arbitrage transaction execution
    */
   private async simulateArbitrageTransaction(
     opportunity: ArbitrageOpportunity,
-    fork: ForkState
+    fork: ForkState,
+    contractAddress: string
   ): Promise<Omit<SimulationResult, 'executionTime'>> {
     try {
       // Create a test wallet for simulation
@@ -291,35 +441,20 @@ export class FoundrySimulator extends EventEmitter {
         ethers.toBeHex(ethers.parseEther('10')), // 10 ETH for gas
       ]);
 
-      // Simulate flash loan execution
-      const flashLoanResult = await this.simulateFlashLoan(opportunity, testWallet);
+      // Build transaction using transaction builder
+      const transactionBuilder = await this.createTransactionBuilder(fork.provider);
+      const route = this.convertOpportunityToRoute(opportunity);
 
-      if (!flashLoanResult.success) {
-        return {
-          success: false,
-          gasUsed: flashLoanResult.gasUsed,
-          actualProfit: 0n,
-          error: flashLoanResult.error || 'Flash loan simulation failed',
-          revertReason: flashLoanResult.revertReason,
-        };
-      }
+      // Build the actual transaction that would be submitted
+      const tx = await transactionBuilder.buildArbitrageTx(route, testWallet.address);
 
-      // Calculate actual profit
-      const actualProfit = await this.calculateActualProfit(
-        opportunity,
-        flashLoanResult,
-        testWallet
-      );
+      // Override the contract address to use our deployed fork contract
+      tx.to = contractAddress;
 
-      // Validate minimum profit requirement
-      const minProfitMet = actualProfit >= BigInt(opportunity.minProfit.toString());
+      // Execute the transaction on the fork
+      const executionResult = await this.executeTransactionOnFork(tx, testWallet, fork);
 
-      return {
-        success: minProfitMet,
-        gasUsed: flashLoanResult.gasUsed,
-        actualProfit,
-        error: minProfitMet ? undefined : 'Insufficient profit after simulation',
-      };
+      return executionResult;
     } catch (error) {
       return {
         success: false,
@@ -331,154 +466,137 @@ export class FoundrySimulator extends EventEmitter {
   }
 
   /**
-   * Simulate flash loan execution
+   * Create transaction builder for simulation
    */
-  private async simulateFlashLoan(
-    opportunity: ArbitrageOpportunity,
-    wallet: ethers.HDNodeWallet
-  ): Promise<{
-    success: boolean;
-    gasUsed: bigint;
-    error?: string;
-    revertReason?: string;
-  }> {
-    try {
-      // For simulation, we'll estimate the gas and execution without deploying contracts
-      // In a real implementation, this would interact with the actual Flash Executor contract
+  private async createTransactionBuilder(provider: ethers.Provider): Promise<any> {
+    if (!this.contractManager) {
+      throw new Error('Contract manager required for transaction building');
+    }
 
-      // Log wallet usage for debugging
-      this.emit('walletUsed', {
-        walletAddress: wallet.address,
-        opportunityId: opportunity.id,
-        balance: (await wallet.provider?.getBalance(wallet.address)) || 0n,
+    // Import TransactionBuilder dynamically to avoid circular dependencies
+    const { TransactionBuilder } = await import('../executor/transaction-builder');
+
+    return new TransactionBuilder({
+      contractManager: this.contractManager,
+      provider,
+      defaultGasLimit: this.timeoutConfig.maxGasLimit,
+      defaultSlippage: 0.01, // 1% default slippage
+    });
+  }
+
+  /**
+   * Convert ArbitrageOpportunity to ArbitrageRoute for transaction builder
+   */
+  private convertOpportunityToRoute(opportunity: ArbitrageOpportunity): any {
+    return {
+      tokenIn: opportunity.tokenIn,
+      tokenOut: opportunity.tokenOut,
+      amountIn: BigInt(opportunity.amountIn.toString()),
+      expectedProfit: BigInt(opportunity.expectedProfit.toString()),
+      path: opportunity.route.pools.map((poolAddress, index) => ({
+        poolAddress,
+        tokenIn: index === 0 ? opportunity.tokenIn : opportunity.route.pools[index - 1], // Simplified
+        tokenOut:
+          index === opportunity.route.pools.length - 1
+            ? opportunity.tokenOut
+            : opportunity.route.pools[index + 1], // Simplified
+      })),
+    };
+  }
+
+  /**
+   * Execute transaction on fork and capture results
+   */
+  private async executeTransactionOnFork(
+    tx: any,
+    wallet: ethers.HDNodeWallet,
+    fork: ForkState
+  ): Promise<Omit<SimulationResult, 'executionTime'>> {
+    try {
+      // Get initial balance for profit calculation
+      const initialBalance = (await wallet.provider?.getBalance(wallet.address)) || 0n;
+
+      // Execute the transaction
+      const txResponse = await wallet.sendTransaction(tx);
+      const receipt = await txResponse.wait();
+
+      if (!receipt) {
+        return {
+          success: false,
+          gasUsed: 0n,
+          actualProfit: 0n,
+          error: 'Transaction receipt not available',
+        };
+      }
+
+      // Get final balance
+      const finalBalance = (await wallet.provider?.getBalance(wallet.address)) || 0n;
+
+      // Calculate actual profit (excluding gas costs for now, as this is a simulation)
+      const gasUsed = BigInt(receipt.gasUsed.toString());
+      const gasCost = gasUsed * BigInt(receipt.gasPrice?.toString() || '0');
+      const balanceChange = finalBalance - initialBalance + gasCost; // Add back gas cost to see profit
+
+      // Check if transaction was successful
+      const success = receipt.status === 1 && balanceChange > 0n;
+
+      // Extract revert reason from logs if transaction failed
+      let revertReason: string | undefined;
+      if (!success && receipt.logs) {
+        // Look for ArbitrageFailed event or other error events
+        for (const log of receipt.logs) {
+          try {
+            // Try to decode as ArbitrageFailed event
+            const iface = new ethers.Interface([
+              'event ArbitrageFailed(address indexed caller, string reason, uint256 gasUsed)',
+            ]);
+            const decoded = iface.parseLog(log);
+            if (decoded && decoded.name === 'ArbitrageFailed') {
+              revertReason = decoded.args['reason'];
+              break;
+            }
+          } catch {
+            // Ignore decode errors
+          }
+        }
+      }
+
+      this.emit('transactionExecuted', {
+        forkId: fork.forkId,
+        txHash: receipt.hash,
+        success,
+        gasUsed: gasUsed.toString(),
+        balanceChange: balanceChange.toString(),
       });
 
-      // Estimate gas for the complete arbitrage transaction
-      const estimatedGas = await this.estimateArbitrageGas(opportunity);
-
-      // Simulate the execution by checking if we have enough gas and the route is valid
-      const hasEnoughGas = estimatedGas <= this.timeoutConfig.maxGasLimit;
-      const routeValid = this.validateRoute(opportunity);
-
-      if (!hasEnoughGas) {
-        return {
-          success: false,
-          gasUsed: estimatedGas,
-          error: 'Gas limit exceeded',
-        };
-      }
-
-      if (!routeValid) {
-        return {
-          success: false,
-          gasUsed: estimatedGas,
-          error: 'Invalid route',
-        };
-      }
-
       return {
-        success: true,
-        gasUsed: estimatedGas,
+        success,
+        gasUsed,
+        actualProfit: success ? balanceChange : 0n,
+        revertReason,
+        logs: receipt.logs?.map(log => log.data) || [],
       };
     } catch (error) {
+      // Handle transaction revert
+      let revertReason: string | undefined;
+
+      if (error instanceof Error) {
+        // Extract revert reason from error message
+        const revertMatch = error.message.match(/revert (.+)/i);
+        if (revertMatch) {
+          revertReason = revertMatch[1];
+        }
+      }
+
       return {
         success: false,
         gasUsed: 0n,
+        actualProfit: 0n,
         error: error instanceof Error ? error.message : String(error),
+        revertReason,
       };
     }
   }
-
-  /**
-   * Estimate gas for arbitrage execution
-   */
-  private async estimateArbitrageGas(opportunity: ArbitrageOpportunity): Promise<bigint> {
-    // Base gas costs for different operations
-    const flashLoanGas = 50000n; // Flash loan initiation and callback
-    const swapGas = 100000n; // Per swap operation
-    const transferGas = 21000n; // Token transfers
-
-    // Calculate total gas based on route complexity
-    const numSwaps = BigInt(opportunity.route.pools.length);
-    const numFallbacks = BigInt(opportunity.fallbackRoutes.length);
-
-    const totalGas =
-      flashLoanGas +
-      swapGas * numSwaps +
-      transferGas * 2n + // Input and output transfers
-      swapGas * numFallbacks * 10n; // Fallback route overhead (10% of main route)
-
-    return totalGas;
-  }
-
-  /**
-   * Validate arbitrage route
-   */
-  private validateRoute(opportunity: ArbitrageOpportunity): boolean {
-    // Check if route has valid pools
-    if (opportunity.route.pools.length === 0) {
-      return false;
-    }
-
-    // Check if amounts are reasonable
-    const amountIn = BigInt(opportunity.amountIn.toString());
-    if (amountIn <= 0n) {
-      return false;
-    }
-
-    // Check if expected profit is positive
-    const expectedProfit = BigInt(opportunity.expectedProfit.toString());
-    if (expectedProfit <= 0n) {
-      return false;
-    }
-
-    // Check if slippage tolerance is reasonable
-    if (opportunity.slippageTolerance > this.timeoutConfig.maxSlippagePercent) {
-      return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * Calculate actual profit from simulation
-   */
-  private async calculateActualProfit(
-    opportunity: ArbitrageOpportunity,
-    flashLoanResult: { gasUsed: bigint },
-    wallet: ethers.HDNodeWallet
-  ): Promise<bigint> {
-    try {
-      // Get current gas price
-      const provider = wallet.provider;
-      if (!provider) {
-        return 0n;
-      }
-
-      const feeData = await provider.getFeeData();
-      const gasPrice = feeData.gasPrice || ethers.parseUnits('2', 'gwei');
-
-      // Calculate gas cost
-      const gasCost = flashLoanResult.gasUsed * BigInt(gasPrice.toString());
-
-      // Calculate flash loan fee
-      const flashLoanFee = BigInt(opportunity.flashFee.toString());
-
-      // Simulate slippage impact
-      const expectedProfit = BigInt(opportunity.expectedProfit.toString());
-      const slippageImpact =
-        (expectedProfit * BigInt(opportunity.slippageTolerance * 100)) / 10000n;
-
-      // Calculate net profit
-      const grossProfit = expectedProfit - slippageImpact;
-      const totalCosts = gasCost + flashLoanFee;
-
-      return grossProfit > totalCosts ? grossProfit - totalCosts : 0n;
-    } catch (error) {
-      return 0n; // Return 0 profit on calculation error
-    }
-  }
-
   /**
    * Process simulation queue
    */
@@ -497,45 +615,140 @@ export class FoundrySimulator extends EventEmitter {
   }
 
   /**
-   * Start Anvil process
+   * Start Anvil process with automatic restart capability
    */
   private async startAnvil(): Promise<void> {
     return new Promise((resolve, reject) => {
-      // Start Anvil with fork configuration
-      this.anvilProcess = spawn('anvil', [
-        '--fork-url',
-        this.forkUrl,
-        '--port',
-        this.anvilPort.toString(),
-        '--host',
-        '127.0.0.1',
-        '--silent', // Reduce log output
-      ]);
-
       let isResolved = false;
+      let restartAttempts = 0;
+      const maxRestartAttempts = 3;
 
-      this.anvilProcess.on('error', error => {
+      const startProcess = () => {
+        // Start Anvil with fork configuration
+        this.anvilProcess = spawn('anvil', [
+          '--fork-url',
+          this.forkUrl,
+          '--port',
+          this.anvilPort.toString(),
+          '--host',
+          '127.0.0.1',
+          '--silent', // Reduce log output
+          '--accounts',
+          '10', // Create 10 test accounts
+          '--balance',
+          '10000', // 10000 ETH per account
+        ]);
+
+        this.anvilProcess.on('error', error => {
+          if (!isResolved) {
+            isResolved = true;
+            reject(new Error(`Failed to start Anvil: ${error.message}`));
+          } else {
+            // Process crashed after startup - attempt restart
+            this.handleAnvilCrash(error);
+          }
+        });
+
+        this.anvilProcess.on('exit', (code, signal) => {
+          if (!isResolved && code !== 0) {
+            isResolved = true;
+            reject(new Error(`Anvil exited with code ${code}, signal ${signal}`));
+          } else if (code !== 0 && restartAttempts < maxRestartAttempts) {
+            // Unexpected exit - attempt restart
+            this.handleAnvilCrash(
+              new Error(`Anvil exited unexpectedly: code ${code}, signal ${signal}`)
+            );
+          }
+        });
+
+        // Capture stdout/stderr for debugging
+        if (this.anvilProcess.stdout) {
+          this.anvilProcess.stdout.on('data', data => {
+            this.emit('anvilOutput', { type: 'stdout', data: data.toString() });
+          });
+        }
+
+        if (this.anvilProcess.stderr) {
+          this.anvilProcess.stderr.on('data', data => {
+            this.emit('anvilOutput', { type: 'stderr', data: data.toString() });
+          });
+        }
+      };
+
+      const handleRestart = () => {
+        restartAttempts++;
+        this.emit('anvilRestarting', { attempt: restartAttempts, maxAttempts: maxRestartAttempts });
+
+        setTimeout(() => {
+          startProcess();
+
+          // Test connection after restart
+          setTimeout(async () => {
+            try {
+              await this.testAnvilConnection();
+              this.emit('anvilRestarted', { attempt: restartAttempts });
+            } catch (error) {
+              if (restartAttempts < maxRestartAttempts) {
+                handleRestart();
+              } else {
+                this.emit('anvilRestartFailed', {
+                  attempts: restartAttempts,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+            }
+          }, 2000);
+        }, 1000 * restartAttempts); // Exponential backoff
+      };
+
+      this.handleAnvilCrash = (error: Error) => {
+        this.emit('anvilCrashed', {
+          error: error.message,
+          restartAttempts,
+          willRestart: restartAttempts < maxRestartAttempts,
+        });
+
+        if (restartAttempts < maxRestartAttempts) {
+          handleRestart();
+        }
+      };
+
+      // Start initial process
+      startProcess();
+
+      // Wait for Anvil to start
+      setTimeout(async () => {
         if (!isResolved) {
-          isResolved = true;
-          reject(new Error(`Failed to start Anvil: ${error.message}`));
+          try {
+            await this.testAnvilConnection();
+            isResolved = true;
+            resolve();
+          } catch (error) {
+            isResolved = true;
+            reject(new Error(`Anvil connection test failed: ${error}`));
+          }
         }
-      });
-
-      this.anvilProcess.on('exit', code => {
-        if (!isResolved && code !== 0) {
-          isResolved = true;
-          reject(new Error(`Anvil exited with code ${code}`));
-        }
-      });
-
-      // Wait for Anvil to start (simple delay-based approach)
-      setTimeout(() => {
-        if (!isResolved) {
-          isResolved = true;
-          resolve();
-        }
-      }, 2000); // 2 second startup delay
+      }, 3000); // 3 second startup delay
     });
+  }
+
+  private handleAnvilCrash!: (error: Error) => void; // Will be assigned in startAnvil
+
+  /**
+   * Test Anvil connection
+   */
+  private async testAnvilConnection(): Promise<void> {
+    const forkUrl = `http://127.0.0.1:${this.anvilPort}`;
+    const testProvider = new ethers.JsonRpcProvider(forkUrl);
+
+    // Test basic RPC call
+    await testProvider.getBlockNumber();
+
+    // Test fork functionality
+    const chainId = await testProvider.getNetwork();
+    if (!chainId) {
+      throw new Error('Failed to get network info from Anvil');
+    }
   }
 
   /**

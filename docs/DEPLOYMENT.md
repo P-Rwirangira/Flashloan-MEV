@@ -288,9 +288,27 @@ Access Grafana at `http://localhost:3000` (default credentials: admin/admin)
    ```bash
    # Allow only necessary ports
    sudo ufw allow 22/tcp    # SSH
-   sudo ufw allow 3002/tcp  # Health checks (internal only)
+   
+   # Health checks - restrict to monitoring networks only
+   # Option 1: Allow from specific monitoring subnet
+   sudo ufw allow from 10.0.1.0/24 to any port 3002
+   
+   # Option 2: Allow from specific monitoring IPs
+   sudo ufw allow from 192.168.1.100 to any port 3002
+   sudo ufw allow from 192.168.1.101 to any port 3002
+   
+   # Option 3: Bind to localhost and use reverse proxy
+   # Configure health endpoint to bind to 127.0.0.1:3002
+   # Then use nginx/apache with authentication
+   
    sudo ufw enable
    ```
+
+   **Alternative secure approaches:**
+   - **Reverse Proxy**: Use nginx/apache with HTTP basic auth
+   - **VPN Access**: Require VPN connection for monitoring access  
+   - **Private Network**: Deploy in private subnet with bastion host
+   - **Service Mesh**: Use Istio/Linkerd for mTLS and access control
 
 2. **Secrets Management**
    ```bash

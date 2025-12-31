@@ -5,7 +5,7 @@
  */
 
 import { ethers } from 'ethers';
-import { readFileSync, writeFileSync } from 'fs';
+import { promises as fs } from 'fs';
 import { join } from 'path';
 import * as yaml from 'yaml';
 import { logger } from '../utils/logger';
@@ -59,17 +59,26 @@ export class ContractManager {
   private configPath: string;
   private config: ContractsYaml;
 
-  constructor(configPath: string = 'config/contracts.yaml') {
-    this.configPath = join(process.cwd(), configPath);
-    this.config = this.loadConfig();
+  private constructor(configPath: string, config: ContractsYaml) {
+    this.configPath = configPath;
+    this.config = config;
   }
 
   /**
-   * Load configuration from YAML file
+   * Create ContractManager instance asynchronously
    */
-  private loadConfig(): ContractsYaml {
+  static async create(configPath: string = 'config/contracts.yaml'): Promise<ContractManager> {
+    const fullPath = join(process.cwd(), configPath);
+    const config = await ContractManager.loadConfigAsync(fullPath);
+    return new ContractManager(fullPath, config);
+  }
+
+  /**
+   * Load configuration from YAML file asynchronously
+   */
+  private static async loadConfigAsync(configPath: string): Promise<ContractsYaml> {
     try {
-      const configFile = readFileSync(this.configPath, 'utf8');
+      const configFile = await fs.readFile(configPath, 'utf8');
       return yaml.parse(configFile) as ContractsYaml;
     } catch (error) {
       logger.error('Failed to load contracts configuration:', error);
@@ -78,12 +87,27 @@ export class ContractManager {
   }
 
   /**
-   * Save configuration to YAML file
+   * Load configuration from YAML file (returns Promise)
    */
-  private saveConfig(): void {
+  async loadConfig(): Promise<ContractsYaml> {
+    this.config = await ContractManager.loadConfigAsync(this.configPath);
+    return this.config;
+  }
+
+  /**
+   * Save configuration to YAML file asynchronously
+   */
+  private async saveConfig(): Promise<void> {
     try {
       const yamlString = yaml.stringify(this.config, { indent: 2 });
-      writeFileSync(this.configPath, yamlString, 'utf8');
+      const tempPath = `${this.configPath}.tmp`;
+
+      // Write to temp file first
+      await fs.writeFile(tempPath, yamlString, 'utf8');
+
+      // Atomically rename temp file to real path
+      await fs.rename(tempPath, this.configPath);
+
       logger.info('Contracts configuration saved successfully');
     } catch (error) {
       logger.error('Failed to save contracts configuration:', error);
@@ -94,9 +118,9 @@ export class ContractManager {
   /**
    * Update Flash Executor contract configuration
    */
-  updateFlashExecutorConfig(contractConfig: ContractConfig): void {
+  async updateFlashExecutorConfig(contractConfig: ContractConfig): Promise<void> {
     this.config.contracts.flashExecutor = contractConfig;
-    this.saveConfig();
+    await this.saveConfig();
     logger.info(`Flash Executor configuration updated: ${contractConfig.address}`);
   }
 
@@ -115,24 +139,49 @@ export class ContractManager {
   }
 
   /**
+   * Add normalized address helper
+   */
+  private normalizeAddress(address: string): string {
+    return address.toLowerCase();
+  }
+
+  /**
    * Add authorized pool
    */
-  addAuthorizedPool(protocol: 'uniswapV3' | 'aerodrome', pool: PoolConfig): void {
-    this.config.contracts.authorizedPools[protocol].push(pool);
-    this.saveConfig();
-    logger.info(`Added authorized ${protocol} pool: ${pool.address}`);
+  async addAuthorizedPool(protocol: 'uniswapV3' | 'aerodrome', pool: PoolConfig): Promise<void> {
+    const pools = this.config.contracts.authorizedPools[protocol];
+    const normalizedAddress = this.normalizeAddress(pool.address);
+
+    // Check for duplicates using normalized addresses
+    const exists = pools.some(
+      existingPool => this.normalizeAddress(existingPool.address) === normalizedAddress
+    );
+
+    if (!exists) {
+      pools.push(pool);
+      await this.saveConfig();
+      logger.info(`Added authorized ${protocol} pool: ${pool.address}`);
+    } else {
+      logger.warn(`Pool already exists in ${protocol} authorized pools: ${pool.address}`);
+    }
   }
 
   /**
    * Remove authorized pool
    */
-  removeAuthorizedPool(protocol: 'uniswapV3' | 'aerodrome', poolAddress: string): void {
+  async removeAuthorizedPool(
+    protocol: 'uniswapV3' | 'aerodrome',
+    poolAddress: string
+  ): Promise<void> {
     const pools = this.config.contracts.authorizedPools[protocol];
-    const index = pools.findIndex(pool => pool.address.toLowerCase() === poolAddress.toLowerCase());
+    const normalizedAddress = this.normalizeAddress(poolAddress);
+    const index = pools.findIndex(
+      pool => this.normalizeAddress(pool.address) === normalizedAddress
+    );
 
     if (index !== -1) {
       pools.splice(index, 1);
-      this.saveConfig();
+      await this.saveConfig();
       logger.info(`Removed authorized ${protocol} pool: ${poolAddress}`);
     } else {
       logger.warn(`Pool not found in ${protocol} authorized pools: ${poolAddress}`);
@@ -170,14 +219,14 @@ export class ContractManager {
   getAllAuthorizedPoolAddresses(): Address[] {
     const pools: Address[] = [];
 
-    // Add Uniswap V3 pools
+    // Add Uniswap V3 pools with normalized addresses
     this.config.contracts.authorizedPools.uniswapV3.forEach(pool => {
-      pools.push(pool.address as Address);
+      pools.push(this.normalizeAddress(pool.address) as Address);
     });
 
-    // Add Aerodrome pools
+    // Add Aerodrome pools with normalized addresses
     this.config.contracts.authorizedPools.aerodrome.forEach(pool => {
-      pools.push(pool.address as Address);
+      pools.push(this.normalizeAddress(pool.address) as Address);
     });
 
     return pools;
@@ -243,9 +292,14 @@ export class ContractManager {
   }
 
   /**
-   * Reset configuration (for testing)
+   * Reset configuration (for testing only)
    */
-  resetConfig(): void {
+  async resetConfig(): Promise<void> {
+    // Environment guard - only allow in test environment
+    if (process.env['NODE_ENV'] !== 'test') {
+      throw new Error('resetConfig can only be called in test environment');
+    }
+
     this.config.contracts.flashExecutor = {
       address: '',
       deploymentBlock: 0,
@@ -255,7 +309,7 @@ export class ContractManager {
       owner: '',
       minProfit: '',
     };
-    this.saveConfig();
+    await this.saveConfig();
     logger.info('Contract configuration reset');
   }
 }

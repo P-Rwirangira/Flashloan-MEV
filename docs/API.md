@@ -262,14 +262,111 @@ All endpoints may return error responses in the following format:
 
 ## CORS
 
-All endpoints support CORS with the following headers:
-- `Access-Control-Allow-Origin: *`
-- `Access-Control-Allow-Methods: GET, OPTIONS`
-- `Access-Control-Allow-Headers: Content-Type`
+**⚠️ Security Warning**: The current configuration uses permissive CORS settings for development.
+
+**Development Configuration:**
+```
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET, OPTIONS
+Access-Control-Allow-Headers: Content-Type
+```
+
+**Production Security Recommendations:**
+
+For production deployments, restrict CORS origins to specific monitoring/dashboard domains:
+
+```yaml
+# config/production.yaml
+monitoring:
+  cors:
+    allowedOrigins:
+      - "https://monitoring.yourcompany.com"
+      - "https://grafana.yourcompany.com"
+    allowCredentials: false
+    maxAge: 86400
+```
+
+Environment variable configuration:
+```bash
+CORS_ALLOWED_ORIGINS="https://monitoring.yourcompany.com,https://grafana.yourcompany.com"
+```
+
+## Security
+
+### Production Security Considerations
+
+**⚠️ Important**: Health check endpoints expose operational metrics that could be sensitive in production environments.
+
+### Authentication Options
+
+For production deployments, consider implementing:
+
+1. **API Key Authentication**
+   ```bash
+   curl -H "X-API-Key: your-secret-key" http://localhost:3002/health
+   ```
+
+2. **Mutual TLS (mTLS)**
+   - Client certificate authentication
+   - Encrypted communication
+
+3. **Token-based Authentication**
+   ```bash
+   curl -H "Authorization: Bearer your-jwt-token" http://localhost:3002/metrics
+   ```
+
+### Network Security
+
+**Recommended mitigations:**
+
+1. **Network-level restrictions**
+   - IP allowlists for monitoring systems
+   - Private subnets/VPCs
+   - Load balancer with authentication
+
+2. **Firewall rules (UFW example)**
+   ```bash
+   # Allow from monitoring subnet only
+   sudo ufw allow from 10.0.1.0/24 to any port 3002
+   
+   # Allow from specific monitoring IPs
+   sudo ufw allow from 192.168.1.100 to any port 3002
+   ```
+
+3. **Reverse proxy with authentication**
+   ```nginx
+   location /health {
+       auth_basic "Monitoring";
+       auth_basic_user_file /etc/nginx/.htpasswd;
+       proxy_pass http://localhost:3002/health;
+   }
+   ```
+
+### Sensitive Data Exposure
+
+The `/metrics` endpoint exposes:
+- Profit and loss information
+- Trading volumes and success rates
+- System performance data
+- Network latency information
+
+**Recommendations:**
+- Use VPN or private networks for monitoring access
+- Implement rate limiting for unauthenticated endpoints
+- Consider separate internal/external health endpoints
+- Audit access logs regularly
 
 ## Rate Limiting
 
-Currently, no rate limiting is enforced on health check endpoints. These are designed for frequent polling by monitoring systems and load balancers.
+Currently, no rate limiting is enforced on health check endpoints. For production:
+
+```yaml
+# Recommended rate limits
+rateLimit:
+  health: 60/minute    # Health checks
+  metrics: 10/minute   # Detailed metrics
+  status: 120/minute   # Simple status
+```
 
 ## Integration Examples
 

@@ -13,7 +13,32 @@ async function main() {
 
   // Get deployment configuration
   const deploymentConfig = contractManager.getDeploymentConfig();
-  const minProfit = parseEther(deploymentConfig.minProfitEth);
+
+  // Validate minProfitEth
+  if (!deploymentConfig.minProfitEth) {
+    throw new Error('minProfitEth is required in deployment configuration');
+  }
+
+  const minProfitEthStr = String(deploymentConfig.minProfitEth).trim();
+
+  // Validate format (decimal number)
+  if (!/^\d+(\.\d+)?$/.test(minProfitEthStr)) {
+    throw new Error(
+      `Invalid minProfitEth format: ${minProfitEthStr}. Must be a positive decimal number.`
+    );
+  }
+
+  const minProfitNum = parseFloat(minProfitEthStr);
+  if (minProfitNum <= 0) {
+    throw new Error(`minProfitEth must be positive, got: ${minProfitNum}`);
+  }
+
+  let minProfit: bigint;
+  try {
+    minProfit = parseEther(minProfitEthStr);
+  } catch (error) {
+    throw new Error(`Failed to parse minProfitEth "${minProfitEthStr}": ${error}`);
+  }
 
   console.log('Minimum profit set to:', minProfit.toString(), 'wei');
 
@@ -49,6 +74,8 @@ async function main() {
   const authorizedPools = contractManager.getAllAuthorizedPoolAddresses();
   console.log(`\nAdding ${authorizedPools.length} authorized pools...`);
 
+  const failedPools: string[] = [];
+
   for (const poolAddress of authorizedPools) {
     try {
       console.log(`Adding pool: ${poolAddress}`);
@@ -57,7 +84,15 @@ async function main() {
       console.log(`✓ Pool added: ${poolAddress}`);
     } catch (error) {
       console.error(`✗ Failed to add pool ${poolAddress}:`, error);
+      failedPools.push(poolAddress);
     }
+  }
+
+  // Check if any pools failed to register
+  if (failedPools.length > 0) {
+    const errorMsg = `Failed to register ${failedPools.length} pools: ${failedPools.join(', ')}`;
+    console.error(errorMsg);
+    throw new Error(errorMsg);
   }
 
   console.log('\n=== Deployment Summary ===');

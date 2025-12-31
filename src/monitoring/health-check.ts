@@ -161,10 +161,10 @@ export class HealthCheckSystem extends EventEmitter {
       uptime: (now - this.startTime) / 1000, // seconds
       version: process.env['npm_package_version'] || '1.0.0',
       checks: {
-        rpcConnection: this.componentHealth.get('rpcConnection')!,
-        circuitBreaker: this.componentHealth.get('circuitBreaker')!,
-        memoryUsage: this.componentHealth.get('memoryUsage')!,
-        opportunityDetection: this.componentHealth.get('opportunityDetection')!,
+        rpcConnection: this.getComponentHealthSafe('rpcConnection'),
+        circuitBreaker: this.getComponentHealthSafe('circuitBreaker'),
+        memoryUsage: this.getComponentHealthSafe('memoryUsage'),
+        opportunityDetection: this.getComponentHealthSafe('opportunityDetection'),
       },
       metrics: {
         totalOpportunities: metrics.totalOpportunities,
@@ -389,9 +389,9 @@ export class HealthCheckSystem extends EventEmitter {
    * Update active phases for metrics
    */
   updateActivePhases(phases: string[]): void {
-    if (this.lastHealthCheck) {
+    if (this.lastHealthCheck && this.lastHealthCheck.metrics) {
       this.lastHealthCheck.metrics = {
-        ...this.lastHealthCheck.metrics!,
+        ...this.lastHealthCheck.metrics,
         activePhases: phases,
       };
     }
@@ -421,5 +421,23 @@ export class HealthCheckSystem extends EventEmitter {
    */
   getAllComponentHealth(): Map<string, ComponentHealth> {
     return new Map(this.componentHealth);
+  }
+
+  /**
+   * Safely get component health with fallback
+   */
+  private getComponentHealthSafe(componentName: string): ComponentHealth {
+    const health = this.componentHealth.get(componentName);
+    if (health) {
+      return health;
+    }
+
+    // Return default unhealthy state if component not found
+    return {
+      status: HealthStatus.UNHEALTHY,
+      message: `Component ${componentName} not found`,
+      lastCheck: Date.now(),
+      details: { error: 'Component not initialized' },
+    };
   }
 }

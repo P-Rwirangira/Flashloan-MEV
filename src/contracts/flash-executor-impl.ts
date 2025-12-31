@@ -597,12 +597,14 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
 export class FlashExecutorFactory {
   private readonly provider: ethers.Provider;
   private readonly signer?: ethers.Signer;
+  private readonly bytecode?: string;
 
-  constructor(provider: ethers.Provider, signer?: ethers.Signer) {
+  constructor(provider: ethers.Provider, signer?: ethers.Signer, bytecode?: string) {
     this.provider = provider;
     if (signer) {
       this.signer = signer;
     }
+    this.bytecode = bytecode;
   }
 
   /**
@@ -673,12 +675,37 @@ export class FlashExecutorFactory {
    * Get contract bytecode (loaded from compiled artifacts)
    */
   getBytecode(): string {
+    // Use provided bytecode first
+    if (this.bytecode) {
+      return this.bytecode;
+    }
+
     try {
-      // Load bytecode from compiled artifacts
-      const FlashExecutorArtifact = require('../artifacts/contracts/FlashExecutor.sol/FlashExecutor.json');
-      return FlashExecutorArtifact.bytecode;
+      // Try environment variable path first
+      const artifactPath = process.env['FLASH_EXECUTOR_ARTIFACT_PATH'];
+      if (artifactPath) {
+        const fs = require('fs');
+        const path = require('path');
+        const fullPath = path.resolve(artifactPath);
+        const artifactContent = fs.readFileSync(fullPath, 'utf8');
+        const artifact = JSON.parse(artifactContent);
+        return artifact.bytecode;
+      }
+
+      // Fallback to default path
+      const path = require('path');
+      const fs = require('fs');
+      const defaultPath = path.join(
+        process.cwd(),
+        'artifacts/contracts/FlashExecutor.sol/FlashExecutor.json'
+      );
+      const artifactContent = fs.readFileSync(defaultPath, 'utf8');
+      const artifact = JSON.parse(artifactContent);
+      return artifact.bytecode;
     } catch (error) {
-      throw new Error('Contract bytecode not available - run "npm run build:contracts" first');
+      throw new Error(
+        'Contract bytecode not available - run "npm run build:contracts" first or provide bytecode via constructor'
+      );
     }
   }
 

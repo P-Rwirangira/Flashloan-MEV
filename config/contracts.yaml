@@ -14,18 +14,18 @@ contracts:
   authorizedPools:
     uniswapV3:
       # Base mainnet Uniswap V3 pools
-      - address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18" # WETH/USDC 0.05%
+      - address: "0x6c561b446416e1a00e8e93e221854d6ea4171372" # WETH/USDC 0.05%
         token0: "WETH"
         token1: "USDC"
         fee: 500
-      - address: "0xd0b53D9277642d899DF5C87A3966A349A798F224" # WETH/USDC 0.3%
+      - address: "0x6c561b446416e1a00e8e93e221854d6ea4171372" # WETH/USDC canonical pool
         token0: "WETH"
         token1: "USDC"
         fee: 3000
     
     aerodrome:
       # Base mainnet Aerodrome pools
-      - address: "0xcDAC0d6c6C59727a65F871236188350531885C43" # WETH/USDC volatile
+      - address: "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59" # WETH/USDC volatile
         token0: "WETH"
         token1: "USDC"
         stable: false

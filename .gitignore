@@ -139,6 +139,11 @@ logs/
 config/local.yaml
 config/production.yaml
 
+# Hardhat artifacts and cache (machine-specific, should be regenerated locally)
+artifacts/
+cache/
+*.dbg.json
+
 # IDE files
 .vscode/
 .idea/

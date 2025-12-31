@@ -538,14 +538,21 @@ export class RelayManager extends EventEmitter {
   private async submitToLocalNode(
     transaction: ethers.TransactionRequest,
     relay: RelayConfig,
-    _timeout: number
+    timeout: number
   ): Promise<RelaySubmissionResult> {
     const startTime = Date.now();
 
     try {
       // Submit directly to local node
       const tx = await this.wallet.sendTransaction(transaction);
-      const receipt = await tx.wait();
+
+      // Wait for transaction with timeout
+      const receipt = await Promise.race([
+        tx.wait(),
+        new Promise<null>((_, reject) =>
+          setTimeout(() => reject(new Error('Transaction wait timeout')), timeout)
+        ),
+      ]);
 
       return {
         success: true,
@@ -557,6 +564,9 @@ export class RelayManager extends EventEmitter {
         latency: Date.now() - startTime,
       };
     } catch (error) {
+      if ((error as Error).message.includes('timeout')) {
+        throw new Error(`Local node submission timed out after ${timeout}ms`);
+      }
       throw new Error(`Local node submission failed: ${(error as Error).message}`);
     }
   }
