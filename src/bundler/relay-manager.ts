@@ -8,72 +8,87 @@ import { EventEmitter } from 'events';
 import { ethers } from 'ethers';
 import { createComponentLogger } from '../utils/logger';
 import { RpcConnectionManager } from '../rpc/connection-manager';
+import { FlashbotsRelay } from './flashbots-relay';
+import { BloXrouteRelay } from './bloxroute-relay';
 
 export enum RelayProvider {
   FLASHBOTS_PROTECT = 'flashbots_protect',
   FLASHBOTS_AUCTION = 'flashbots_auction',
+  BLOXROUTE = 'bloxroute',
   EDEN_NETWORK = 'eden_network',
   MANIFOLD_FINANCE = 'manifold_finance',
   SECURERPC = 'securerpc',
+  LOCAL_NODE = 'local_node',
 }
 
 export interface RelayConfig {
   provider: RelayProvider;
   endpoint: string;
-  apiKey?: string;
+  apiKey?: string | undefined;
   enabled: boolean;
   priority: number; // 1 = highest priority
-  maxGasPrice?: bigint;
-  minProfit?: bigint;
+  maxGasPrice?: bigint | undefined;
+  minProfit?: bigint | undefined;
 }
 
 export interface RelaySubmissionResult {
   success: boolean;
   relayProvider: RelayProvider;
-  transactionHash?: string;
-  bundleHash?: string;
-  error?: string;
-  gasUsed?: bigint;
-  effectiveGasPrice?: bigint;
-  profit?: bigint;
+  transactionHash?: string | undefined;
+  bundleHash?: string | undefined;
+  error?: string | undefined;
+  gasUsed?: bigint | undefined;
+  effectiveGasPrice?: bigint | undefined;
+  profit?: bigint | undefined;
   latency: number;
-  blockNumber?: number;
+  blockNumber?: number | undefined;
 }
 
 export interface RelayManagerOptions {
   relays: RelayConfig[];
   connectionManager: RpcConnectionManager;
-  defaultTimeout?: number;
-  maxConcurrentSubmissions?: number;
-  enableFailover?: boolean;
-  retryAttempts?: number;
-  blockTimeMs?: number; // Chain-specific block time in milliseconds
+  wallet: ethers.Wallet;
+  defaultTimeout?: number | undefined;
+  maxConcurrentSubmissions?: number | undefined;
+  enableFailover?: boolean | undefined;
+  retryAttempts?: number | undefined;
+  blockTimeMs?: number | undefined; // Chain-specific block time in milliseconds
 }
 
 export class RelayManager extends EventEmitter {
   private readonly logger = createComponentLogger('relay-manager');
-  private readonly options: Required<
-    Omit<RelayManagerOptions, 'connectionManager' | 'blockTimeMs'>
-  > & { blockTimeMs: number };
+  private readonly options: {
+    defaultTimeout: number;
+    maxConcurrentSubmissions: number;
+    enableFailover: boolean;
+    retryAttempts: number;
+    blockTimeMs: number;
+    relays: RelayConfig[];
+  };
   private readonly connectionManager: RpcConnectionManager;
+  private readonly wallet: ethers.Wallet;
   private readonly blockTimeMs: number;
 
   private relayConfigs: Map<RelayProvider, RelayConfig> = new Map();
   private activeSubmissions = 0;
   private submissionQueue: Array<() => Promise<void>> = [];
 
+  // Relay implementations
+  private flashbotsRelay?: FlashbotsRelay | undefined;
+  private bloxrouteRelay?: BloXrouteRelay | undefined;
+
   constructor(options: RelayManagerOptions) {
     super();
     this.connectionManager = options.connectionManager;
+    this.wallet = options.wallet;
     this.blockTimeMs = options.blockTimeMs ?? 2000; // Default to Base L2's ~2s block time
     this.options = {
-      defaultTimeout: 30000, // 30 seconds
-      maxConcurrentSubmissions: 3,
-      enableFailover: true,
-      retryAttempts: 2,
+      defaultTimeout: options.defaultTimeout ?? 30000, // 30 seconds
+      maxConcurrentSubmissions: options.maxConcurrentSubmissions ?? 3,
+      enableFailover: options.enableFailover ?? true,
+      retryAttempts: options.retryAttempts ?? 2,
       blockTimeMs: this.blockTimeMs,
-      ...options,
-      relays: options.relays, // Ensure relays is not overwritten
+      relays: options.relays,
     };
 
     // Initialize relay configurations
@@ -89,15 +104,57 @@ export class RelayManager extends EventEmitter {
   }
 
   /**
+   * Initialize relay implementations
+   */
+  async initialize(): Promise<void> {
+    this.logger.info('Initializing relay implementations...');
+
+    // Initialize Flashbots relay if configured
+    const flashbotsConfig = Array.from(this.relayConfigs.values()).find(
+      c => c.provider === RelayProvider.FLASHBOTS_PROTECT && c.enabled
+    );
+
+    if (flashbotsConfig) {
+      this.flashbotsRelay = new FlashbotsRelay({
+        connectionManager: this.connectionManager,
+        wallet: this.wallet,
+        authSignerPrivateKey: process.env['FLASHBOTS_AUTH_KEY'],
+        network: 'base',
+      });
+
+      await this.flashbotsRelay.initialize();
+      this.logger.info('Flashbots relay initialized');
+    }
+
+    // Initialize bloXroute relay if configured
+    const bloxrouteConfig = Array.from(this.relayConfigs.values()).find(
+      c => c.provider === RelayProvider.BLOXROUTE && c.enabled
+    );
+
+    if (bloxrouteConfig && bloxrouteConfig.apiKey) {
+      this.bloxrouteRelay = new BloXrouteRelay({
+        wallet: this.wallet,
+        apiKey: bloxrouteConfig.apiKey,
+        network: 'base',
+      });
+
+      await this.bloxrouteRelay.initialize();
+      this.logger.info('bloXroute relay initialized');
+    }
+
+    this.logger.info('Relay implementations initialized successfully');
+  }
+
+  /**
    * Submit transaction to relays with failover strategy
    */
   async submitTransaction(
     transaction: ethers.TransactionRequest,
     options?: {
-      preferredRelay?: RelayProvider;
-      maxGasPrice?: bigint;
-      minProfit?: bigint;
-      timeout?: number;
+      preferredRelay?: RelayProvider | undefined;
+      maxGasPrice?: bigint | undefined;
+      minProfit?: bigint | undefined;
+      timeout?: number | undefined;
     }
   ): Promise<RelaySubmissionResult> {
     const operationId = `relay-submit-${Date.now()}`;
@@ -180,9 +237,9 @@ export class RelayManager extends EventEmitter {
     transactions: ethers.TransactionRequest[],
     targetBlock: number,
     options?: {
-      preferredRelay?: RelayProvider;
-      maxBribe?: bigint;
-      minProfit?: bigint;
+      preferredRelay?: RelayProvider | undefined;
+      maxBribe?: bigint | undefined;
+      minProfit?: bigint | undefined;
     }
   ): Promise<RelaySubmissionResult> {
     this.logger.info('Submitting bundle to relays', {
@@ -317,13 +374,13 @@ export class RelayManager extends EventEmitter {
     transaction: ethers.TransactionRequest,
     relay: RelayConfig,
     options?: {
-      maxGasPrice?: bigint;
-      minProfit?: bigint;
-      timeout?: number;
+      maxGasPrice?: bigint | undefined;
+      minProfit?: bigint | undefined;
+      timeout?: number | undefined;
     }
   ): Promise<RelaySubmissionResult> {
     const startTime = Date.now();
-    const timeout = options?.timeout || this.options.defaultTimeout;
+    const timeout: number = options?.timeout ?? this.options.defaultTimeout;
 
     // Validate transaction against relay constraints
     this.validateTransactionForRelay(transaction, relay, options);
@@ -337,6 +394,9 @@ export class RelayManager extends EventEmitter {
         case RelayProvider.FLASHBOTS_AUCTION:
           return await this.submitToFlashbotsAuction(transaction, relay, timeout);
 
+        case RelayProvider.BLOXROUTE:
+          return await this.submitToBloXroute(transaction, relay, timeout);
+
         case RelayProvider.EDEN_NETWORK:
           return await this.submitToEdenNetwork(transaction, relay, timeout);
 
@@ -345,6 +405,9 @@ export class RelayManager extends EventEmitter {
 
         case RelayProvider.SECURERPC:
           return await this.submitToSecureRpc(transaction, relay, timeout);
+
+        case RelayProvider.LOCAL_NODE:
+          return await this.submitToLocalNode(transaction, relay, timeout);
 
         default:
           throw new Error(`Unsupported relay provider: ${relay.provider}`);
@@ -362,22 +425,26 @@ export class RelayManager extends EventEmitter {
   private async submitToFlashbotsProtect(
     transaction: ethers.TransactionRequest,
     relay: RelayConfig,
-    timeout: number
+    _timeout: number
   ): Promise<RelaySubmissionResult> {
     const startTime = Date.now();
 
     try {
-      // Flashbots Protect uses standard eth_sendTransaction
-      const response = await this.makeRelayRequest(relay.endpoint, {
-        method: 'eth_sendTransaction',
-        params: [transaction],
-        timeout,
-      });
+      if (!this.flashbotsRelay || !this.flashbotsRelay.isInitialized()) {
+        throw new Error('Flashbots relay not initialized');
+      }
+
+      // Use our Flashbots relay implementation
+      const result = await this.flashbotsRelay.sendPrivateTransaction(transaction);
+
+      if (!result.success) {
+        throw new Error(result.error || 'Flashbots submission failed');
+      }
 
       return {
         success: true,
         relayProvider: relay.provider,
-        transactionHash: response.result,
+        transactionHash: result.transactionHash ?? undefined,
         latency: Date.now() - startTime,
       };
     } catch (error) {
@@ -435,6 +502,62 @@ export class RelayManager extends EventEmitter {
       };
     } catch (error) {
       throw new Error(`Flashbots Auction submission failed: ${(error as Error).message}`);
+    }
+  }
+
+  private async submitToBloXroute(
+    transaction: ethers.TransactionRequest,
+    relay: RelayConfig,
+    _timeout: number
+  ): Promise<RelaySubmissionResult> {
+    const startTime = Date.now();
+
+    try {
+      if (!this.bloxrouteRelay || !this.bloxrouteRelay.isInitialized()) {
+        throw new Error('bloXroute relay not initialized');
+      }
+
+      // Use our bloXroute relay implementation
+      const result = await this.bloxrouteRelay.sendPrivateTransaction(transaction);
+
+      if (!result.success) {
+        throw new Error(result.error || 'bloXroute submission failed');
+      }
+
+      return {
+        success: true,
+        relayProvider: relay.provider,
+        transactionHash: result.transactionHash ?? undefined,
+        latency: result.latency ?? Date.now() - startTime,
+      };
+    } catch (error) {
+      throw new Error(`bloXroute submission failed: ${(error as Error).message}`);
+    }
+  }
+
+  private async submitToLocalNode(
+    transaction: ethers.TransactionRequest,
+    relay: RelayConfig,
+    _timeout: number
+  ): Promise<RelaySubmissionResult> {
+    const startTime = Date.now();
+
+    try {
+      // Submit directly to local node
+      const tx = await this.wallet.sendTransaction(transaction);
+      const receipt = await tx.wait();
+
+      return {
+        success: true,
+        relayProvider: relay.provider,
+        transactionHash: tx.hash,
+        gasUsed: receipt?.gasUsed ?? undefined,
+        effectiveGasPrice: receipt?.gasPrice ?? undefined,
+        blockNumber: receipt?.blockNumber ?? undefined,
+        latency: Date.now() - startTime,
+      };
+    } catch (error) {
+      throw new Error(`Local node submission failed: ${(error as Error).message}`);
     }
   }
 
@@ -595,7 +718,7 @@ export class RelayManager extends EventEmitter {
   private validateTransactionForRelay(
     transaction: ethers.TransactionRequest,
     relay: RelayConfig,
-    options?: { maxGasPrice?: bigint; minProfit?: bigint }
+    options?: { maxGasPrice?: bigint | undefined; minProfit?: bigint | undefined }
   ): void {
     // Check gas price constraints
     if (relay.maxGasPrice && transaction.gasPrice) {
