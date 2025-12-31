@@ -178,6 +178,38 @@ class BaseMEVPlatform extends EventEmitter {
   private async initializePhaseComponents(): Promise<void> {
     if (!this.config) throw new Error('Configuration not loaded');
 
+    const rawConfig = await this.configLoader.load();
+
+    // Phase 1: Cross-DEX Arbitrage
+    if (this.config.phases.arbitrage.enabled) {
+      this.platformLogger.info('Initializing Phase 1: Cross-DEX arbitrage');
+
+      // Initialize pool manager
+      const { PoolManager } = await import('./scanner/pool-manager');
+      const poolManager = new PoolManager({
+        connectionManager: this.connectionManager,
+        allowedPools: rawConfig.allowedPools || { uniswapV3: [], aerodrome: [] },
+        updateIntervalMs: 5000,
+      });
+
+      await poolManager.initialize();
+
+      // Initialize arbitrage scanner
+      this.arbitrageScanner = new ArbitrageScanner({
+        poolManager,
+        connectionManager: this.connectionManager,
+        config: rawConfig.strategies.arbitrage,
+        scanIntervalMs: 1000,
+      });
+
+      // Set up event listener for arbitrage opportunities
+      this.arbitrageScanner.on('opportunityDetected', async (opportunity: any) => {
+        await this.handleArbitrageOpportunity(opportunity);
+      });
+
+      this.platformLogger.info('Phase 1 arbitrage scanner initialized successfully');
+    }
+
     // Phase 2: Liquidations
     if (
       this.config.phases.liquidations.enabled &&
@@ -300,6 +332,20 @@ class BaseMEVPlatform extends EventEmitter {
   private async startPhaseComponents(): Promise<void> {
     if (!this.config) return;
 
+    // Start Phase 1: Arbitrage scanning
+    if (this.config.phases.arbitrage.enabled && this.arbitrageScanner) {
+      this.platformLogger.info('Starting arbitrage scanning');
+      try {
+        await this.arbitrageScanner.startScanning();
+        this.platformLogger.info('Arbitrage scanner started successfully');
+      } catch (error) {
+        this.platformLogger.logError(error as Error, {
+          operation: 'arbitrage-scanner-startup',
+        });
+        throw error;
+      }
+    }
+
     // Start Phase 2: Liquidation monitoring
     if (this.config.phases.liquidations.enabled && this.lendingMonitor) {
       this.platformLogger.info('Starting liquidation monitoring');
@@ -313,6 +359,65 @@ class BaseMEVPlatform extends EventEmitter {
     }
 
     this.platformLogger.info('All enabled phase components started');
+  }
+
+  private async handleArbitrageOpportunity(opportunity: any): Promise<void> {
+    try {
+      const operationId = `arbitrage-${opportunity.id}`;
+      this.platformLogger.startPerformanceTracking(operationId);
+
+      // Check circuit breaker
+      const canExecute = await new Promise<boolean>(resolve => {
+        this.circuitBreaker
+          .execute(async () => {
+            resolve(true);
+            return true;
+          })
+          .catch(() => resolve(false));
+      });
+
+      if (!canExecute) {
+        this.platformLogger.warn('Circuit breaker open, skipping arbitrage opportunity', {
+          opportunityId: opportunity.id,
+        });
+        return;
+      }
+
+      // Validate profit threshold (placeholder for now - will be enhanced in later tasks)
+      const minProfitUSD = 15.0; // Updated threshold for Base L2
+      if (opportunity.expectedProfitUSD && opportunity.expectedProfitUSD < minProfitUSD) {
+        this.platformLogger.debug('Opportunity below profit threshold', {
+          opportunityId: opportunity.id,
+          expectedProfit: opportunity.expectedProfitUSD,
+          minProfit: minProfitUSD,
+        });
+        return;
+      }
+
+      this.platformLogger.info('Profitable arbitrage opportunity found', {
+        opportunityId: opportunity.id,
+        route: opportunity.route,
+        expectedProfit: opportunity.expectedProfitUSD,
+        spread: opportunity.spread,
+      });
+
+      // Record successful opportunity detection
+      this.metricsCollector.recordOpportunitySuccess(
+        RelayProvider.FLASHBOTS_PROTECT,
+        BigInt(Math.floor((opportunity.expectedProfitUSD || 0) * 1e18)),
+        BigInt(Math.floor((opportunity.estimatedGasCost || 0) * 1e18)),
+        0n, // bribe
+        Date.now(),
+        2000 // latency
+      );
+
+      this.platformLogger.endPerformanceTracking(operationId);
+    } catch (error) {
+      this.platformLogger.logError(error as Error, {
+        opportunityId: opportunity.id,
+        operation: 'arbitrage-processing',
+      });
+    }
   }
 
   private async handleLiquidationOpportunity(opportunity: any): Promise<void> {
@@ -521,10 +626,18 @@ class BaseMEVPlatform extends EventEmitter {
     return globalPerformanceTracker.trackOperation('platform-shutdown', async () => {
       this.platformLogger.info('Stopping Base MEV Platform...');
 
-      // Stop all phase components
+      // Stop Phase 1: Arbitrage scanner
+      if (this.arbitrageScanner) {
+        this.platformLogger.info('Stopping arbitrage scanner');
+        await this.arbitrageScanner.stopScanning();
+      }
+
+      // Stop Phase 2: Liquidation monitoring
       if (this.lendingMonitor) {
         this.lendingMonitor.stopScanning();
       }
+
+      // Stop Phase 3: Stable pool monitoring
       if (this.stablePoolMonitor) {
         this.stablePoolMonitor.stopScanning();
       }
