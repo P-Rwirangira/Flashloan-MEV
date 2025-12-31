@@ -637,9 +637,63 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
    */
   private async getCurrentHealthFactor(protocol: string, borrower: Address): Promise<number> {
     try {
-      // This would integrate with actual protocol contracts
-      // For now, return a simulated health factor
-      return 0.95; // Below liquidation threshold
+      // Get provider for contract calls
+      const provider = this.transactionManager.getProvider();
+
+      // Protocol-specific health factor calculation
+      switch (protocol.toLowerCase()) {
+        case 'moonwell': {
+          // Moonwell comptroller interface
+          const comptrollerAbi = [
+            'function getAccountLiquidity(address account) external view returns (uint256, uint256, uint256)',
+          ];
+          const comptrollerAddress = '0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180'; // Moonwell comptroller on Base
+          const comptroller = new ethers.Contract(comptrollerAddress, comptrollerAbi, provider);
+
+          const getAccountLiquidity = comptroller['getAccountLiquidity'];
+          if (!getAccountLiquidity) {
+            throw new Error('getAccountLiquidity method not found');
+          }
+
+          const [error, liquidity, shortfall] = await getAccountLiquidity(borrower);
+
+          if (error !== 0n) {
+            throw new Error(`Comptroller error: ${error}`);
+          }
+
+          // Health factor = liquidity / (liquidity + shortfall)
+          // If shortfall > 0, position is liquidatable
+          if (shortfall > 0n) {
+            return Number(liquidity) / Number(liquidity + shortfall);
+          }
+
+          return 2.0; // Healthy position
+        }
+
+        case 'aave-v3': {
+          // Aave V3 pool interface
+          const poolAbi = [
+            'function getUserAccountData(address user) external view returns (uint256, uint256, uint256, uint256, uint256, uint256)',
+          ];
+          const poolAddress = '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5'; // Aave V3 pool on Base
+          const pool = new ethers.Contract(poolAddress, poolAbi, provider);
+
+          const getUserAccountData = pool['getUserAccountData'];
+          if (!getUserAccountData) {
+            throw new Error('getUserAccountData method not found');
+          }
+
+          const userData = await getUserAccountData(borrower);
+          const healthFactor = userData[5]; // Health factor is the 6th element
+
+          // Aave returns health factor scaled by 1e18
+          return Number(healthFactor) / 1e18;
+        }
+
+        default:
+          this.logger.warn('Unknown protocol for health factor calculation', { protocol });
+          return 1.5; // Safe default
+      }
     } catch (error) {
       this.logger.error('Failed to get current health factor', {
         protocol,

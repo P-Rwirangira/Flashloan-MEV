@@ -231,30 +231,50 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
    */
   private async detectMEVProtection(targetTxHash: string): Promise<MEVProtectionSignal> {
     try {
-      // This would integrate with actual MEV protection services
-      // For now, return a simulated detection result
+      // Get provider for transaction analysis
+      const provider = this.transactionManager.getProvider();
 
-      // Check transaction data for protection patterns
-      const hasFlashbotsProtect =
-        this.mevProtectionPatterns.get('flashbots')?.test(targetTxHash) || false;
-      const hasCowSwapProtection =
-        this.mevProtectionPatterns.get('cowswap')?.test(targetTxHash) || false;
-      const hasOpenMEVProtection =
-        this.mevProtectionPatterns.get('openmev')?.test(targetTxHash) || false;
+      // Get transaction details
+      const tx = await provider.getTransaction(targetTxHash);
+      if (!tx) {
+        throw new Error('Transaction not found');
+      }
 
-      const hasProtection = hasFlashbotsProtect || hasCowSwapProtection || hasOpenMEVProtection;
+      // Analyze transaction for MEV protection patterns
+      let hasProtection = false;
+      let protectionService: string | null = null;
+      let protectionLevel: 'none' | 'basic' | 'advanced' = 'none';
 
-      let protectionService = null;
-      if (hasFlashbotsProtect) protectionService = 'Flashbots Protect';
-      else if (hasCowSwapProtection) protectionService = 'CoW Swap';
-      else if (hasOpenMEVProtection) protectionService = 'OpenMEV';
+      // Check for Flashbots Protect patterns
+      if (tx.to && this.isFlashbotsProtectAddress(tx.to)) {
+        hasProtection = true;
+        protectionService = 'Flashbots Protect';
+        protectionLevel = 'advanced';
+      }
+
+      // Check for CoW Swap patterns
+      if (tx.data && this.isCowSwapTransaction(tx.data)) {
+        hasProtection = true;
+        protectionService = 'CoW Swap';
+        protectionLevel = 'advanced';
+      }
+
+      // Check for private mempool submission patterns
+      if (tx.maxPriorityFeePerGas && tx.maxPriorityFeePerGas === 0n) {
+        hasProtection = true;
+        protectionService = protectionService || 'Private Mempool';
+        protectionLevel = 'basic';
+      }
+
+      // Analyze transaction data for protection hints
+      const hasProtectionHints = this.analyzeTransactionForProtectionHints(tx.data || '0x');
 
       return {
-        hasProtection,
+        hasProtection: hasProtection || hasProtectionHints,
         protectionService,
         userConsent: false, // Default to no consent for safety
-        slippageTolerance: 0.005, // 0.5% default
-        protectionLevel: hasProtection ? 'advanced' : 'none',
+        slippageTolerance: this.estimateSlippageTolerance(tx),
+        protectionLevel: hasProtectionHints && !hasProtection ? 'basic' : protectionLevel,
       };
     } catch (error) {
       this.logger.error('Failed to detect MEV protection', {
@@ -864,6 +884,65 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
       });
       throw error;
     }
+  }
+
+  /**
+   * Check if address is a known Flashbots Protect address
+   */
+  private isFlashbotsProtectAddress(address: string): boolean {
+    const flashbotsAddresses = [
+      '0x0000000000000000000000000000000000000000', // Placeholder - would have real addresses
+    ];
+    return flashbotsAddresses.includes(address.toLowerCase());
+  }
+
+  /**
+   * Check if transaction data indicates CoW Swap
+   */
+  private isCowSwapTransaction(data: string): boolean {
+    // CoW Swap function selectors
+    const cowSwapSelectors = [
+      '0x13d79a0b', // settle function
+      '0x2e1a7d4d', // withdraw function
+    ];
+
+    const selector = data.slice(0, 10);
+    return cowSwapSelectors.includes(selector);
+  }
+
+  /**
+   * Analyze transaction data for protection hints
+   */
+  private analyzeTransactionForProtectionHints(data: string): boolean {
+    // Look for patterns that suggest MEV protection
+    // High slippage tolerance, unusual routing, etc.
+
+    if (data.length < 10) return false;
+
+    // Check for unusual function selectors that might indicate protection
+    const selector = data.slice(0, 10);
+    const protectionSelectors = [
+      '0x7ff36ab5', // swapExactETHForTokensSupportingFeeOnTransferTokens
+      '0x38ed1739', // swapExactTokensForTokens with high slippage
+    ];
+
+    return protectionSelectors.includes(selector);
+  }
+
+  /**
+   * Estimate slippage tolerance from transaction
+   */
+  private estimateSlippageTolerance(tx: any): number {
+    // Analyze transaction parameters to estimate slippage tolerance
+    // This is a simplified implementation
+
+    if (tx.gasPrice && tx.maxFeePerGas) {
+      const gasPremium = Number(tx.maxFeePerGas - tx.gasPrice) / Number(tx.gasPrice);
+      // Higher gas premium might indicate higher slippage tolerance
+      return Math.min(0.05, Math.max(0.001, gasPremium * 0.1)); // 0.1% to 5%
+    }
+
+    return 0.005; // 0.5% default
   }
 
   /**

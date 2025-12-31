@@ -296,17 +296,64 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
    */
   private async getStablePoolState(poolAddress: Address): Promise<StablePoolState> {
     try {
-      // This would integrate with actual Aerodrome contracts
-      // For now, return simulated pool state
+      // Get provider for contract calls
+      const provider = this.transactionManager.getProvider();
+
+      // Aerodrome stable pool interface
+      const poolAbi = [
+        'function getReserves() external view returns (uint256, uint256, uint256)',
+        'function token0() external view returns (address)',
+        'function token1() external view returns (address)',
+        'function fee() external view returns (uint256)',
+        'function stable() external view returns (bool)',
+        'function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256)',
+      ];
+
+      const pool = new ethers.Contract(poolAddress, poolAbi, provider);
+
+      // Get basic pool data with null checks
+      const getReserves = pool['getReserves'];
+      const getToken0 = pool['token0'];
+      const getToken1 = pool['token1'];
+      const getFee = pool['fee'];
+      const getStable = pool['stable'];
+
+      if (!getReserves || !getToken0 || !getToken1 || !getFee || !getStable) {
+        throw new Error('Required pool methods not found');
+      }
+
+      const reserves = await getReserves();
+      const reserve0 = reserves[0];
+      const reserve1 = reserves[1];
+      const token0 = await getToken0();
+      const token1 = await getToken1();
+      const fee = await getFee();
+      const isStable = await getStable();
+
+      if (!isStable) {
+        throw new Error('Pool is not a stable pool');
+      }
+
+      // Calculate imbalance
+      const totalReserves = reserve0 + reserve1;
+      const expectedBalance = totalReserves / 2n;
+      const imbalance0 =
+        Number(
+          reserve0 > expectedBalance ? reserve0 - expectedBalance : expectedBalance - reserve0
+        ) / Number(totalReserves);
+
+      // Calculate virtual price (simplified)
+      const virtualPrice = ethers.parseEther('1.0'); // Would calculate based on pool invariant
+
       return {
-        reserve0: ethers.parseEther('1000000'), // 1M tokens
-        reserve1: ethers.parseEther('950000'), // 950K tokens (5% imbalance)
-        token0: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC
-        token1: '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', // DAI
-        fee: 200, // 0.02%
-        imbalance: 0.05, // 5% imbalance
-        virtualPrice: ethers.parseEther('1.001'), // Slightly above 1.0
-        amplificationParameter: 100n,
+        reserve0,
+        reserve1,
+        token0,
+        token1,
+        fee: Number(fee),
+        imbalance: imbalance0,
+        virtualPrice,
+        amplificationParameter: 100n, // Would get from pool contract
       };
     } catch (error) {
       this.logger.error('Failed to get stable pool state', {

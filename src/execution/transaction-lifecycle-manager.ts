@@ -75,6 +75,13 @@ export class TransactionLifecycleManager
   }
 
   /**
+   * Get the provider instance
+   */
+  getProvider(): ethers.Provider {
+    return this.provider;
+  }
+
+  /**
    * Get next available nonce for address
    */
   async getNextNonce(address: Address): Promise<number> {
