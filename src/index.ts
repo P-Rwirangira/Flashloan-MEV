@@ -28,6 +28,7 @@ import { OpportunityStateMachine } from './execution/opportunity-state-machine';
 import { FlashLoanManager } from './execution/flash-loan-manager';
 import { TransactionLifecycleManager } from './execution/transaction-lifecycle-manager';
 import { PrivateRelayManager } from './execution/private-relay-manager';
+import { RiskExecutionController } from './execution/risk-execution-controller';
 import { OpportunityType } from './types/execution';
 import { RelayProvider as PrivateRelayProvider } from './types/private-relay';
 import { EventEmitter } from 'events';
@@ -85,6 +86,7 @@ class BaseMEVPlatform extends EventEmitter {
   private flashLoanManager?: FlashLoanManager;
   private transactionLifecycleManager?: TransactionLifecycleManager;
   private privateRelayManager?: PrivateRelayManager;
+  private riskController?: RiskExecutionController;
 
   // Phase-specific components
   private arbitrageScanner?: ArbitrageScanner;
@@ -441,6 +443,32 @@ class BaseMEVPlatform extends EventEmitter {
         // Initialize core execution components
         this.opportunityStateMachine = new OpportunityStateMachine();
 
+        // Initialize risk controller
+        this.riskController = new RiskExecutionController(provider, {
+          minProfitUsd: this.config.execution.profitThresholds.arbitrage,
+          minProfitMarginBps: 50, // 0.5%
+          maxSlippageBps: Math.floor(this.config.execution.riskLimits.maxSlippage * 10000), // Convert to basis points
+          slippageBufferBps: 50, // 0.5% buffer
+          maxGasPriceGwei: Number(this.config.execution.riskLimits.maxGasPrice) / 1e9, // Convert to gwei
+          gasEstimationBuffer: 20, // 20%
+          maxDailyLossUsd: Number(this.config.execution.riskLimits.dailyLossLimit) / 1e18, // Convert to USD
+          maxConsecutiveLosses: 5,
+          maxLossPerExecutionUsd: 100,
+          maxPoolReserveChangeBps: 500, // 5%
+          minPoolLiquidityUsd: 10000,
+          maxPriceImpactBps: 100, // 1%
+          enableCircuitBreaker: true,
+          circuitBreakerThreshold: 70, // 70/100 risk score
+          circuitBreakerRecoveryTimeMs: 300000, // 5 minutes
+          riskScoreThreshold: 80,
+          enableRiskScoring: true,
+          maxExecutionTimeMs: 60000,
+          cooldownPeriodMs: 5000,
+          enablePositionSizing: false,
+          maxPositionSizeUsd: 50000,
+          positionSizeMultiplier: 1.0,
+        });
+
         // Initialize private relay manager
         this.privateRelayManager = new PrivateRelayManager(provider, signer, {
           defaultRelay: PrivateRelayProvider.FLASHBOTS_PROTECT,
@@ -627,6 +655,11 @@ class BaseMEVPlatform extends EventEmitter {
             executionTime: result.executionTime,
           });
 
+          // Record execution success in risk controller
+          if (this.riskController && result.profit && result.gasUsed) {
+            this.riskController.recordExecutionResult(true, result.profit, result.gasUsed);
+          }
+
           // Update metrics
           if (result.profit && result.gasUsed) {
             this.metricsCollector.recordOpportunitySuccess(
@@ -646,6 +679,15 @@ class BaseMEVPlatform extends EventEmitter {
             reason: result.failureReason,
             gasUsed: result.gasUsed?.toString(),
           });
+
+          // Record execution failure in risk controller
+          if (this.riskController) {
+            this.riskController.recordExecutionResult(
+              false,
+              0n,
+              result.gasUsed || BigInt(Math.floor(0.01 * 1e18))
+            );
+          }
 
           // Update metrics
           this.metricsCollector.recordOpportunityFailure(
@@ -676,7 +718,58 @@ class BaseMEVPlatform extends EventEmitter {
           enabledRelays: this.privateRelayManager
             ? Object.keys(this.privateRelayManager.getRelayMetrics())
             : [],
+          riskControllerEnabled: !!this.riskController,
         });
+
+        // Set up risk controller event handlers
+        if (this.riskController) {
+          this.riskController.on(
+            'riskCheckFailed',
+            ({ opportunityId, checkName, severity, reason }) => {
+              this.platformLogger.warn('Risk check failed', {
+                opportunityId,
+                checkName,
+                severity,
+                reason,
+              });
+            }
+          );
+
+          this.riskController.on('circuitBreakerActivated', ({ reason, riskScore }) => {
+            this.platformLogger.error('Risk circuit breaker activated', {
+              reason,
+              riskScore,
+            });
+          });
+
+          this.riskController.on('circuitBreakerDeactivated', ({ reason }) => {
+            this.platformLogger.info('Risk circuit breaker deactivated', {
+              reason,
+            });
+          });
+
+          this.riskController.on('riskLevelChanged', ({ previousLevel, newLevel, riskScore }) => {
+            this.platformLogger.warn('Risk level changed', {
+              previousLevel,
+              newLevel,
+              riskScore,
+            });
+          });
+
+          this.riskController.on('dailyLossLimitReached', ({ currentLoss, limit }) => {
+            this.platformLogger.error('Daily loss limit reached', {
+              currentLoss: currentLoss.toString(),
+              limit: limit.toString(),
+            });
+          });
+
+          this.riskController.on('consecutiveLossLimitReached', ({ consecutiveLosses, limit }) => {
+            this.platformLogger.error('Consecutive loss limit reached', {
+              consecutiveLosses,
+              limit,
+            });
+          });
+        }
 
         // Set up private relay manager event handlers
         if (this.privateRelayManager) {
@@ -897,6 +990,41 @@ class BaseMEVPlatform extends EventEmitter {
       // Execute opportunity using execution engine
       if (this.executionOrchestrator && this.config?.execution?.enabled) {
         try {
+          // Validate opportunity against risk controls first
+          if (this.riskController) {
+            const executionContext = {
+              gasPrice: BigInt(Math.floor(20e9)), // 20 gwei default
+              gasLimit: BigInt(300000), // Default gas limit
+              blockNumber: await this.connectionManager.getProvider().getBlockNumber(),
+              timestamp: Date.now(),
+              nonce: 0, // Will be set by transaction manager
+              maxFeePerGas: BigInt(Math.floor(50e9)), // 50 gwei max
+              maxPriorityFeePerGas: BigInt(Math.floor(2e9)), // 2 gwei priority
+            };
+
+            const riskValidation = await this.riskController.validateExecution(
+              opportunity,
+              executionContext
+            );
+
+            if (!riskValidation.canExecute) {
+              this.platformLogger.warn('Opportunity rejected by risk controller', {
+                opportunityId: opportunity.id,
+                reason: riskValidation.reason,
+                riskScore: riskValidation.riskScore,
+                overallRisk: riskValidation.overallRisk,
+                suggestedActions: riskValidation.suggestedActions,
+              });
+              return;
+            }
+
+            this.platformLogger.info('Opportunity passed risk validation', {
+              opportunityId: opportunity.id,
+              riskScore: riskValidation.riskScore,
+              overallRisk: riskValidation.overallRisk,
+            });
+          }
+
           await this.executionOrchestrator.processOpportunity(opportunity);
           this.platformLogger.info('Arbitrage opportunity submitted for execution', {
             opportunityId: opportunity.id,
@@ -906,6 +1034,11 @@ class BaseMEVPlatform extends EventEmitter {
             opportunityId: opportunity.id,
             error: error instanceof Error ? error.message : String(error),
           });
+
+          // Record execution failure in risk controller
+          if (this.riskController) {
+            this.riskController.recordExecutionResult(false, 0n, BigInt(Math.floor(0.01 * 1e18))); // Assume 0.01 ETH gas cost
+          }
         }
       } else {
         // Fallback: Record successful opportunity detection for metrics
