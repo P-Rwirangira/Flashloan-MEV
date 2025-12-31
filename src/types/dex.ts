@@ -92,6 +92,31 @@ export interface LiquidityInfo {
   readonly utilization: number;
 }
 
+// Pool information for route optimization
+export interface PoolInfo {
+  readonly address: Address;
+  readonly dex: string;
+  readonly token0: Address;
+  readonly token1: Address;
+  readonly fee?: number;
+  readonly liquidity?: bigint;
+  readonly reserve0?: bigint;
+  readonly reserve1?: bigint;
+  readonly active: boolean;
+}
+
+// DEX information for route optimization
+export interface DEXInfo {
+  readonly name: string;
+  readonly protocol: string;
+  readonly version: string;
+  readonly factory: Address;
+  readonly router?: Address;
+  readonly fee: number;
+  readonly gasEstimate: bigint;
+  readonly enabled: boolean;
+}
+
 // DEX pool discovery result
 export interface PoolDiscovery {
   readonly token0: Address;
