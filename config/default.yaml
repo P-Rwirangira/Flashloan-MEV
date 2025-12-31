@@ -49,22 +49,22 @@ performance:
 strategies:
   arbitrage:
     enabled: true
-    minProfitUSD: 5.0
-    maxSlippageBps: 50  # 0.5%
+    minProfitUSD: 15.0
+    maxSlippageBps: 100  # 1%
     maxGasPriceGwei: 50
-    maxPositionSize: 10000  # USD
-    cooldownMs: 1000
+    maxPositionSize: 50000  # USD
+    cooldownMs: 2000
     pairs:
       - "WETH/USDC"
       - "wstETH/ETH"
     maxRoutes: 3
     fallbackRoutes: 2
-    minSpreadBps: 10  # 0.1%
-    maxPriceImpactBps: 100  # 1%
+    minSpreadBps: 25  # 0.25%
+    maxPriceImpactBps: 50  # 0.5%
     dexPriority:
       - "uniswap-v3"
       - "aerodrome"
-    competitionThreshold: 2
+    competitionThreshold: 3
 
   liquidation:
     enabled: false  # Phase 2

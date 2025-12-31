@@ -264,7 +264,7 @@ export class ProfitCalculator extends EventEmitter {
     this.priceOracle = options.priceOracle || new EnhancedPriceOracle(options.connectionManager);
     this.gasOptimizer = options.gasOptimizer;
     this.flashLoanFeeBps = options.flashLoanFeeBps || 5; // 0.05% default
-    this.minProfitMarginPercent = options.minProfitMarginPercent || 0.5; // Reduced to 0.5% for more opportunities
+    this.minProfitMarginPercent = options.minProfitMarginPercent || 1.0; // 1.0% for Base L2
   }
 
   /**
