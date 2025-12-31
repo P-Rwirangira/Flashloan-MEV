@@ -43,8 +43,8 @@ export class MempoolMonitor extends EventEmitter {
 
   private isMonitoring = false;
   private pendingTxs: Map<string, PendingTxOpportunity> = new Map();
-  private cleanupInterval?: NodeJS.Timeout;
-  private statsInterval?: NodeJS.Timeout;
+  private cleanupInterval?: NodeJS.Timeout | undefined;
+  private statsInterval?: NodeJS.Timeout | undefined;
   private stats: MempoolStats = {
     totalPendingTxs: 0,
     dexSwapTxs: 0,

@@ -180,8 +180,8 @@ class BaseMEVPlatform extends EventEmitter {
 
       this.platformLogger.info('Configuration loaded successfully', {
         enabledPhases: Object.entries(this.config.phases)
-          .filter(([_, phase]) => phase.enabled)
-          .map(([name, _]) => name),
+          .filter(([, phase]) => phase.enabled)
+          .map(([name]) => name),
         featureFlags: this.config.featureFlags,
       });
 

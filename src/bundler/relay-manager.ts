@@ -425,7 +425,7 @@ export class RelayManager extends EventEmitter {
   private async submitToFlashbotsProtect(
     transaction: ethers.TransactionRequest,
     relay: RelayConfig,
-    _timeout: number
+    timeoutMs: number
   ): Promise<RelaySubmissionResult> {
     const startTime = Date.now();
 
@@ -434,8 +434,19 @@ export class RelayManager extends EventEmitter {
         throw new Error('Flashbots relay not initialized');
       }
 
-      // Use our Flashbots relay implementation
-      const result = await this.flashbotsRelay.sendPrivateTransaction(transaction);
+      // Use timeout for the submission
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Flashbots submission timeout after ${timeoutMs}ms`)),
+          timeoutMs
+        )
+      );
+
+      // Use our Flashbots relay implementation with timeout
+      const result = await Promise.race([
+        this.flashbotsRelay.sendPrivateTransaction(transaction),
+        timeoutPromise,
+      ]);
 
       if (!result.success) {
         throw new Error(result.error || 'Flashbots submission failed');
@@ -508,7 +519,7 @@ export class RelayManager extends EventEmitter {
   private async submitToBloXroute(
     transaction: ethers.TransactionRequest,
     relay: RelayConfig,
-    _timeout: number
+    timeoutMs: number
   ): Promise<RelaySubmissionResult> {
     const startTime = Date.now();
 
@@ -517,8 +528,19 @@ export class RelayManager extends EventEmitter {
         throw new Error('bloXroute relay not initialized');
       }
 
-      // Use our bloXroute relay implementation
-      const result = await this.bloxrouteRelay.sendPrivateTransaction(transaction);
+      // Use timeout for the submission
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`bloXroute submission timeout after ${timeoutMs}ms`)),
+          timeoutMs
+        )
+      );
+
+      // Use our bloXroute relay implementation with timeout
+      const result = await Promise.race([
+        this.bloxrouteRelay.sendPrivateTransaction(transaction),
+        timeoutPromise,
+      ]);
 
       if (!result.success) {
         throw new Error(result.error || 'bloXroute submission failed');

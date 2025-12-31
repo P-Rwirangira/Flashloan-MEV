@@ -16,6 +16,7 @@ import {
   ArbitrageParams,
 } from './flash-executor';
 import { Address, AsyncResult } from '../types/common';
+import { createComponentLogger } from '../utils/logger';
 
 /**
  * Flash Executor contract ABI - matches the deployed Solidity contract
@@ -57,6 +58,7 @@ const FLASH_EXECUTOR_ABI = [
  * Provides TypeScript interface for interacting with deployed Flash Executor contract
  */
 export class FlashExecutorContract extends EventEmitter implements IFlashExecutor {
+  private readonly logger = createComponentLogger('flash-executor-contract');
   private contract: Contract;
   private readonly signer?: ethers.Signer;
   private readonly config: FlashExecutorConfig;
@@ -199,7 +201,7 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     // This method should only be called by the contract itself during flash loan execution
     // It's included here for interface compliance but should not be called directly
     // Log the parameters for debugging purposes
-    console.warn('uniswapV3FlashCallback called directly with:', { fee0, fee1, data });
+    this.logger.warn('uniswapV3FlashCallback called directly with:', { fee0, fee1, data });
     throw new Error('uniswapV3FlashCallback should not be called directly');
   }
 
@@ -437,14 +439,17 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
       const configMinProfit = BigInt(this.config.minProfitWei.toString());
 
       if (BigInt(contractMinProfit.toString()) !== configMinProfit) {
-        console.warn('Configuration minimum profit does not match contract state');
+        this.logger.warn('Configuration minimum profit does not match contract state', {
+          contractMinProfit: contractMinProfit.toString(),
+          configMinProfit: configMinProfit.toString(),
+        });
       }
 
       // Validate authorized pools
       for (const pool of this.config.authorizedPools) {
         const isAuthorized = await this.isAuthorizedPool(pool);
         if (!isAuthorized) {
-          console.warn(`Pool ${pool} is not authorized in contract`);
+          this.logger.warn('Pool not authorized in contract', { pool });
         }
       }
     } catch (error) {
@@ -597,9 +602,9 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
 export class FlashExecutorFactory {
   private readonly provider: ethers.Provider;
   private readonly signer?: ethers.Signer;
-  private readonly bytecode?: string;
+  private readonly bytecode?: string | undefined;
 
-  constructor(provider: ethers.Provider, signer?: ethers.Signer, bytecode?: string) {
+  constructor(provider: ethers.Provider, signer?: ethers.Signer, bytecode?: string | undefined) {
     this.provider = provider;
     if (signer) {
       this.signer = signer;
