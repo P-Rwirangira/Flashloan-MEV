@@ -119,7 +119,7 @@ export interface TimeSeriesData {
  * Metrics Collector class
  */
 export class MetricsCollector extends EventEmitter {
-  private readonly dataPoints: MetricDataPoint[];
+  private dataPoints: MetricDataPoint[];
   private readonly startTime: number;
 
   // Opportunity tracking
@@ -541,6 +541,59 @@ export class MetricsCollector extends EventEmitter {
     });
 
     return { timestamps, values };
+  }
+
+  /**
+   * Update system health metrics
+   */
+  updateSystemHealth(healthData: Partial<SystemHealthMetrics>): void {
+    this.systemHealth = {
+      ...this.systemHealth,
+      ...healthData,
+    };
+
+    this.addDataPoint({
+      timestamp: Date.now(),
+      type: 'system',
+      data: { event: 'health_update', ...healthData },
+    });
+
+    this.emit('systemHealthUpdated', this.systemHealth);
+  }
+
+  /**
+   * Clean up old data to free memory
+   */
+  cleanupOldData(): void {
+    const cutoff = Date.now() - 3600000; // Keep last hour
+    this.dataPoints = this.dataPoints.filter(point => point.timestamp >= cutoff);
+
+    // Clean up latency arrays
+    const maxLatencyPoints = 1000;
+    Object.keys(this.latencyData).forEach(key => {
+      const latencyArray = this.latencyData[key as keyof typeof this.latencyData];
+      if (latencyArray.length > maxLatencyPoints) {
+        latencyArray.splice(0, latencyArray.length - maxLatencyPoints);
+      }
+    });
+
+    // Clean up relay data
+    this.relayData.forEach(relayStats => {
+      if (relayStats.latencies.length > maxLatencyPoints) {
+        relayStats.latencies.splice(0, relayStats.latencies.length - maxLatencyPoints);
+      }
+      if (relayStats.inclusionTimes.length > maxLatencyPoints) {
+        relayStats.inclusionTimes.splice(0, relayStats.inclusionTimes.length - maxLatencyPoints);
+      }
+      if (relayStats.bribes.length > maxLatencyPoints) {
+        relayStats.bribes.splice(0, relayStats.bribes.length - maxLatencyPoints);
+      }
+    });
+
+    this.emit('dataCleanupCompleted', {
+      dataPointsRemaining: this.dataPoints.length,
+      timestamp: Date.now(),
+    });
   }
 
   /**

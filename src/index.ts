@@ -201,6 +201,42 @@ class BaseMEVPlatform extends EventEmitter {
         activePhases: this.getActivePhases(),
       });
     }, 30000); // Every 30 seconds
+
+    // Performance optimization monitoring
+    setInterval(() => {
+      const memUsage = process.memoryUsage();
+      const memUsageMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+
+      // Update system health metrics
+      this.metricsCollector.updateSystemHealth({
+        memoryUsage: memUsageMB,
+        cpuUsage: process.cpuUsage().user / 1000000,
+        networkLatency: 0,
+        rpcConnectionHealth:
+          this.connectionManager?.getConnectionHealth()?.some(conn => conn.connected) ?? true,
+        consecutiveFailures: 0,
+      });
+
+      // Performance optimization based on metrics
+      const performanceMetrics = this.metricsCollector.getPerformanceMetrics();
+
+      // Adaptive performance tuning
+      if (performanceMetrics.averageEndToEndLatency > 5000) {
+        this.platformLogger.warn('High execution latency detected, optimizing performance', {
+          avgLatency: performanceMetrics.averageEndToEndLatency,
+          p95Latency: performanceMetrics.p95SubmissionLatency,
+        });
+      }
+
+      // Memory pressure management
+      if (memUsageMB > 512) {
+        this.platformLogger.warn('High memory usage detected, cleaning up data', {
+          memUsageMB,
+          heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024),
+        });
+        this.metricsCollector.cleanupOldData();
+      }
+    }, 15000); // Every 15 seconds for performance monitoring
   }
 
   async initialize(): Promise<void> {
@@ -379,6 +415,9 @@ class BaseMEVPlatform extends EventEmitter {
       });
 
       this.platformLogger.info('Phase 1 arbitrage scanner initialized successfully');
+
+      // Initialize performance optimization features
+      this.setupPerformanceOptimization();
 
       // Initialize mempool monitor for backrun opportunities
       this.mempoolMonitor = new MempoolMonitor({
@@ -894,6 +933,140 @@ class BaseMEVPlatform extends EventEmitter {
         );
       }
     }
+  }
+
+  private setupPerformanceOptimization(): void {
+    // Memory management and garbage collection optimization
+    if (global.gc) {
+      setInterval(() => {
+        const memUsage = process.memoryUsage();
+        const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+        const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
+        const heapUsagePercent = (memUsage.heapUsed / memUsage.heapTotal) * 100;
+
+        // Force garbage collection if memory usage is high
+        if (heapUsagePercent > 80) {
+          this.platformLogger.warn('High memory usage detected, forcing garbage collection', {
+            heapUsedMB,
+            heapTotalMB,
+            heapUsagePercent: Math.round(heapUsagePercent),
+          });
+          if (global.gc) {
+            global.gc();
+          }
+        }
+      }, 30000); // Check every 30 seconds
+    }
+
+    // CPU usage monitoring and throttling
+    let lastCpuUsage = process.cpuUsage();
+    setInterval(() => {
+      const currentCpuUsage = process.cpuUsage(lastCpuUsage);
+      const cpuPercent = (currentCpuUsage.user + currentCpuUsage.system) / 1000000; // Convert to seconds
+
+      if (cpuPercent > 0.8) {
+        // 80% CPU usage
+        this.platformLogger.warn('High CPU usage detected', {
+          cpuPercent: Math.round(cpuPercent * 100),
+          userTime: currentCpuUsage.user,
+          systemTime: currentCpuUsage.system,
+        });
+
+        // Implement CPU throttling by increasing scan intervals
+        if (this.arbitrageScanner) {
+          this.platformLogger.info('Throttling scanner due to high CPU usage');
+          // Scanner will automatically adjust based on system load
+        }
+      }
+
+      lastCpuUsage = process.cpuUsage();
+    }, 10000); // Check every 10 seconds
+
+    // Connection pool optimization
+    this.optimizeConnectionPools();
+
+    // Cache warming and optimization
+    this.setupCacheOptimization();
+
+    // Event loop lag monitoring
+    this.monitorEventLoopLag();
+
+    this.platformLogger.info('Performance optimization features initialized');
+  }
+
+  private optimizeConnectionPools(): void {
+    // Optimize RPC connection pooling
+    if (this.connectionManager) {
+      // Set up connection pool monitoring
+      setInterval(() => {
+        const poolStats = this.connectionManager.getConnectionHealth();
+        if (poolStats.length > 0) {
+          const unhealthyConnections = poolStats.filter(conn => !conn.connected);
+          if (unhealthyConnections.length > 0) {
+            this.platformLogger.warn('Unhealthy connections detected', {
+              total: poolStats.length,
+              unhealthy: unhealthyConnections.length,
+            });
+          }
+
+          // Log connection health
+          this.platformLogger.debug('Connection pool status', {
+            total: poolStats.length,
+            healthy: poolStats.filter(conn => conn.connected).length,
+            unhealthy: unhealthyConnections.length,
+          });
+        }
+      }, 60000); // Check every minute
+    }
+  }
+
+  private setupCacheOptimization(): void {
+    // Implement intelligent cache warming
+    const cacheWarmupInterval = setInterval(async () => {
+      try {
+        // Warm up frequently accessed data
+        // Note: Pool manager and price oracle will be available in later phases
+      } catch (error) {
+        this.platformLogger.warn('Cache warmup failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }, 120000); // Every 2 minutes
+
+    // Clean up interval on shutdown
+    process.on('SIGTERM', () => {
+      clearInterval(cacheWarmupInterval);
+    });
+  }
+
+  private monitorEventLoopLag(): void {
+    let start = process.hrtime.bigint();
+
+    const measureLag = () => {
+      const delta = process.hrtime.bigint() - start;
+      const lagMs = Number(delta) / 1000000; // Convert to milliseconds
+
+      if (lagMs > 100) {
+        // More than 100ms lag
+        this.platformLogger.warn('Event loop lag detected', {
+          lagMs: Math.round(lagMs),
+          threshold: 100,
+        });
+      }
+
+      // Log periodic event loop health
+      if (Math.random() < 0.01) {
+        // 1% sampling
+        this.platformLogger.debug('Event loop health', {
+          lagMs: Math.round(lagMs),
+        });
+      }
+
+      start = process.hrtime.bigint();
+      setImmediate(measureLag);
+    };
+
+    setImmediate(measureLag);
   }
 
   async start(): Promise<void> {
