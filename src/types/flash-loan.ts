@@ -193,7 +193,7 @@ export interface FlashLoanEvents {
     amount: bigint;
     fee: bigint;
     success: boolean;
-    transactionHash?: string;
+    transactionHash?: string | undefined;
   };
 
   flashLoanFailed: {
@@ -218,14 +218,42 @@ export interface FlashLoanEvents {
 }
 
 /**
- * Common flash loan tokens on Base
+ * Flash loan token configuration
  */
-export const FLASH_LOAN_TOKENS = {
+export interface FlashLoanTokenConfig {
+  WETH: Address;
+  USDC: Address;
+  DAI: Address;
+  USDT: Address;
+}
+
+/**
+ * Default flash loan tokens for Base mainnet
+ */
+export const DEFAULT_FLASH_LOAN_TOKENS: FlashLoanTokenConfig = {
   WETH: '0x4200000000000000000000000000000000000006' as Address,
   USDC: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as Address,
   DAI: '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb' as Address,
-  USDT: '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2' as Address,
+  USDT: '0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2' as Address, // Verified Base mainnet USDT
 } as const;
+
+/**
+ * Get flash loan tokens for current environment
+ */
+export function getFlashLoanTokens(): FlashLoanTokenConfig {
+  // Check for environment overrides
+  const envTokens: Partial<FlashLoanTokenConfig> = {};
+
+  if (process.env['FLASH_LOAN_WETH']) envTokens.WETH = process.env['FLASH_LOAN_WETH'] as Address;
+  if (process.env['FLASH_LOAN_USDC']) envTokens.USDC = process.env['FLASH_LOAN_USDC'] as Address;
+  if (process.env['FLASH_LOAN_DAI']) envTokens.DAI = process.env['FLASH_LOAN_DAI'] as Address;
+  if (process.env['FLASH_LOAN_USDT']) envTokens.USDT = process.env['FLASH_LOAN_USDT'] as Address;
+
+  return {
+    ...DEFAULT_FLASH_LOAN_TOKENS,
+    ...envTokens,
+  };
+}
 
 /**
  * Flash loan error types

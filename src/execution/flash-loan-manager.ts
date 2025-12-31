@@ -21,7 +21,7 @@ import {
   IFlashLoanManager,
   IFlashLoanProvider,
   FlashLoanEvents,
-  FLASH_LOAN_TOKENS,
+  getFlashLoanTokens,
   FlashLoanError,
   InsufficientCapacityError,
   ProviderUnavailableError,
@@ -43,7 +43,7 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
     { sources: FlashLoanSource[]; timestamp: number }
   >();
 
-  private capacityRefreshInterval?: NodeJS.Timeout;
+  private capacityRefreshInterval?: NodeJS.Timeout | undefined;
   private isRunning = false;
 
   constructor(config: Partial<FlashLoanManagerConfig> = {}) {
@@ -58,6 +58,7 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
       capacityRefreshIntervalMs: config.capacityRefreshIntervalMs ?? 30000, // 30 seconds
       enableFallback: config.enableFallback ?? true,
       providers: {
+        ...config.providers,
         [FlashLoanProvider.UNISWAP_V3]: {
           enabled: config.providers?.[FlashLoanProvider.UNISWAP_V3]?.enabled ?? true,
           feeRate: config.providers?.[FlashLoanProvider.UNISWAP_V3]?.feeRate ?? 0.0005, // 0.05%
@@ -82,7 +83,6 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
             config.providers?.[FlashLoanProvider.AAVE]?.poolAddress ??
             ('0x0000000000000000000000000000000000000000' as Address), // Not available on Base yet
         },
-        ...config.providers,
       },
     };
 
@@ -151,6 +151,16 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
    * Get optimal flash loan source
    */
   async getOptimalSource(token: Address, amount: bigint): Promise<FlashLoanSource> {
+    // Validate amount first
+    if (!this.validateAmount(amount)) {
+      throw new FlashLoanError(
+        'Invalid flash loan amount',
+        FlashLoanProvider.UNISWAP_V3,
+        token,
+        amount
+      );
+    }
+
     const estimates = await this.getCostEstimates(token, amount);
 
     if (estimates.length === 0) {
@@ -170,6 +180,15 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
     });
 
     const optimal = estimates[0];
+
+    if (!optimal) {
+      throw new FlashLoanError(
+        'No flash loan sources available',
+        FlashLoanProvider.UNISWAP_V3,
+        token,
+        amount
+      );
+    }
 
     // Get the actual source from the provider
     const provider = this.providers.get(optimal.provider);
@@ -192,9 +211,9 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
     this.logger.debug('Optimal flash loan source selected', {
       provider: optimal.provider,
       token,
-      amount: amount.toString(),
-      fee: optimal.fee.toString(),
-      totalCost: optimal.totalCost.toString(),
+      amount: this.formatAmount(amount),
+      fee: this.formatAmount(optimal.fee),
+      totalCost: this.formatAmount(optimal.totalCost),
     });
 
     return source;
@@ -280,9 +299,9 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
 
     this.logger.debug('Flash loan split calculated', {
       token,
-      totalAmount: amount.toString(),
+      totalAmount: this.formatAmount(amount),
       splits: splits.length,
-      totalFee: splits.reduce((sum, split) => sum + split.fee, 0n).toString(),
+      totalFee: this.formatAmount(splits.reduce((sum, split) => sum + split.fee, 0n)),
     });
 
     return splits;
@@ -364,6 +383,14 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
             'Attempting flash loan splitting due to insufficient single source capacity'
           );
           splits = await this.getSplitSources(request.token, request.amount);
+          if (!splits || splits.length === 0 || !splits[0]) {
+            throw new FlashLoanError(
+              'No split sources available',
+              FlashLoanProvider.UNISWAP_V3,
+              request.token,
+              request.amount
+            );
+          }
           source = splits[0].source; // Use first split as primary source
         } else {
           throw error;
@@ -401,9 +428,9 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
       this.logger.info('Flash loan executed', {
         provider: source.provider,
         token: request.token,
-        amount: request.amount.toString(),
+        amount: this.formatAmount(request.amount),
         success: result.success,
-        fee: result.feesPaid.toString(),
+        fee: this.formatAmount(result.feesPaid),
         executionTime: result.executionTime,
       });
 
@@ -422,7 +449,7 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
 
       this.logger.error('Flash loan execution failed', {
         token: request.token,
-        amount: request.amount.toString(),
+        amount: this.formatAmount(request.amount),
         error: failureReason,
         executionTime,
       });
@@ -454,7 +481,7 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
           const fee = await provider.calculateFee(token, amount);
           const gasOverhead = await provider.estimateGasOverhead(token, amount);
           const totalCost = fee + gasOverhead;
-          const costPercentage = Number(totalCost) / Number(amount);
+          const costRatio = Number(totalCost) / Number(amount);
 
           estimates.push({
             provider: providerType,
@@ -464,7 +491,7 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
             fee,
             gasOverhead,
             totalCost,
-            costPercentage,
+            costPercentage: costRatio,
           });
         }
       } catch (error) {
@@ -517,7 +544,7 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
    * Refresh capacity cache for all tokens
    */
   private async refreshCapacityCache(): Promise<void> {
-    const tokens = Object.values(FLASH_LOAN_TOKENS);
+    const tokens = Object.values(getFlashLoanTokens());
 
     for (const token of tokens) {
       try {
@@ -567,5 +594,21 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
     this.capacityCache.clear();
     this.sourceCache.clear();
     this.logger.debug('Flash loan manager caches cleared');
+  }
+
+  /**
+   * Format flash loan amount for logging and display
+   */
+  private formatAmount(amount: bigint, decimals: number = 18): string {
+    return ethers.formatUnits(amount, decimals);
+  }
+
+  /**
+   * Validate flash loan amount is within reasonable bounds
+   */
+  private validateAmount(amount: bigint): boolean {
+    // Check if amount is positive and not unreasonably large
+    const maxAmount = ethers.parseUnits('1000000', 18); // 1M tokens max
+    return amount > 0n && amount <= maxAmount;
   }
 }

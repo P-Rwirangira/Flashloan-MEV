@@ -31,12 +31,11 @@ export enum TransactionStage {
 export interface TransactionRequest {
   to: Address;
   data: string;
-  value?: bigint;
+  value?: bigint | null;
   gasLimit: bigint;
   maxFeePerGas: bigint;
   maxPriorityFeePerGas: bigint;
-  nonce?: number;
-  type?: number; // EIP-1559 type 2
+  type?: number | null; // EIP-1559 type 2
 }
 
 /**
@@ -97,8 +96,8 @@ export interface TransactionStageTransition {
   from: TransactionStage;
   to: TransactionStage;
   timestamp: number;
-  reason?: string;
-  metadata?: Record<string, any>;
+  reason?: string | undefined;
+  metadata?: Record<string, any> | undefined;
 }
 
 /**
@@ -106,10 +105,10 @@ export interface TransactionStageTransition {
  */
 export interface TransactionSubmissionResult {
   success: boolean;
-  transactionHash?: string;
-  nonce?: number;
-  gasPrice?: bigint;
-  failureReason?: string;
+  transactionHash?: string | undefined;
+  nonce?: number | undefined;
+  gasPrice?: bigint | undefined;
+  failureReason?: string | undefined;
   submissionTime: number;
 }
 
@@ -142,10 +141,10 @@ export interface TransactionReplacementOptions {
  */
 export interface TransactionSimulationResult {
   success: boolean;
-  gasUsed?: bigint;
-  returnData?: string;
-  revertReason?: string;
-  stateChanges?: StateChange[];
+  gasUsed?: bigint | undefined;
+  returnData?: string | undefined;
+  revertReason?: string | undefined;
+  stateChanges?: StateChange[] | undefined;
   simulationTime: number;
 }
 

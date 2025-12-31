@@ -108,7 +108,7 @@ export class TransactionBuilder {
         encodedRouteData,
       ]);
 
-      // Get current nonce
+      // Get current nonce for validation
       const nonce = await this.getNonce(walletAddress);
 
       // Calculate gas limit
@@ -136,16 +136,15 @@ export class TransactionBuilder {
         data: txData,
         value: 0n, // No ETH value needed for flash loan arbitrage
         gasLimit,
-        nonce,
-        maxFeePerGas: options?.maxGasPrice,
-        maxPriorityFeePerGas,
+        maxFeePerGas: options?.maxGasPrice || 25000000000n,
+        maxPriorityFeePerGas: maxPriorityFeePerGas || 2000000000n,
       };
 
       this.logger.debug('Arbitrage transaction built', {
         to: tx.to,
         dataLength: tx.data.length,
         gasLimit: tx.gasLimit?.toString(),
-        nonce: tx.nonce,
+        nonce: nonce, // Use nonce in logging
         flashPool: flashLoanParams.flashPool,
         amount0: flashLoanParams.amount0.toString(),
         amount1: flashLoanParams.amount1.toString(),

@@ -15,6 +15,8 @@ import {
   ArbitrageRoute,
   ExecutionOptions,
   ExecutionMetrics,
+  OpportunityType,
+  OpportunityPhase,
 } from '../types/execution';
 
 export interface TransactionExecutorOptions {
@@ -42,8 +44,21 @@ export class TransactionExecutor {
     totalProfit: 0n,
     totalProfitUSD: 0,
     totalGasCost: 0n,
+    avgExecutionTime: 0,
     averageExecutionTimeMs: 0,
     successRate: 0,
+    profitPerExecution: 0n,
+    executionsByType: {
+      [OpportunityType.ARBITRAGE]: 0,
+      [OpportunityType.LIQUIDATION]: 0,
+      [OpportunityType.STABLE_POOL_REBALANCING]: 0,
+      [OpportunityType.MEMPOOL_BACKRUN]: 0,
+    },
+    executionsByPhase: {
+      [OpportunityPhase.CROSS_DEX]: 0,
+      [OpportunityPhase.LIQUIDATIONS]: 0,
+      [OpportunityPhase.STABLE_POOLS]: 0,
+    },
   };
 
   constructor(options: TransactionExecutorOptions) {
@@ -104,7 +119,9 @@ export class TransactionExecutor {
         });
 
         const result: ExecutionResult = {
+          opportunityId: 'dry-run',
           success: true,
+          executionTime: Date.now() - startTime,
           executionTimeMs: Date.now() - startTime,
           profit: route.expectedProfit,
           profitUSD: route.expectedProfitUSD,
@@ -138,9 +155,6 @@ export class TransactionExecutor {
       }
       if (maxPriorityFeePerGas !== undefined && maxPriorityFeePerGas !== null) {
         txRequest.maxPriorityFeePerGas = maxPriorityFeePerGas;
-      }
-      if (tx.nonce !== undefined) {
-        txRequest.nonce = tx.nonce;
       }
 
       // Execute transaction
@@ -188,9 +202,10 @@ export class TransactionExecutor {
       // Actual profit = expected profit - gas cost
       const actualProfit = route.expectedProfit - gasCost;
       const gasCostETH = Number(ethers.formatEther(gasCost));
-      const actualProfitUSD = route.expectedProfitUSD - gasCostETH * this.ethPriceUSD;
+      const actualProfitUSD = (route.expectedProfitUSD || 0) - gasCostETH * this.ethPriceUSD;
 
       const result: ExecutionResult = {
+        opportunityId: 'arbitrage-execution',
         success: receipt.status === 1,
         transactionHash: receipt.hash,
         blockNumber: receipt.blockNumber,
@@ -198,6 +213,7 @@ export class TransactionExecutor {
         effectiveGasPrice,
         profit: actualProfit,
         profitUSD: actualProfitUSD,
+        executionTime: Date.now() - startTime,
         executionTimeMs: Date.now() - startTime,
       };
 
@@ -228,7 +244,9 @@ export class TransactionExecutor {
       });
 
       const result: ExecutionResult = {
+        opportunityId: 'arbitrage-execution-failed',
         success: false,
+        executionTime: executionTimeMs,
         executionTimeMs,
         error: (error as Error).message,
         revertReason: this.extractRevertReason(error),
@@ -273,7 +291,7 @@ export class TransactionExecutor {
       if (result.profit) {
         this.metrics.totalProfit += result.profit;
       }
-      if (result.profitUSD) {
+      if (result.profitUSD && this.metrics.totalProfitUSD !== undefined) {
         this.metrics.totalProfitUSD += result.profitUSD;
       }
     } else {
@@ -285,10 +303,13 @@ export class TransactionExecutor {
     }
 
     // Update average execution time
-    const totalTime =
-      this.metrics.averageExecutionTimeMs * (this.metrics.totalExecutions - 1) +
-      result.executionTimeMs;
-    this.metrics.averageExecutionTimeMs = totalTime / this.metrics.totalExecutions;
+    const executionTime = result.executionTimeMs || result.executionTime;
+    if (this.metrics.averageExecutionTimeMs !== undefined) {
+      const totalTime =
+        this.metrics.averageExecutionTimeMs * (this.metrics.totalExecutions - 1) + executionTime;
+      this.metrics.averageExecutionTimeMs = totalTime / this.metrics.totalExecutions;
+      this.metrics.avgExecutionTime = this.metrics.averageExecutionTimeMs;
+    }
 
     // Update success rate
     this.metrics.successRate = this.metrics.successfulExecutions / this.metrics.totalExecutions;
@@ -297,7 +318,7 @@ export class TransactionExecutor {
       totalExecutions: this.metrics.totalExecutions,
       successRate: `${(this.metrics.successRate * 100).toFixed(2)}%`,
       totalProfit: ethers.formatEther(this.metrics.totalProfit),
-      totalProfitUSD: this.metrics.totalProfitUSD.toFixed(2),
+      totalProfitUSD: (this.metrics.totalProfitUSD || 0).toFixed(2),
     });
   }
 
@@ -319,8 +340,21 @@ export class TransactionExecutor {
       totalProfit: 0n,
       totalProfitUSD: 0,
       totalGasCost: 0n,
+      avgExecutionTime: 0,
       averageExecutionTimeMs: 0,
       successRate: 0,
+      profitPerExecution: 0n,
+      executionsByType: {
+        [OpportunityType.ARBITRAGE]: 0,
+        [OpportunityType.LIQUIDATION]: 0,
+        [OpportunityType.STABLE_POOL_REBALANCING]: 0,
+        [OpportunityType.MEMPOOL_BACKRUN]: 0,
+      },
+      executionsByPhase: {
+        [OpportunityPhase.CROSS_DEX]: 0,
+        [OpportunityPhase.LIQUIDATIONS]: 0,
+        [OpportunityPhase.STABLE_POOLS]: 0,
+      },
     };
 
     this.logger.info('Metrics reset');

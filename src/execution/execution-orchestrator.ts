@@ -36,7 +36,8 @@ class PriorityQueue<T> {
     let added = false;
 
     for (let i = 0; i < this.items.length; i++) {
-      if (queueItem.priority > this.items[i].priority) {
+      const currentItem = this.items[i];
+      if (currentItem && queueItem.priority > currentItem.priority) {
         this.items.splice(i, 0, queueItem);
         added = true;
         break;
@@ -85,7 +86,7 @@ export class ExecutionOrchestrator extends EventEmitter {
   private isRunning = false;
   private isPaused = false;
   private circuitBreakerActive = false;
-  private circuitBreakerReason?: string;
+  private circuitBreakerReason?: string | undefined;
   private consecutiveFailures = 0;
   private lastExecutionAt?: number;
 
@@ -104,7 +105,8 @@ export class ExecutionOrchestrator extends EventEmitter {
   };
 
   private executionTimes: number[] = [];
-  private processingInterval?: NodeJS.Timeout;
+  private processingInterval?: NodeJS.Timeout | undefined;
+  private circuitBreakerRecoveryTimer?: NodeJS.Timeout | undefined;
 
   constructor(
     config: Partial<ExecutionOrchestratorConfig> = {},
@@ -164,7 +166,9 @@ export class ExecutionOrchestrator extends EventEmitter {
         opportunity.id,
         OpportunityState.DETECTED,
         opportunity.expiresAt,
-        { type: opportunity.type, phase: opportunity.phase }
+        { type: opportunity.type, phase: opportunity.phase },
+        undefined, // executorAddress - will use default from config
+        (opportunity as any).poolAddress || (opportunity as any).originAddress // originAddress from opportunity data
       );
 
       // Check if orchestrator is running and not paused
@@ -331,6 +335,12 @@ export class ExecutionOrchestrator extends EventEmitter {
     // Clear queue
     this.executionQueue.clear();
 
+    // Clear circuit breaker recovery timer
+    if (this.circuitBreakerRecoveryTimer) {
+      clearTimeout(this.circuitBreakerRecoveryTimer);
+      this.circuitBreakerRecoveryTimer = undefined;
+    }
+
     // Shutdown state machine
     this.stateMachine.shutdown();
 
@@ -439,19 +449,30 @@ export class ExecutionOrchestrator extends EventEmitter {
 
     // Return a promise that resolves when the opportunity is executed
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      let timeoutHandle: NodeJS.Timeout | undefined;
+
+      const handleExecuted = (result: ExecutionResult) => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        this.removeListener(`failed:${opportunity.id}`, handleFailed);
+        resolve(result);
+      };
+
+      const handleFailed = (result: ExecutionResult) => {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        this.removeListener(`executed:${opportunity.id}`, handleExecuted);
+        resolve(result);
+      };
+
+      const handleTimeout = () => {
+        this.removeListener(`executed:${opportunity.id}`, handleExecuted);
+        this.removeListener(`failed:${opportunity.id}`, handleFailed);
         reject(new Error('Execution timeout while queued'));
-      }, this.config.executionTimeoutMs);
+      };
 
-      this.once(`executed:${opportunity.id}`, (result: ExecutionResult) => {
-        clearTimeout(timeout);
-        resolve(result);
-      });
+      timeoutHandle = setTimeout(handleTimeout, this.config.executionTimeoutMs);
 
-      this.once(`failed:${opportunity.id}`, (result: ExecutionResult) => {
-        clearTimeout(timeout);
-        resolve(result);
-      });
+      this.once(`executed:${opportunity.id}`, handleExecuted);
+      this.once(`failed:${opportunity.id}`, handleFailed);
     });
   }
 
@@ -659,12 +680,13 @@ export class ExecutionOrchestrator extends EventEmitter {
     this.emit('circuitBreakerActivated', { reason, timestamp: Date.now() });
 
     // Schedule recovery attempt
-    setTimeout(() => {
+    this.circuitBreakerRecoveryTimer = setTimeout(() => {
       if (this.circuitBreakerActive) {
         this.logger.info('Attempting circuit breaker recovery');
         this.circuitBreakerActive = false;
         this.circuitBreakerReason = undefined;
         this.consecutiveFailures = 0;
+        this.circuitBreakerRecoveryTimer = undefined;
         this.emit('circuitBreakerRecovered', { timestamp: Date.now() });
       }
     }, this.config.circuitBreakerRecoveryTimeMs);

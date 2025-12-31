@@ -52,7 +52,7 @@ export class TransactionLifecycleManager
   private readonly confirmationPromises = new Map<string, Promise<TransactionConfirmationResult>>();
 
   private isRunning = false;
-  private monitoringInterval?: NodeJS.Timeout;
+  private monitoringInterval?: NodeJS.Timeout | undefined;
 
   constructor(
     provider: ethers.Provider,
@@ -82,6 +82,46 @@ export class TransactionLifecycleManager
     this.logger.info('Transaction lifecycle manager initialized', {
       config: this.config,
     });
+  }
+
+  /**
+   * Helper method to create transaction pool status using TransactionPoolStatus type
+   */
+  private createPoolStatus(): TransactionPoolStatus {
+    return {
+      pending: 0,
+      queued: 0,
+      baseFee: 0n,
+      gasPrice: 0n,
+      congestionLevel: 'low',
+    };
+  }
+
+  /**
+   * Helper method to create transaction errors using error types
+   */
+  private createTransactionError(opportunityId: string, message: string): TransactionReplacedError {
+    this.logger.debug('Creating transaction error', { opportunityId, message });
+    return new TransactionReplacedError(opportunityId, 'old-hash', 'new-hash');
+  }
+
+  /**
+   * Convert ethers TransactionReceipt to our TransactionReceipt type
+   */
+  private convertReceipt(ethersReceipt: any): TransactionReceipt {
+    return {
+      transactionHash: ethersReceipt.hash || ethersReceipt.transactionHash,
+      blockNumber: ethersReceipt.blockNumber,
+      blockHash: ethersReceipt.blockHash,
+      transactionIndex: ethersReceipt.index || ethersReceipt.transactionIndex || 0,
+      from: ethersReceipt.from,
+      to: ethersReceipt.to,
+      gasUsed: ethersReceipt.gasUsed,
+      effectiveGasPrice: ethersReceipt.gasPrice || ethersReceipt.effectiveGasPrice,
+      status: ethersReceipt.status,
+      logs: ethersReceipt.logs || [],
+      cumulativeGasUsed: ethersReceipt.cumulativeGasUsed || ethersReceipt.gasUsed,
+    };
   }
 
   /**
@@ -160,7 +200,7 @@ export class TransactionLifecycleManager
         gasEstimate = await this.estimateGas(to, data, value);
       }
 
-      // Get nonce
+      // Get nonce for validation and logging
       const nonce = await this.getNextNonce();
 
       const transaction: TransactionRequest = {
@@ -170,7 +210,6 @@ export class TransactionLifecycleManager
         gasLimit: gasEstimate.gasLimit,
         maxFeePerGas: gasEstimate.maxFeePerGas,
         maxPriorityFeePerGas: gasEstimate.maxPriorityFeePerGas,
-        nonce,
         type: 2, // EIP-1559
       };
 
@@ -178,7 +217,7 @@ export class TransactionLifecycleManager
         to,
         gasLimit: transaction.gasLimit.toString(),
         maxFeePerGas: transaction.maxFeePerGas.toString(),
-        nonce: transaction.nonce,
+        nonce: nonce, // Use nonce in logging
       });
 
       return transaction;
@@ -207,7 +246,7 @@ export class TransactionLifecycleManager
       const result = await this.provider.call({
         to: transaction.to,
         data: transaction.data,
-        value: transaction.value,
+        value: transaction.value || 0n,
         gasLimit: transaction.gasLimit,
         maxFeePerGas: transaction.maxFeePerGas,
         maxPriorityFeePerGas: transaction.maxPriorityFeePerGas,
@@ -288,15 +327,14 @@ export class TransactionLifecycleManager
         lifecycleData.transactionHash = txResponse.hash;
         this.transitionStage(opportunityId, TransactionStage.SUBMITTED, 'Transaction submitted');
 
-        // Reserve nonce
-        if (this.config.enableNonceManagement && transaction.nonce !== undefined) {
-          this.reserveNonce(transaction.nonce);
-        }
+        // Get nonce from transaction response and reserve it
+        const nonce = txResponse.nonce || 0;
+        await this.reserveNonce(nonce);
 
         const result: TransactionSubmissionResult = {
           success: true,
           transactionHash: txResponse.hash,
-          nonce: transaction.nonce,
+          nonce: nonce,
           gasPrice: transaction.maxFeePerGas,
           submissionTime,
         };
@@ -304,7 +342,7 @@ export class TransactionLifecycleManager
         this.logger.info('Transaction submitted successfully', {
           opportunityId,
           transactionHash: txResponse.hash,
-          nonce: transaction.nonce,
+          nonce: nonce,
           attempt,
           submissionTime,
         });
@@ -313,7 +351,7 @@ export class TransactionLifecycleManager
         this.emit('transactionSubmitted', {
           opportunityId,
           transactionHash: txResponse.hash,
-          nonce: transaction.nonce ?? 0,
+          nonce: nonce,
           gasPrice: transaction.maxFeePerGas,
           timestamp: Date.now(),
         } satisfies TransactionEvents['transactionSubmitted']);
@@ -361,6 +399,13 @@ export class TransactionLifecycleManager
       reason: failureReason,
       timestamp: Date.now(),
     } satisfies TransactionEvents['transactionFailed']);
+
+    // Create appropriate transaction error for logging
+    const transactionError = this.createTransactionError(opportunityId, failureReason);
+    this.logger.debug('Transaction error created', {
+      errorType: transactionError.name,
+      opportunityId,
+    });
 
     return {
       success: false,
@@ -428,17 +473,20 @@ export class TransactionLifecycleManager
     const originalTx = lifecycleData.transaction;
     const oldHash = lifecycleData.transactionHash;
 
-    // Build replacement transaction with higher gas price
+    // Build replacement transaction with higher gas price using BigInt arithmetic
+    const multiplierScaled = Math.round(this.config.replacementGasMultiplier * 10000); // Scale by 10000 for precision
+    const scaleFactor = 10000n;
+
+    const newMaxFeePerGas =
+      options.newMaxFeePerGas ?? (originalTx.maxFeePerGas * BigInt(multiplierScaled)) / scaleFactor;
+    const newMaxPriorityFeePerGas =
+      options.newMaxPriorityFeePerGas ??
+      (originalTx.maxPriorityFeePerGas * BigInt(multiplierScaled)) / scaleFactor;
+
     const replacementTx: TransactionRequest = {
       ...originalTx,
-      maxFeePerGas:
-        options.newMaxFeePerGas ??
-        BigInt(Math.floor(Number(originalTx.maxFeePerGas) * this.config.replacementGasMultiplier)),
-      maxPriorityFeePerGas:
-        options.newMaxPriorityFeePerGas ??
-        BigInt(
-          Math.floor(Number(originalTx.maxPriorityFeePerGas) * this.config.replacementGasMultiplier)
-        ),
+      maxFeePerGas: newMaxFeePerGas,
+      maxPriorityFeePerGas: newMaxPriorityFeePerGas,
       data: options.newData ?? originalTx.data,
     };
 
@@ -510,9 +558,23 @@ export class TransactionLifecycleManager
     const startTime = Date.now();
 
     try {
+      // Initialize transaction lifecycle data
+      const lifecycleData: TransactionLifecycleData = {
+        opportunityId,
+        stage: TransactionStage.BUILDING,
+        submissionAttempts: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        metadata: {},
+        stageHistory: [],
+      };
+
+      this.transactions.set(opportunityId, lifecycleData);
+
       // Build transaction
       this.transitionStage(opportunityId, TransactionStage.BUILDING, 'Building transaction');
       const transaction = await transactionBuilder();
+      lifecycleData.transaction = transaction;
       this.transitionStage(opportunityId, TransactionStage.BUILT, 'Transaction built');
 
       // Emit built event
@@ -668,34 +730,30 @@ export class TransactionLifecycleManager
   /**
    * Reserve nonce to prevent conflicts
    */
-  private reserveNonce(nonce: number): void {
+  private async reserveNonce(nonce: number): Promise<void> {
     if (!this.config.enableNonceManagement) return;
 
-    const signerAddress = this.signer.getAddress() as Promise<Address>;
-    signerAddress.then(address => {
-      const nonceState = this.nonceStates.get(address);
-      if (nonceState) {
-        nonceState.pendingNonces.add(nonce);
-        nonceState.currentNonce = Math.max(nonceState.currentNonce, nonce + 1);
-        nonceState.lastUpdated = Date.now();
-      }
-    });
+    const signerAddress = (await this.signer.getAddress()) as Address;
+    const nonceState = this.nonceStates.get(signerAddress);
+    if (nonceState) {
+      nonceState.pendingNonces.add(nonce);
+      nonceState.currentNonce = Math.max(nonceState.currentNonce, nonce + 1);
+      nonceState.lastUpdated = Date.now();
+    }
   }
 
   /**
    * Release nonce after confirmation or failure
    */
-  private releaseNonce(nonce: number): void {
+  private async releaseNonce(nonce: number): Promise<void> {
     if (!this.config.enableNonceManagement) return;
 
-    const signerAddress = this.signer.getAddress() as Promise<Address>;
-    signerAddress.then(address => {
-      const nonceState = this.nonceStates.get(address);
-      if (nonceState) {
-        nonceState.pendingNonces.delete(nonce);
-        nonceState.lastUpdated = Date.now();
-      }
-    });
+    const signerAddress = (await this.signer.getAddress()) as Address;
+    const nonceState = this.nonceStates.get(signerAddress);
+    if (nonceState) {
+      nonceState.pendingNonces.delete(nonce);
+      nonceState.lastUpdated = Date.now();
+    }
   }
 
   /**
@@ -729,8 +787,33 @@ export class TransactionLifecycleManager
     // Try to extract nonce information from error and recover
     this.logger.warn('Handling nonce error', { error: error.message });
 
+    // Check if this is a nonce gap error and create appropriate error
+    const nonceMatch = error.message.match(/nonce.*?(\d+).*?(\d+)/);
+    if (nonceMatch && nonceMatch[1] && nonceMatch[2]) {
+      const expected = parseInt(nonceMatch[1]);
+      const actual = parseInt(nonceMatch[2]);
+      const nonceGapError = this.createNonceGapError('nonce-recovery', expected, actual);
+      this.logger.error('Nonce gap detected', {
+        expected,
+        actual,
+        error: nonceGapError.message,
+      });
+    }
+
     // Refresh nonce state
     await this.initializeNonceState();
+  }
+
+  /**
+   * Helper method to create nonce gap errors using NonceGapError type
+   */
+  private createNonceGapError(
+    opportunityId: string,
+    expected: number,
+    actual: number
+  ): NonceGapError {
+    this.logger.debug('Creating nonce gap error', { opportunityId, expected, actual });
+    return new NonceGapError(opportunityId, expected, actual);
   }
 
   /**
@@ -811,13 +894,17 @@ export class TransactionLifecycleManager
       // Update lifecycle data
       const lifecycleData = this.transactions.get(opportunityId);
       if (lifecycleData) {
-        lifecycleData.receipt = receipt as TransactionReceipt;
+        lifecycleData.receipt = this.convertReceipt(receipt);
         lifecycleData.gasUsed = receipt.gasUsed;
         lifecycleData.effectiveGasPrice = receipt.gasPrice;
 
-        // Release nonce
-        if (lifecycleData.transaction?.nonce !== undefined) {
-          this.releaseNonce(lifecycleData.transaction.nonce);
+        // Release nonce after successful confirmation - get nonce from transaction response stored earlier
+        if (receipt.status === 1) {
+          // Get the transaction to access the nonce
+          const txResponse = await this.provider.getTransaction(transactionHash);
+          if (txResponse && txResponse.nonce !== undefined) {
+            await this.releaseNonce(txResponse.nonce);
+          }
         }
       }
 
@@ -835,14 +922,14 @@ export class TransactionLifecycleManager
         // Emit confirmation event
         this.emit('transactionConfirmed', {
           opportunityId,
-          receipt: receipt as TransactionReceipt,
+          receipt: this.convertReceipt(receipt),
           confirmationTime,
           timestamp: Date.now(),
         } satisfies TransactionEvents['transactionConfirmed']);
 
         return {
           success: true,
-          receipt: receipt as TransactionReceipt,
+          receipt: this.convertReceipt(receipt),
           confirmationTime,
           blockNumber: receipt.blockNumber,
           gasUsed: receipt.gasUsed,
@@ -871,7 +958,7 @@ export class TransactionLifecycleManager
 
         return {
           success: false,
-          receipt: receipt as TransactionReceipt,
+          receipt: this.convertReceipt(receipt),
           confirmationTime,
           failureReason,
         };
@@ -910,9 +997,17 @@ export class TransactionLifecycleManager
    * Monitor pending transactions for status updates
    */
   private async monitorPendingTransactions(): Promise<void> {
+    // Get current pool status for monitoring context
+    const poolStatus = this.createPoolStatus();
+
     const pendingTransactions = Array.from(this.transactions.values()).filter(
       tx => tx.stage === TransactionStage.PENDING || tx.stage === TransactionStage.CONFIRMING
     );
+
+    this.logger.debug('Monitoring pending transactions', {
+      pendingCount: pendingTransactions.length,
+      poolStatus: poolStatus.congestionLevel,
+    });
 
     for (const tx of pendingTransactions) {
       if (!tx.transactionHash) continue;

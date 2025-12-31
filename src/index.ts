@@ -22,6 +22,7 @@ import { StablePoolMonitor } from './scanner/stable-pool-monitor';
 import { MempoolMonitor } from './scanner/mempool-monitor';
 import { LiquidationProfitCalculator } from './simulator/liquidation-calculator';
 import { StablePoolRebalancingCalculator } from './simulator/stable-pool-calculator';
+import { ExecutionOrchestrator } from './execution/execution-orchestrator';
 import { EventEmitter } from 'events';
 import { ethers } from 'ethers';
 import path from 'path';
@@ -43,6 +44,21 @@ interface PlatformConfig {
     enableStablePoolMonitoring: boolean;
     enableAdvancedRouting: boolean;
     enablePerformanceOptimizations: boolean;
+    enableExecutionEngine: boolean;
+  };
+  execution?: {
+    enabled: boolean;
+    maxConcurrentExecutions: number;
+    profitThresholds: {
+      arbitrage: number;
+      liquidation: number;
+      stablePool: number;
+    };
+    riskLimits: {
+      maxSlippage: number;
+      maxGasPrice: bigint;
+      dailyLossLimit: bigint;
+    };
   };
 }
 
@@ -54,6 +70,9 @@ class BaseMEVPlatform extends EventEmitter {
   private alertingSystem: AlertingSystem;
   private healthCheckSystem: HealthCheckSystem;
   private healthServer: HealthServer;
+
+  // Execution engine
+  private executionOrchestrator?: ExecutionOrchestrator;
 
   // Phase-specific components
   private arbitrageScanner?: ArbitrageScanner;
@@ -220,6 +239,23 @@ class BaseMEVPlatform extends EventEmitter {
         enableAdvancedRouting: rawConfig.featureFlags?.enableAdvancedRouting ?? true,
         enablePerformanceOptimizations:
           rawConfig.featureFlags?.enablePerformanceOptimizations ?? true,
+        enableExecutionEngine: rawConfig.featureFlags?.enableExecutionEngine ?? true,
+      },
+      execution: {
+        enabled: rawConfig.execution?.enabled ?? true,
+        maxConcurrentExecutions: rawConfig.execution?.maxConcurrentExecutions ?? 5,
+        profitThresholds: {
+          arbitrage: rawConfig.execution?.profitThresholds?.arbitrage ?? 15.0,
+          liquidation: rawConfig.execution?.profitThresholds?.liquidation ?? 25.0,
+          stablePool: rawConfig.execution?.profitThresholds?.stablePool ?? 10.0,
+        },
+        riskLimits: {
+          maxSlippage: rawConfig.execution?.riskLimits?.maxSlippage ?? 0.02,
+          maxGasPrice: BigInt(rawConfig.execution?.riskLimits?.maxGasPrice ?? '50000000000'), // 50 gwei
+          dailyLossLimit: BigInt(
+            rawConfig.execution?.riskLimits?.dailyLossLimit ?? '1000000000000000000'
+          ), // 1 ETH
+        },
       },
     };
   }
@@ -369,6 +405,69 @@ class BaseMEVPlatform extends EventEmitter {
         await this.handleStablePoolOpportunity(opportunity);
       });
     }
+
+    // Initialize Execution Engine
+    if (this.config.featureFlags.enableExecutionEngine && this.config.execution?.enabled) {
+      this.platformLogger.info('Initializing Execution Engine');
+
+      // Create signer from private key (in production, use secure key management)
+      const privateKey = process.env['EXECUTION_PRIVATE_KEY'];
+      if (!privateKey) {
+        this.platformLogger.warn('No execution private key provided, execution engine disabled');
+        return;
+      }
+
+      // Initialize execution orchestrator (signer will be created by individual engines as needed)
+      this.executionOrchestrator = new ExecutionOrchestrator({
+        maxConcurrentExecutions: this.config.execution.maxConcurrentExecutions,
+        enableCircuitBreaker: true,
+        circuitBreakerThreshold: 3,
+        circuitBreakerRecoveryTimeMs: 300000, // 5 minutes
+        executionTimeoutMs: 45000,
+        queueMaxSize: 100,
+        enableGracefulShutdown: true,
+        shutdownTimeoutMs: 30000,
+      });
+
+      // Set up execution event handlers
+      this.executionOrchestrator.on('opportunityExecuted', result => {
+        this.platformLogger.info('Opportunity executed successfully', {
+          opportunityId: result.opportunityId,
+          profit: result.profit?.toString(),
+          gasUsed: result.gasUsed?.toString(),
+          executionTime: result.executionTime,
+        });
+
+        // Update metrics
+        if (result.profit && result.gasUsed) {
+          this.metricsCollector.recordOpportunitySuccess(
+            RelayProvider.FLASHBOTS_PROTECT,
+            result.profit,
+            result.gasUsed,
+            0n, // bribe
+            Date.now(),
+            result.executionTime || 0
+          );
+        }
+      });
+
+      this.executionOrchestrator.on('opportunityFailed', result => {
+        this.platformLogger.warn('Opportunity execution failed', {
+          opportunityId: result.opportunityId,
+          reason: result.failureReason,
+          gasUsed: result.gasUsed?.toString(),
+        });
+
+        // Update metrics
+        this.metricsCollector.recordOpportunityFailure(
+          RelayProvider.FLASHBOTS_PROTECT,
+          result.failureReason || 'Unknown error',
+          result.gasUsed || 0n
+        );
+      });
+
+      this.platformLogger.info('Execution engine initialized successfully');
+    }
   }
 
   async start(): Promise<void> {
@@ -456,6 +555,20 @@ class BaseMEVPlatform extends EventEmitter {
       this.stablePoolMonitor.startScanning();
     }
 
+    // Start Execution Engine
+    if (this.config.featureFlags.enableExecutionEngine && this.executionOrchestrator) {
+      this.platformLogger.info('Starting execution engine');
+      try {
+        await this.executionOrchestrator.start();
+        this.platformLogger.info('Execution engine started successfully');
+      } catch (error) {
+        this.platformLogger.logError(error as Error, {
+          operation: 'execution-engine-startup',
+        });
+        throw error;
+      }
+    }
+
     this.platformLogger.info('All enabled phase components started');
   }
 
@@ -499,15 +612,30 @@ class BaseMEVPlatform extends EventEmitter {
         spread: opportunity.spread,
       });
 
-      // Record successful opportunity detection
-      this.metricsCollector.recordOpportunitySuccess(
-        RelayProvider.FLASHBOTS_PROTECT,
-        BigInt(Math.floor((opportunity.expectedProfitUSD || 0) * 1e18)),
-        BigInt(Math.floor((opportunity.estimatedGasCost || 0) * 1e18)),
-        0n, // bribe
-        Date.now(),
-        2000 // latency
-      );
+      // Execute opportunity using execution engine
+      if (this.executionOrchestrator && this.config?.execution?.enabled) {
+        try {
+          await this.executionOrchestrator.processOpportunity(opportunity);
+          this.platformLogger.info('Arbitrage opportunity submitted for execution', {
+            opportunityId: opportunity.id,
+          });
+        } catch (error) {
+          this.platformLogger.warn('Failed to submit arbitrage opportunity for execution', {
+            opportunityId: opportunity.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } else {
+        // Fallback: Record successful opportunity detection for metrics
+        this.metricsCollector.recordOpportunitySuccess(
+          RelayProvider.FLASHBOTS_PROTECT,
+          BigInt(Math.floor((opportunity.expectedProfitUSD || 0) * 1e18)),
+          BigInt(Math.floor((opportunity.estimatedGasCost || 0) * 1e18)),
+          0n, // bribe
+          Date.now(),
+          2000 // latency
+        );
+      }
 
       this.platformLogger.endPerformanceTracking(operationId);
     } catch (error) {
@@ -796,6 +924,19 @@ class BaseMEVPlatform extends EventEmitter {
       // Stop Phase 3: Stable pool monitoring
       if (this.stablePoolMonitor) {
         this.stablePoolMonitor.stopScanning();
+      }
+
+      // Stop Execution Engine
+      if (this.executionOrchestrator) {
+        this.platformLogger.info('Stopping execution engine');
+        try {
+          await this.executionOrchestrator.stop();
+          this.platformLogger.info('Execution engine stopped successfully');
+        } catch (error) {
+          this.platformLogger.logError(error as Error, {
+            operation: 'execution-engine-shutdown',
+          });
+        }
       }
 
       // Stop health check system

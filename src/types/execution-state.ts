@@ -31,8 +31,8 @@ export interface OpportunityStateTransition {
   from: OpportunityState;
   to: OpportunityState;
   timestamp: number;
-  reason?: string;
-  metadata?: Record<string, any>;
+  reason?: string | undefined;
+  metadata?: Record<string, any> | undefined;
 }
 
 /**
@@ -43,9 +43,11 @@ export interface OpportunityStateData {
   state: OpportunityState;
   createdAt: number;
   updatedAt: number;
-  expiresAt?: number;
+  expiresAt?: number | undefined;
   transitions: OpportunityStateTransition[];
   metadata: Record<string, any>;
+  executorAddress?: Address | undefined; // Address of the executor handling this opportunity
+  originAddress?: Address | undefined; // Address where the opportunity was detected (e.g., pool address)
 }
 
 /**
@@ -56,8 +58,8 @@ export interface StateChangeEvent {
   previousState: OpportunityState;
   newState: OpportunityState;
   timestamp: number;
-  reason?: string;
-  metadata?: Record<string, any>;
+  reason?: string | undefined;
+  metadata?: Record<string, any> | undefined;
 }
 
 /**
@@ -89,6 +91,8 @@ export interface StateMachineConfig {
   stateExpirationMs: number;
   enableTransitionValidation: boolean;
   enableEventEmission: boolean;
+  defaultExecutorAddress?: Address | undefined; // Default executor address for opportunities
+  trackOriginAddresses?: boolean | undefined; // Whether to track origin addresses in state data
 }
 
 /**

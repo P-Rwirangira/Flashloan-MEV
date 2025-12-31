@@ -6,7 +6,50 @@
  */
 
 import { Address } from './common';
-import { OpportunityState } from './execution-state';
+
+/**
+ * Transaction request interface
+ */
+export interface TransactionRequest {
+  to: Address;
+  data: string;
+  value?: bigint;
+  gasLimit: bigint;
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+}
+
+/**
+ * Arbitrage route for execution
+ */
+export interface ArbitrageRoute {
+  tokenIn: Address;
+  tokenOut: Address;
+  amountIn: bigint;
+  expectedAmountOut: bigint;
+  swaps: SwapRoute[];
+  path: SwapRoute[]; // Alias for swaps for backward compatibility
+  estimatedGasCost: bigint;
+  estimatedProfit: bigint;
+  expectedProfit: bigint; // Alias for estimatedProfit for backward compatibility
+  expectedProfitUSD?: number; // USD value of expected profit
+}
+
+/**
+ * Execution options
+ */
+export interface ExecutionOptions {
+  maxSlippageBps: number;
+  gasLimitBuffer: number;
+  priorityFeeMultiplier: number;
+  usePrivateRelay: boolean;
+  timeoutMs: number;
+  slippageTolerance?: number; // 0-1 scale
+  gasLimitMultiplier?: number; // Gas limit multiplier
+  maxGasPrice?: bigint; // Maximum gas price
+  maxPriorityFeePerGas?: bigint; // Maximum priority fee per gas
+  dryRun?: boolean; // Dry run mode for testing
+}
 
 /**
  * Base opportunity interface
@@ -94,6 +137,7 @@ export interface SwapRoute {
   fee: number;
   amountIn: bigint;
   expectedAmountOut: bigint;
+  direction: boolean; // Direction for swap (true for token0->token1, false for token1->token0)
 }
 
 /**
@@ -102,14 +146,18 @@ export interface SwapRoute {
 export interface ExecutionResult {
   opportunityId: string;
   success: boolean;
-  profit?: bigint;
-  gasCost?: bigint;
+  profit?: bigint | undefined;
+  profitUSD?: number | undefined; // USD value of profit
+  gasCost?: bigint | undefined;
   executionTime: number;
-  failureReason?: string;
-  transactionHash?: string;
-  blockNumber?: number;
-  gasUsed?: bigint;
-  effectiveGasPrice?: bigint;
+  executionTimeMs?: number | undefined; // Alias for executionTime for backward compatibility
+  failureReason?: string | undefined;
+  revertReason?: string | undefined; // Revert reason for failed transactions
+  transactionHash?: string | undefined;
+  blockNumber?: number | undefined;
+  gasUsed?: bigint | undefined;
+  effectiveGasPrice?: bigint | undefined;
+  error?: string | undefined; // Error message for failed executions
 }
 
 /**
@@ -135,8 +183,8 @@ export interface ExecutionStatus {
   successRate: number;
   avgLatency: number;
   circuitBreakerActive: boolean;
-  circuitBreakerReason?: string;
-  lastExecutionAt?: number;
+  circuitBreakerReason?: string | undefined;
+  lastExecutionAt?: number | undefined;
 }
 
 /**
@@ -217,8 +265,10 @@ export interface ExecutionMetrics {
   successfulExecutions: number;
   failedExecutions: number;
   totalProfit: bigint;
+  totalProfitUSD?: number | undefined; // USD value of total profit
   totalGasCost: bigint;
   avgExecutionTime: number;
+  averageExecutionTimeMs?: number | undefined; // Alias for avgExecutionTime for backward compatibility
   successRate: number;
   profitPerExecution: bigint;
   executionsByType: Record<OpportunityType, number>;

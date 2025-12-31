@@ -7,6 +7,7 @@
 
 import { EventEmitter } from 'events';
 import { createComponentLogger } from '../utils/logger';
+import { Address } from '../types/common';
 import {
   OpportunityState,
   OpportunityStateData,
@@ -41,6 +42,8 @@ export class OpportunityStateMachine extends EventEmitter {
       stateExpirationMs: config.stateExpirationMs ?? 24 * 60 * 60 * 1000, // 24 hours
       enableTransitionValidation: config.enableTransitionValidation ?? true,
       enableEventEmission: config.enableEventEmission ?? true,
+      defaultExecutorAddress: config.defaultExecutorAddress,
+      trackOriginAddresses: config.trackOriginAddresses ?? true,
       ...config,
     };
 
@@ -61,7 +64,9 @@ export class OpportunityStateMachine extends EventEmitter {
     opportunityId: string,
     initialState: OpportunityState = OpportunityState.DETECTED,
     expiresAt?: number,
-    metadata: Record<string, any> = {}
+    metadata: Record<string, any> = {},
+    executorAddress?: Address,
+    originAddress?: Address
   ): OpportunityStateData {
     if (this.opportunities.has(opportunityId)) {
       throw new Error(`Opportunity ${opportunityId} already exists`);
@@ -76,6 +81,8 @@ export class OpportunityStateMachine extends EventEmitter {
       expiresAt,
       transitions: [],
       metadata: { ...metadata },
+      executorAddress: executorAddress || this.config.defaultExecutorAddress,
+      originAddress,
     };
 
     this.opportunities.set(opportunityId, stateData);
