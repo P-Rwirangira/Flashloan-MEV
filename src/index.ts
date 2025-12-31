@@ -27,7 +27,9 @@ import { FlashLoanArbitrageEngine } from './execution/flash-loan-arbitrage-engin
 import { OpportunityStateMachine } from './execution/opportunity-state-machine';
 import { FlashLoanManager } from './execution/flash-loan-manager';
 import { TransactionLifecycleManager } from './execution/transaction-lifecycle-manager';
+import { PrivateRelayManager } from './execution/private-relay-manager';
 import { OpportunityType } from './types/execution';
+import { RelayProvider as PrivateRelayProvider } from './types/private-relay';
 import { EventEmitter } from 'events';
 import { ethers } from 'ethers';
 import path from 'path';
@@ -82,6 +84,7 @@ class BaseMEVPlatform extends EventEmitter {
   private opportunityStateMachine?: OpportunityStateMachine;
   private flashLoanManager?: FlashLoanManager;
   private transactionLifecycleManager?: TransactionLifecycleManager;
+  private privateRelayManager?: PrivateRelayManager;
 
   // Phase-specific components
   private arbitrageScanner?: ArbitrageScanner;
@@ -438,6 +441,96 @@ class BaseMEVPlatform extends EventEmitter {
         // Initialize core execution components
         this.opportunityStateMachine = new OpportunityStateMachine();
 
+        // Initialize private relay manager
+        this.privateRelayManager = new PrivateRelayManager(provider, signer, {
+          defaultRelay: PrivateRelayProvider.FLASHBOTS_PROTECT,
+          enableFallback: true,
+          maxConcurrentSubmissions: 5,
+          selectionStrategy: 'balanced',
+          enableMetrics: true,
+          metricsRetentionMs: 24 * 60 * 60 * 1000, // 24 hours
+          enableBundles: true,
+          maxBundleSize: 3,
+          relayProviders: [
+            {
+              name: 'Flashbots Protect',
+              provider: PrivateRelayProvider.FLASHBOTS_PROTECT,
+              endpoint: process.env['FLASHBOTS_PROTECT_RPC'] || 'https://rpc.flashbots.net',
+              authentication: {
+                type: 'api-key',
+                apiKey: process.env['FLASHBOTS_API_KEY'] || '',
+              },
+              capabilities: {
+                supportsBundle: true,
+                supportsCancellation: false,
+                supportsReplacement: true,
+                supportsSimulation: true,
+                maxTransactionsPerBundle: 25,
+                estimatedInclusionTime: 12000, // 12 seconds
+                supportedChains: [8453], // Base mainnet
+              },
+              costs: {
+                baseFee: BigInt(0),
+                priorityFeeMultiplier: 1.0,
+                bundleFee: BigInt(0),
+              },
+              enabled: true,
+              priority: 1,
+              maxRetries: 2,
+              timeoutMs: 30000,
+            },
+            {
+              name: 'bloXroute',
+              provider: PrivateRelayProvider.BLOXROUTE,
+              endpoint: process.env['BLOXROUTE_ENDPOINT'] || 'https://api.bloxroute.com',
+              authentication: {
+                type: 'api-key',
+                apiKey: process.env['BLOXROUTE_API_KEY'] || '',
+              },
+              capabilities: {
+                supportsBundle: false,
+                supportsCancellation: true,
+                supportsReplacement: true,
+                supportsSimulation: false,
+                maxTransactionsPerBundle: 1,
+                estimatedInclusionTime: 8000, // 8 seconds
+                supportedChains: [8453], // Base mainnet
+              },
+              costs: {
+                baseFee: BigInt(1e15), // 0.001 ETH
+                priorityFeeMultiplier: 1.1,
+              },
+              enabled: !!process.env['BLOXROUTE_API_KEY'], // Only enable if API key is provided
+              priority: 2,
+              maxRetries: 1,
+              timeoutMs: 20000,
+            },
+            {
+              name: 'Local Node Fallback',
+              provider: PrivateRelayProvider.LOCAL_NODE,
+              endpoint: process.env['BASE_RPC_URL'] || 'https://mainnet.base.org',
+              authentication: { type: 'none' },
+              capabilities: {
+                supportsBundle: false,
+                supportsCancellation: false,
+                supportsReplacement: true,
+                supportsSimulation: false,
+                maxTransactionsPerBundle: 1,
+                estimatedInclusionTime: 15000, // 15 seconds
+                supportedChains: [8453], // Base mainnet
+              },
+              costs: {
+                baseFee: BigInt(0),
+                priorityFeeMultiplier: 1.0,
+              },
+              enabled: true,
+              priority: 99, // Lowest priority (fallback)
+              maxRetries: 0,
+              timeoutMs: 10000,
+            },
+          ],
+        });
+
         this.flashLoanManager = new FlashLoanManager({
           preferredProvider: 'uniswap-v3' as any,
           maxBorrowAmountUsd: 1000000, // $1M max
@@ -579,7 +672,54 @@ class BaseMEVPlatform extends EventEmitter {
           flashExecutorAddress,
           signerAddress: await signer.getAddress(),
           registeredEngines: ['arbitrage'],
+          privateRelayEnabled: !!this.privateRelayManager,
+          enabledRelays: this.privateRelayManager
+            ? Object.keys(this.privateRelayManager.getRelayMetrics())
+            : [],
         });
+
+        // Set up private relay manager event handlers
+        if (this.privateRelayManager) {
+          this.privateRelayManager.on(
+            'transactionSubmitted',
+            ({ relayProvider, transactionHash, latency }) => {
+              this.platformLogger.info('Transaction submitted via private relay', {
+                relay: relayProvider,
+                txHash: transactionHash,
+                latency,
+              });
+            }
+          );
+
+          this.privateRelayManager.on(
+            'transactionFailed',
+            ({ relayProvider, reason, retryCount }) => {
+              this.platformLogger.warn('Private relay transaction failed', {
+                relay: relayProvider,
+                reason,
+                retryCount,
+              });
+            }
+          );
+
+          this.privateRelayManager.on('relayUnavailable', ({ relayProvider, reason }) => {
+            this.platformLogger.error('Private relay unavailable', {
+              relay: relayProvider,
+              reason,
+            });
+          });
+
+          this.privateRelayManager.on(
+            'fallbackActivated',
+            ({ originalRelay, fallbackRelay, reason }) => {
+              this.platformLogger.warn('Private relay fallback activated', {
+                originalRelay,
+                fallbackRelay,
+                reason,
+              });
+            }
+          );
+        }
       } catch (error) {
         this.platformLogger.logError(error as Error, {
           operation: 'execution-engine-initialization',
@@ -680,6 +820,12 @@ class BaseMEVPlatform extends EventEmitter {
     if (this.config.featureFlags.enableExecutionEngine && this.executionOrchestrator) {
       this.platformLogger.info('Starting execution engine');
       try {
+        // Start private relay manager first
+        if (this.privateRelayManager) {
+          await this.privateRelayManager.start();
+          this.platformLogger.info('Private relay manager started');
+        }
+
         // Start transaction lifecycle manager
         if (this.transactionLifecycleManager) {
           await this.transactionLifecycleManager.start();
@@ -1080,6 +1226,12 @@ class BaseMEVPlatform extends EventEmitter {
           if (this.flashLoanManager) {
             await this.flashLoanManager.stop();
             this.platformLogger.info('Flash loan manager stopped');
+          }
+
+          // Stop private relay manager
+          if (this.privateRelayManager) {
+            await this.privateRelayManager.stop();
+            this.platformLogger.info('Private relay manager stopped');
           }
 
           this.platformLogger.info('Execution engine stopped successfully');
