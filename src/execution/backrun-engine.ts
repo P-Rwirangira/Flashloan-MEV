@@ -724,6 +724,12 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
   ): Promise<TransactionRequest> {
     const backrunTx = route.backrunTransaction;
 
+    this.logger.debug('Building backrun transaction', {
+      opportunityId: opportunity.id,
+      targetTx: opportunity.targetTransaction,
+      backrunType: route.backrunTransaction.type,
+    });
+
     // Encode transaction data based on backrun type
     let transactionData: string;
     let targetAddress: string;
@@ -812,7 +818,7 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
    * Calculate actual backrun profit
    */
   private async calculateBackrunProfit(
-    _opportunity: MempoolBackrunOpportunity,
+    opportunity: MempoolBackrunOpportunity,
     route: BackrunRoute,
     transactionHash: string
   ): Promise<bigint> {
@@ -828,6 +834,7 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
     const estimatedProfit = route.estimatedProfit;
 
     this.logger.debug('Calculating backrun profit', {
+      opportunity: opportunity.id,
       transactionHash,
       estimatedProfit: estimatedProfit.toString(),
       gasCost: gasCost.toString(),

@@ -532,6 +532,12 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
     // For now, return a placeholder
     const abiCoder = new ethers.AbiCoder();
 
+    this.logger.debug('Encoding direct liquidation data', {
+      opportunityId: opportunity.id,
+      routeSteps: route.steps.length,
+      borrower: opportunity.borrower,
+    });
+
     return abiCoder.encode(
       ['address', 'address', 'uint256'],
       [opportunity.borrower, opportunity.collateralToken, opportunity.debtAmount]
@@ -543,7 +549,7 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
    */
   private async calculateActualProfit(
     opportunity: LiquidationOpportunity,
-    _route: LiquidationRoute
+    route: LiquidationRoute
   ): Promise<bigint> {
     // In production, this would:
     // 1. Get the actual transaction receipt
@@ -554,6 +560,13 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
     // For now, return estimated profit minus gas costs
     const gasCost = BigInt(200000) * BigInt(50e9); // 200k gas * 50 gwei gas price
     const estimatedProfit = opportunity.estimatedProfit;
+
+    this.logger.debug('Calculating liquidation profit', {
+      opportunity: opportunity.id,
+      route: route.steps.length,
+      estimatedProfit: estimatedProfit.toString(),
+      gasCost: gasCost.toString(),
+    });
 
     return estimatedProfit > gasCost ? estimatedProfit - gasCost : 0n;
   }

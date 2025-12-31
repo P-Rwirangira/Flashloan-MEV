@@ -20,6 +20,8 @@ import {
   IPrivateRelayManager,
   RelayError,
   RelayUnavailableError,
+  BundleSubmission,
+  BundleSubmissionResult,
 } from '../types/private-relay';
 
 /**
@@ -28,7 +30,6 @@ import {
 export class PrivateRelayManager extends EventEmitter implements IPrivateRelayManager {
   private readonly logger = createComponentLogger('private-relay-manager');
   private readonly config: PrivateRelayManagerConfig;
-  private readonly provider: ethers.Provider;
   private readonly signer: ethers.Signer;
 
   private readonly relayConfigs = new Map<RelayProvider, RelayProviderConfig>();
@@ -39,13 +40,12 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
   private metricsCleanupInterval: NodeJS.Timeout | undefined;
 
   constructor(
-    provider: ethers.Provider,
+    _provider: ethers.Provider,
     signer: ethers.Signer,
     config: Partial<PrivateRelayManagerConfig> = {}
   ) {
     super();
 
-    this.provider = provider;
     this.signer = signer;
 
     this.config = {
@@ -149,7 +149,8 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
         urgency: options.urgency || 'medium',
       };
 
-      const selectedRelay = this.selectOptimalRelay(criteria);
+      const selectedRelayProvider = this.selectOptimalRelayProvider(criteria);
+      const selectedRelay = this.relayConfigs.get(selectedRelayProvider);
       if (!selectedRelay) {
         throw new RelayUnavailableError(
           RelayProvider.FLASHBOTS_PROTECT,
@@ -159,7 +160,7 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
 
       // Create submission promise
       const submissionPromise = this.executeRelaySubmission(
-        selectedRelay,
+        selectedRelayProvider,
         transaction,
         options,
         submissionId
@@ -171,7 +172,7 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
       const result = await submissionPromise;
 
       // Update metrics
-      this.updateRelayMetrics(selectedRelay, result, Date.now() - startTime);
+      this.updateRelayMetrics(selectedRelayProvider, result, Date.now() - startTime);
 
       return result;
     } catch (error) {
@@ -395,13 +396,78 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
   }
 
   /**
-   * Select optimal relay based on criteria
+   * Submit bundle of transactions
    */
-  private selectOptimalRelay(criteria: RelaySelectionCriteria): RelayProvider | null {
+  async submitBundle(
+    bundle: BundleSubmission,
+    options: SubmissionOptions = {}
+  ): Promise<BundleSubmissionResult> {
+    const startTime = Date.now();
+
+    try {
+      if (!this.config.enableBundles) {
+        throw new RelayError('Bundle submission is disabled', this.config.defaultRelay);
+      }
+
+      if (bundle.transactions.length > this.config.maxBundleSize) {
+        throw new RelayError(
+          `Bundle size ${bundle.transactions.length} exceeds maximum ${this.config.maxBundleSize}`,
+          this.config.defaultRelay
+        );
+      }
+
+      // For now, submit transactions individually
+      // In production, this would use actual bundle submission APIs
+      const transactionHashes: string[] = [];
+
+      for (const transaction of bundle.transactions) {
+        const result = await this.submitTransaction(transaction, options);
+        if (result.success && result.transactionHash) {
+          transactionHashes.push(result.transactionHash);
+        }
+      }
+
+      return {
+        success: transactionHashes.length === bundle.transactions.length,
+        bundleHash: `bundle-${Date.now()}`,
+        transactionHashes,
+        relayProvider: this.config.defaultRelay,
+        latency: Date.now() - startTime,
+        timestamp: Date.now(),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        relayProvider: this.config.defaultRelay,
+        latency: Date.now() - startTime,
+        failureReason: error instanceof Error ? error.message : String(error),
+        timestamp: Date.now(),
+      };
+    }
+  }
+
+  /**
+   * Get optimal relay for transaction
+   */
+  async selectOptimalRelay(criteria: RelaySelectionCriteria): Promise<RelayProviderConfig> {
+    const selectedProvider = this.selectOptimalRelayProvider(criteria);
+    const config = this.relayConfigs.get(selectedProvider);
+
+    if (!config) {
+      throw new Error(`No configuration found for relay ${selectedProvider}`);
+    }
+
+    return config;
+  }
+
+  /**
+   * Select optimal relay provider based on criteria
+   */
+  private selectOptimalRelayProvider(criteria: RelaySelectionCriteria): RelayProvider {
     const availableRelays = this.config.relayProviders.filter(r => r.enabled);
 
     if (availableRelays.length === 0) {
-      return null;
+      return this.config.defaultRelay;
     }
 
     // If preferred relay is specified and available, use it
@@ -452,7 +518,7 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
     }
 
     // Find relay with lowest average latency
-    let fastestRelay = relays[0].provider;
+    let fastestRelay = relays[0]?.provider || RelayProvider.FLASHBOTS_PROTECT;
     let lowestLatency = Infinity;
 
     for (const relay of relays) {
@@ -478,7 +544,7 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
     }
 
     // Find relay with highest success rate
-    let mostReliableRelay = relays[0].provider;
+    let mostReliableRelay = relays[0]?.provider || RelayProvider.FLASHBOTS_PROTECT;
     let highestSuccessRate = 0;
 
     for (const relay of relays) {
@@ -504,7 +570,7 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
     }
 
     // Calculate composite score: (success_rate * 0.6) + (1/latency * 0.4)
-    let bestRelay = relays[0].provider;
+    let bestRelay = relays[0]?.provider || RelayProvider.FLASHBOTS_PROTECT;
     let bestScore = 0;
 
     for (const relay of relays) {
@@ -600,23 +666,59 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
   private getDefaultRelayConfigs(): RelayProviderConfig[] {
     return [
       {
+        name: 'Flashbots Protect',
         provider: RelayProvider.FLASHBOTS_PROTECT,
         endpoint: 'https://rpc.flashbots.net',
         enabled: true,
         priority: 1,
+        maxRetries: 3,
+        timeoutMs: 30000,
         authentication: {
           type: 'bearer',
           apiKey: process.env['FLASHBOTS_API_KEY'] || '',
         },
+        capabilities: {
+          supportsBundle: true,
+          supportsCancellation: false,
+          supportsReplacement: true,
+          supportsSimulation: true,
+          maxTransactionsPerBundle: 5,
+          estimatedInclusionTime: 12000,
+          supportedChains: [8453], // Base mainnet
+        },
+        costs: {
+          baseFee: BigInt(0),
+          priorityFeeMultiplier: 1.0,
+          bundleFee: BigInt(0),
+          maxBribe: BigInt(1e18), // 1 ETH
+        },
       },
       {
+        name: 'bloXroute',
         provider: RelayProvider.BLOXROUTE,
         endpoint: 'https://api.bloxroute.com',
         enabled: !!process.env['BLOXROUTE_API_KEY'],
         priority: 2,
+        maxRetries: 3,
+        timeoutMs: 30000,
         authentication: {
           type: 'api-key',
           apiKey: process.env['BLOXROUTE_API_KEY'] || '',
+        },
+        capabilities: {
+          supportsBundle: true,
+          supportsCancellation: true,
+          supportsReplacement: true,
+          supportsSimulation: true,
+          maxTransactionsPerBundle: 10,
+          estimatedInclusionTime: 8000,
+          supportedChains: [8453], // Base mainnet
+        },
+        costs: {
+          baseFee: BigInt(1e15), // 0.001 ETH
+          priorityFeeMultiplier: 1.1,
+          bundleFee: BigInt(5e15), // 0.005 ETH
+          maxBribe: BigInt(5e17), // 0.5 ETH
         },
       },
     ];
@@ -656,6 +758,76 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
       });
 
     await Promise.allSettled(testPromises);
+  }
+
+  /**
+   * Get relay metrics
+   */
+  getRelayMetrics(provider?: RelayProvider): RelayMetrics | Record<RelayProvider, RelayMetrics> {
+    if (provider) {
+      return this.relayMetrics.get(provider) || this.createEmptyMetrics();
+    }
+
+    // Return all metrics as a record
+    const allMetrics: Record<RelayProvider, RelayMetrics> = {} as Record<
+      RelayProvider,
+      RelayMetrics
+    >;
+    for (const [relayProvider, metrics] of this.relayMetrics) {
+      allMetrics[relayProvider] = metrics;
+    }
+    return allMetrics;
+  }
+
+  /**
+   * Check relay health
+   */
+  async checkRelayHealth(provider: RelayProvider): Promise<boolean> {
+    const config = this.relayConfigs.get(provider);
+    if (!config || !config.enabled) {
+      return false;
+    }
+
+    try {
+      const response = await fetch(config.endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'web3_clientVersion',
+          params: [],
+        }),
+        signal: AbortSignal.timeout(5000), // 5 second timeout
+      });
+
+      return response.ok;
+    } catch (error) {
+      this.logger.debug('Relay health check failed', {
+        provider,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Update relay configuration
+   */
+  updateRelayConfig(provider: RelayProvider, config: Partial<RelayProviderConfig>): void {
+    const existingConfig = this.relayConfigs.get(provider);
+    if (!existingConfig) {
+      this.logger.warn('Cannot update config for unknown relay', { provider });
+      return;
+    }
+
+    const updatedConfig = { ...existingConfig, ...config };
+    this.relayConfigs.set(provider, updatedConfig);
+
+    this.logger.info('Relay configuration updated', {
+      provider,
+      updatedFields: Object.keys(config),
+    });
   }
 
   /**
