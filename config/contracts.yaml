@@ -1,0 +1,49 @@
+# Contract deployment configuration
+contracts:
+  flashExecutor:
+    # Will be populated after deployment
+    address: ""
+    deploymentBlock: 0
+    deploymentTime: ""
+    network: ""
+    chainId: ""
+    owner: ""
+    minProfit: ""
+    
+  # Authorized pools for flash loans
+  authorizedPools:
+    uniswapV3:
+      # Base mainnet Uniswap V3 pools
+      - address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18" # WETH/USDC 0.05%
+        token0: "WETH"
+        token1: "USDC"
+        fee: 500
+      - address: "0xd0b53D9277642d899DF5C87A3966A349A798F224" # WETH/USDC 0.3%
+        token0: "WETH"
+        token1: "USDC"
+        fee: 3000
+    
+    aerodrome:
+      # Base mainnet Aerodrome pools
+      - address: "0xcDAC0d6c6C59727a65F871236188350531885C43" # WETH/USDC volatile
+        token0: "WETH"
+        token1: "USDC"
+        stable: false
+
+# Deployment settings
+deployment:
+  minProfitEth: "0.001" # 0.001 ETH minimum profit
+  gasLimit: 5000000
+  gasPrice: "auto" # Use network suggested gas price
+  
+# Network configurations
+networks:
+  base:
+    rpcUrl: "https://mainnet.base.org"
+    chainId: 8453
+    blockExplorer: "https://basescan.org"
+    
+  baseSepolia:
+    rpcUrl: "https://sepolia.base.org"
+    chainId: 84532
+    blockExplorer: "https://sepolia.basescan.org"

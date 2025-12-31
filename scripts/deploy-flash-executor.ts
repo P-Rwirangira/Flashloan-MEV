@@ -1,40 +1,84 @@
 import { ethers } from 'hardhat';
 import { parseEther } from 'ethers';
+import { ContractManager } from '../src/contracts/contract-manager';
 
 async function main() {
   const [deployer] = await ethers.getSigners();
+  const network = await ethers.provider.getNetwork();
+  const contractManager = new ContractManager();
 
   console.log('Deploying contracts with the account:', deployer.address);
   console.log('Account balance:', (await ethers.provider.getBalance(deployer.address)).toString());
+  console.log('Network:', network.name, 'Chain ID:', network.chainId.toString());
 
-  // Deploy FlashExecutor with minimum profit of 0.001 ETH (1e15 wei)
-  const minProfit = parseEther('0.001');
+  // Get deployment configuration
+  const deploymentConfig = contractManager.getDeploymentConfig();
+  const minProfit = parseEther(deploymentConfig.minProfitEth);
 
+  console.log('Minimum profit set to:', minProfit.toString(), 'wei');
+
+  // Deploy FlashExecutor
   const FlashExecutor = await ethers.getContractFactory('FlashExecutor');
-  const flashExecutor = await FlashExecutor.deploy(minProfit);
+  const flashExecutor = await FlashExecutor.deploy(minProfit, {
+    gasLimit: deploymentConfig.gasLimit,
+  });
 
   await flashExecutor.waitForDeployment();
 
   const contractAddress = await flashExecutor.getAddress();
+  const deploymentBlock = await ethers.provider.getBlockNumber();
 
   console.log('FlashExecutor deployed to:', contractAddress);
-  console.log('Minimum profit set to:', minProfit.toString(), 'wei');
+  console.log('Deployment block:', deploymentBlock);
   console.log('Owner:', await flashExecutor.owner());
 
-  // Save deployment info
-  const deploymentInfo = {
-    contractAddress,
+  // Update contract configuration
+  const contractConfig = {
+    address: contractAddress,
     minProfit: minProfit.toString(),
     owner: await flashExecutor.owner(),
-    network: (await ethers.provider.getNetwork()).name,
-    chainId: (await ethers.provider.getNetwork()).chainId.toString(),
-    deploymentBlock: await ethers.provider.getBlockNumber(),
+    network: network.name,
+    chainId: network.chainId.toString(),
+    deploymentBlock,
     deploymentTime: new Date().toISOString(),
   };
 
-  console.log('\nDeployment Info:', JSON.stringify(deploymentInfo, null, 2));
+  contractManager.updateFlashExecutorConfig(contractConfig);
 
-  return deploymentInfo;
+  // Add authorized pools to the contract
+  const authorizedPools = contractManager.getAllAuthorizedPoolAddresses();
+  console.log(`\nAdding ${authorizedPools.length} authorized pools...`);
+
+  for (const poolAddress of authorizedPools) {
+    try {
+      console.log(`Adding pool: ${poolAddress}`);
+      const tx = await flashExecutor.addAuthorizedPool(poolAddress);
+      await tx.wait();
+      console.log(`✓ Pool added: ${poolAddress}`);
+    } catch (error) {
+      console.error(`✗ Failed to add pool ${poolAddress}:`, error);
+    }
+  }
+
+  console.log('\n=== Deployment Summary ===');
+  console.log('Contract Address:', contractAddress);
+  console.log('Network:', network.name);
+  console.log('Chain ID:', network.chainId.toString());
+  console.log('Owner:', await flashExecutor.owner());
+  console.log('Min Profit:', minProfit.toString(), 'wei');
+  console.log('Authorized Pools:', authorizedPools.length);
+  console.log('Deployment Block:', deploymentBlock);
+  console.log('Gas Used: ~', deploymentConfig.gasLimit);
+
+  return {
+    contractAddress,
+    network: network.name,
+    chainId: network.chainId.toString(),
+    owner: await flashExecutor.owner(),
+    minProfit: minProfit.toString(),
+    authorizedPools: authorizedPools.length,
+    deploymentBlock,
+  };
 }
 
 main()
