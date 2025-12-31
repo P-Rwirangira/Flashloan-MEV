@@ -98,30 +98,118 @@ export class TransactionLifecycleManager
   }
 
   /**
-   * Helper method to create transaction errors using error types
+   * Get next available nonce for address
    */
-  private createTransactionError(opportunityId: string, message: string): TransactionReplacedError {
-    this.logger.debug('Creating transaction error', { opportunityId, message });
-    return new TransactionReplacedError(opportunityId, 'old-hash', 'new-hash');
+  async getNextNonce(address: Address): Promise<number> {
+    const nonceState = this.nonceStates.get(address);
+
+    if (!nonceState) {
+      // Initialize nonce state for new address
+      const chainNonce = await this.provider.getTransactionCount(address, 'pending');
+      const newNonceState: NonceState = {
+        address,
+        chainNonce,
+        pendingNonces: new Set(),
+        lastUsedNonce: chainNonce - 1,
+        gapRecoveryInProgress: false,
+      };
+      this.nonceStates.set(address, newNonceState);
+      return chainNonce;
+    }
+
+    // Check for nonce gaps and recover if needed
+    if (this.config.nonceGapRecovery && !nonceState.gapRecoveryInProgress) {
+      await this.detectAndRecoverNonceGaps(address);
+    }
+
+    // Find next available nonce
+    let nextNonce = nonceState.lastUsedNonce + 1;
+    while (nonceState.pendingNonces.has(nextNonce)) {
+      nextNonce++;
+    }
+
+    return nextNonce;
   }
 
   /**
-   * Convert ethers TransactionReceipt to our TransactionReceipt type
+   * Reserve nonce for transaction
    */
-  private convertReceipt(ethersReceipt: any): TransactionReceipt {
-    return {
-      transactionHash: ethersReceipt.hash || ethersReceipt.transactionHash,
-      blockNumber: ethersReceipt.blockNumber,
-      blockHash: ethersReceipt.blockHash,
-      transactionIndex: ethersReceipt.index || ethersReceipt.transactionIndex || 0,
-      from: ethersReceipt.from,
-      to: ethersReceipt.to,
-      gasUsed: ethersReceipt.gasUsed,
-      effectiveGasPrice: ethersReceipt.gasPrice || ethersReceipt.effectiveGasPrice,
-      status: ethersReceipt.status,
-      logs: ethersReceipt.logs || [],
-      cumulativeGasUsed: ethersReceipt.cumulativeGasUsed || ethersReceipt.gasUsed,
-    };
+  async reserveNonce(address: Address): Promise<number> {
+    const nonce = await this.getNextNonce(address);
+    const nonceState = this.nonceStates.get(address)!;
+
+    // Check for nonce conflicts
+    if (nonceState.pendingNonces.has(nonce)) {
+      throw new NonceGapError(`Nonce ${nonce} already reserved for ${address}`);
+    }
+
+    nonceState.pendingNonces.add(nonce);
+    nonceState.lastUsedNonce = Math.max(nonceState.lastUsedNonce, nonce);
+
+    this.logger.debug('Nonce reserved', {
+      address,
+      nonce,
+      pendingCount: nonceState.pendingNonces.size,
+    });
+    return nonce;
+  }
+
+  /**
+   * Release nonce (on success or failure)
+   */
+  releaseNonce(address: Address, nonce: number): void {
+    const nonceState = this.nonceStates.get(address);
+    if (!nonceState) {
+      this.logger.warn('Attempted to release nonce for unknown address', { address, nonce });
+      return;
+    }
+
+    nonceState.pendingNonces.delete(nonce);
+    this.logger.debug('Nonce released', {
+      address,
+      nonce,
+      pendingCount: nonceState.pendingNonces.size,
+    });
+  }
+
+  /**
+   * Detect and recover from nonce gaps
+   */
+  private async detectAndRecoverNonceGaps(address: Address): Promise<void> {
+    const nonceState = this.nonceStates.get(address);
+    if (!nonceState || nonceState.gapRecoveryInProgress) return;
+
+    nonceState.gapRecoveryInProgress = true;
+
+    try {
+      const currentChainNonce = await this.provider.getTransactionCount(address, 'pending');
+
+      // Check if chain nonce has advanced beyond our tracking
+      if (currentChainNonce > nonceState.chainNonce) {
+        this.logger.info('Nonce gap detected, recovering', {
+          address,
+          oldChainNonce: nonceState.chainNonce,
+          newChainNonce: currentChainNonce,
+          pendingNonces: Array.from(nonceState.pendingNonces),
+        });
+
+        // Clear pending nonces that are now confirmed
+        const confirmedNonces = Array.from(nonceState.pendingNonces).filter(
+          n => n < currentChainNonce
+        );
+        confirmedNonces.forEach(n => nonceState.pendingNonces.delete(n));
+
+        // Update chain nonce
+        nonceState.chainNonce = currentChainNonce;
+        nonceState.lastUsedNonce = Math.max(nonceState.lastUsedNonce, currentChainNonce - 1);
+
+        this.emit('nonceGapRecovered', { address, recoveredNonces: confirmedNonces });
+      }
+    } catch (error) {
+      this.logger.error('Failed to recover nonce gaps', { address, error });
+    } finally {
+      nonceState.gapRecoveryInProgress = false;
+    }
   }
 
   /**
@@ -168,7 +256,6 @@ export class TransactionLifecycleManager
       this.logger.info('Waiting for pending confirmations...', {
         count: pendingConfirmations.length,
       });
-
       await Promise.allSettled(pendingConfirmations);
     }
 
@@ -176,859 +263,162 @@ export class TransactionLifecycleManager
   }
 
   /**
-   * Build transaction from parameters
+   * Initialize nonce state for signer
    */
-  async buildTransaction(
-    to: Address,
-    data: string,
-    value: bigint = 0n,
-    gasOptions?: Partial<GasEstimationResult>
-  ): Promise<TransactionRequest> {
+  private async initializeNonceState(): Promise<void> {
+    const signerAddress = await this.signer.getAddress();
+    const chainNonce = await this.provider.getTransactionCount(signerAddress, 'pending');
+
+    this.nonceStates.set(signerAddress, {
+      address: signerAddress,
+      chainNonce,
+      pendingNonces: new Set(),
+      lastUsedNonce: chainNonce - 1,
+      gapRecoveryInProgress: false,
+    });
+
+    this.logger.debug('Nonce state initialized', { signerAddress, chainNonce });
+  }
+
+  /**
+   * Monitor pending transactions
+   */
+  private monitorPendingTransactions(): void {
+    // Implementation for monitoring pending transactions
+    // This would check for stuck transactions, update gas prices, etc.
+  }
+
+  /**
+   * Build transaction from request
+   */
+  async buildTransaction(request: TransactionRequest): Promise<TransactionLifecycleData> {
+    const transactionId = `tx-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
     try {
+      this.logger.debug('Building transaction', { transactionId, to: request.to });
+
+      // Reserve nonce
+      const fromAddress = await this.signer.getAddress();
+      const nonce = await this.reserveNonce(fromAddress);
+
       // Estimate gas if not provided
-      let gasEstimate: GasEstimationResult;
-
-      if (gasOptions) {
-        gasEstimate = {
-          gasLimit: gasOptions.gasLimit ?? 200000n,
-          maxFeePerGas: gasOptions.maxFeePerGas ?? 25000000000n,
-          maxPriorityFeePerGas: gasOptions.maxPriorityFeePerGas ?? 2000000000n,
-          estimatedCost: gasOptions.estimatedCost ?? 0n,
-          confidence: gasOptions.confidence ?? 0.8,
-        };
-      } else {
-        gasEstimate = await this.estimateGas(to, data, value);
+      let gasLimit = request.gasLimit;
+      if (!gasLimit) {
+        const gasEstimation = await this.estimateGas(request);
+        gasLimit = gasEstimation.gasLimit;
       }
 
-      // Get nonce for validation and logging
-      const nonce = await this.getNextNonce();
+      // Get gas price if not provided
+      let gasPrice = request.gasPrice;
+      let maxFeePerGas = request.maxFeePerGas;
+      let maxPriorityFeePerGas = request.maxPriorityFeePerGas;
 
-      const transaction: TransactionRequest = {
-        to,
-        data,
-        value,
-        gasLimit: gasEstimate.gasLimit,
-        maxFeePerGas: gasEstimate.maxFeePerGas,
-        maxPriorityFeePerGas: gasEstimate.maxPriorityFeePerGas,
-        type: 2, // EIP-1559
-      };
-
-      this.logger.debug('Transaction built', {
-        to,
-        gasLimit: transaction.gasLimit.toString(),
-        maxFeePerGas: transaction.maxFeePerGas.toString(),
-        nonce: nonce, // Use nonce in logging
-      });
-
-      return transaction;
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      this.logger.error('Transaction build failed', { to, error: reason });
-      throw new TransactionBuildError('build-error', reason);
-    }
-  }
-
-  /**
-   * Simulate transaction execution
-   */
-  async simulateTransaction(transaction: TransactionRequest): Promise<TransactionSimulationResult> {
-    if (!this.config.enableSimulation) {
-      return {
-        success: true,
-        simulationTime: 0,
-      };
-    }
-
-    const startTime = Date.now();
-
-    try {
-      // Use eth_call to simulate the transaction
-      const result = await this.provider.call({
-        to: transaction.to,
-        data: transaction.data,
-        value: transaction.value || 0n,
-        gasLimit: transaction.gasLimit,
-        maxFeePerGas: transaction.maxFeePerGas,
-        maxPriorityFeePerGas: transaction.maxPriorityFeePerGas,
-      });
-
-      const simulationTime = Date.now() - startTime;
-
-      this.logger.debug('Transaction simulation successful', {
-        to: transaction.to,
-        gasLimit: transaction.gasLimit.toString(),
-        simulationTime,
-      });
-
-      return {
-        success: true,
-        returnData: result,
-        simulationTime,
-      };
-    } catch (error) {
-      const simulationTime = Date.now() - startTime;
-      let revertReason: string | undefined;
-
-      if (error instanceof Error) {
-        // Try to extract revert reason
-        const match = error.message.match(/revert (.+)/);
-        revertReason = match ? match[1] : error.message;
-      }
-
-      this.logger.warn('Transaction simulation failed', {
-        to: transaction.to,
-        revertReason,
-        simulationTime,
-      });
-
-      return {
-        success: false,
-        revertReason,
-        simulationTime,
-      };
-    }
-  }
-
-  /**
-   * Submit transaction to network
-   */
-  async submitTransaction(
-    opportunityId: string,
-    transaction: TransactionRequest
-  ): Promise<TransactionSubmissionResult> {
-    const startTime = Date.now();
-
-    // Initialize transaction lifecycle data
-    const lifecycleData: TransactionLifecycleData = {
-      opportunityId,
-      stage: TransactionStage.BUILDING,
-      transaction,
-      submissionAttempts: 0,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      metadata: {},
-      stageHistory: [],
-    };
-
-    this.transactions.set(opportunityId, lifecycleData);
-    this.transitionStage(opportunityId, TransactionStage.SUBMITTING, 'Starting submission');
-
-    let lastError: Error | undefined;
-
-    for (let attempt = 1; attempt <= this.config.maxSubmissionAttempts; attempt++) {
-      try {
-        lifecycleData.submissionAttempts = attempt;
-
-        // Submit transaction
-        const txResponse = await this.signer.sendTransaction(transaction);
-        const submissionTime = Date.now() - startTime;
-
-        // Update lifecycle data
-        lifecycleData.transactionHash = txResponse.hash;
-        this.transitionStage(opportunityId, TransactionStage.SUBMITTED, 'Transaction submitted');
-
-        // Get nonce from transaction response and reserve it
-        const nonce = txResponse.nonce || 0;
-        await this.reserveNonce(nonce);
-
-        const result: TransactionSubmissionResult = {
-          success: true,
-          transactionHash: txResponse.hash,
-          nonce: nonce,
-          gasPrice: transaction.maxFeePerGas,
-          submissionTime,
-        };
-
-        this.logger.info('Transaction submitted successfully', {
-          opportunityId,
-          transactionHash: txResponse.hash,
-          nonce: nonce,
-          attempt,
-          submissionTime,
-        });
-
-        // Emit event
-        this.emit('transactionSubmitted', {
-          opportunityId,
-          transactionHash: txResponse.hash,
-          nonce: nonce,
-          gasPrice: transaction.maxFeePerGas,
-          timestamp: Date.now(),
-        } satisfies TransactionEvents['transactionSubmitted']);
-
-        return result;
-      } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
-
-        this.logger.warn('Transaction submission attempt failed', {
-          opportunityId,
-          attempt,
-          maxAttempts: this.config.maxSubmissionAttempts,
-          error: lastError.message,
-        });
-
-        // Handle specific errors
-        if (this.isNonceError(lastError)) {
-          await this.handleNonceError(lastError);
-        }
-
-        // Wait before retry (except on last attempt)
-        if (attempt < this.config.maxSubmissionAttempts) {
-          await new Promise(resolve => setTimeout(resolve, this.config.submissionRetryDelayMs));
+      if (!gasPrice && !maxFeePerGas) {
+        const feeData = await this.provider.getFeeData();
+        if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+          maxFeePerGas = feeData.maxFeePerGas;
+          maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+        } else {
+          gasPrice = feeData.gasPrice || ethers.parseUnits('20', 'gwei');
         }
       }
-    }
 
-    // All attempts failed
-    const submissionTime = Date.now() - startTime;
-    const failureReason = lastError?.message ?? 'Unknown submission error';
+      const builtTransaction: TransactionRequest = {
+        ...request,
+        nonce,
+        gasLimit,
+        gasPrice,
+        maxFeePerGas,
+        maxPriorityFeePerGas,
+      };
 
-    this.transitionStage(opportunityId, TransactionStage.FAILED, failureReason);
-
-    this.logger.error('Transaction submission failed after all attempts', {
-      opportunityId,
-      attempts: this.config.maxSubmissionAttempts,
-      error: failureReason,
-      submissionTime,
-    });
-
-    // Emit failure event
-    this.emit('transactionFailed', {
-      opportunityId,
-      stage: TransactionStage.SUBMITTING,
-      reason: failureReason,
-      timestamp: Date.now(),
-    } satisfies TransactionEvents['transactionFailed']);
-
-    // Create appropriate transaction error for logging
-    const transactionError = this.createTransactionError(opportunityId, failureReason);
-    this.logger.debug('Transaction error created', {
-      errorType: transactionError.name,
-      opportunityId,
-    });
-
-    return {
-      success: false,
-      failureReason,
-      submissionTime,
-    };
-  }
-
-  /**
-   * Monitor transaction confirmation
-   */
-  async monitorConfirmation(
-    opportunityId: string,
-    transactionHash: string,
-    timeoutMs: number = this.config.confirmationTimeoutMs
-  ): Promise<TransactionConfirmationResult> {
-    const startTime = Date.now();
-
-    // Check if already monitoring this transaction
-    const existingPromise = this.confirmationPromises.get(opportunityId);
-    if (existingPromise) {
-      return existingPromise;
-    }
-
-    const confirmationPromise = this.doMonitorConfirmation(
-      opportunityId,
-      transactionHash,
-      timeoutMs,
-      startTime
-    );
-    this.confirmationPromises.set(opportunityId, confirmationPromise);
-
-    try {
-      const result = await confirmationPromise;
-      return result;
-    } finally {
-      this.confirmationPromises.delete(opportunityId);
-    }
-  }
-
-  /**
-   * Replace transaction (RBF)
-   */
-  async replaceTransaction(
-    opportunityId: string,
-    options: TransactionReplacementOptions
-  ): Promise<TransactionSubmissionResult> {
-    if (!this.config.enableReplacement) {
-      throw new TransactionError(
-        'Transaction replacement is disabled',
-        opportunityId,
-        TransactionStage.SUBMITTED
-      );
-    }
-
-    const lifecycleData = this.transactions.get(opportunityId);
-    if (!lifecycleData || !lifecycleData.transaction) {
-      throw new TransactionError(
-        'Transaction not found for replacement',
-        opportunityId,
-        TransactionStage.SUBMITTED
-      );
-    }
-
-    const originalTx = lifecycleData.transaction;
-    const oldHash = lifecycleData.transactionHash;
-
-    // Build replacement transaction with higher gas price using BigInt arithmetic
-    const multiplierScaled = Math.round(this.config.replacementGasMultiplier * 10000); // Scale by 10000 for precision
-    const scaleFactor = 10000n;
-
-    const newMaxFeePerGas =
-      options.newMaxFeePerGas ?? (originalTx.maxFeePerGas * BigInt(multiplierScaled)) / scaleFactor;
-    const newMaxPriorityFeePerGas =
-      options.newMaxPriorityFeePerGas ??
-      (originalTx.maxPriorityFeePerGas * BigInt(multiplierScaled)) / scaleFactor;
-
-    const replacementTx: TransactionRequest = {
-      ...originalTx,
-      maxFeePerGas: newMaxFeePerGas,
-      maxPriorityFeePerGas: newMaxPriorityFeePerGas,
-      data: options.newData ?? originalTx.data,
-    };
-
-    this.logger.info('Replacing transaction', {
-      opportunityId,
-      oldHash,
-      reason: options.reason,
-      oldGasPrice: originalTx.maxFeePerGas.toString(),
-      newGasPrice: replacementTx.maxFeePerGas.toString(),
-    });
-
-    // Submit replacement
-    const result = await this.submitTransaction(opportunityId, replacementTx);
-
-    if (result.success && result.transactionHash && oldHash) {
-      this.transitionStage(opportunityId, TransactionStage.REPLACED, options.reason);
-
-      // Emit replacement event
-      this.emit('transactionReplaced', {
-        opportunityId,
-        oldHash,
-        newHash: result.transactionHash,
-        reason: options.reason,
-        timestamp: Date.now(),
-      } satisfies TransactionEvents['transactionReplaced']);
-    }
-
-    return result;
-  }
-
-  /**
-   * Cancel transaction
-   */
-  async cancelTransaction(opportunityId: string, reason: string): Promise<boolean> {
-    const lifecycleData = this.transactions.get(opportunityId);
-    if (!lifecycleData) {
-      return false;
-    }
-
-    this.transitionStage(opportunityId, TransactionStage.CANCELLED, reason);
-
-    this.logger.info('Transaction cancelled', { opportunityId, reason });
-
-    // Emit cancellation event
-    this.emit('transactionCancelled', {
-      opportunityId,
-      reason,
-      timestamp: Date.now(),
-    } satisfies TransactionEvents['transactionCancelled']);
-
-    return true;
-  }
-
-  /**
-   * Get transaction lifecycle data
-   */
-  getTransactionData(opportunityId: string): TransactionLifecycleData | undefined {
-    const data = this.transactions.get(opportunityId);
-    return data ? { ...data } : undefined;
-  }
-
-  /**
-   * Process complete transaction lifecycle
-   */
-  async processTransaction(
-    opportunityId: string,
-    transactionBuilder: () => Promise<TransactionRequest>
-  ): Promise<TransactionConfirmationResult> {
-    const startTime = Date.now();
-
-    try {
-      // Initialize transaction lifecycle data
       const lifecycleData: TransactionLifecycleData = {
-        opportunityId,
-        stage: TransactionStage.BUILDING,
-        submissionAttempts: 0,
+        id: transactionId,
+        request: builtTransaction,
+        stage: TransactionStage.BUILT,
         createdAt: Date.now(),
         updatedAt: Date.now(),
-        metadata: {},
-        stageHistory: [],
+        attempts: 0,
+        gasEstimations: [],
+        stageHistory: [
+          {
+            stage: TransactionStage.BUILT,
+            timestamp: Date.now(),
+            metadata: { nonce, gasLimit: gasLimit.toString() },
+          },
+        ],
       };
 
-      this.transactions.set(opportunityId, lifecycleData);
+      this.transactions.set(transactionId, lifecycleData);
+      this.emit('transactionBuilt', lifecycleData);
 
-      // Build transaction
-      this.transitionStage(opportunityId, TransactionStage.BUILDING, 'Building transaction');
-      const transaction = await transactionBuilder();
-      lifecycleData.transaction = transaction;
-      this.transitionStage(opportunityId, TransactionStage.BUILT, 'Transaction built');
-
-      // Emit built event
-      this.emit('transactionBuilt', {
-        opportunityId,
-        transaction,
-        timestamp: Date.now(),
-      } satisfies TransactionEvents['transactionBuilt']);
-
-      // Simulate transaction if enabled
-      if (this.config.enableSimulation) {
-        this.transitionStage(opportunityId, TransactionStage.SIMULATING, 'Simulating transaction');
-        const simulation = await this.simulateTransaction(transaction);
-        this.transitionStage(opportunityId, TransactionStage.SIMULATED, 'Simulation completed');
-
-        // Emit simulation event
-        this.emit('transactionSimulated', {
-          opportunityId,
-          result: simulation,
-          timestamp: Date.now(),
-        } satisfies TransactionEvents['transactionSimulated']);
-
-        if (!simulation.success) {
-          throw new TransactionSimulationError(
-            opportunityId,
-            simulation.revertReason,
-            simulation.gasUsed
-          );
-        }
-      }
-
-      // Submit transaction
-      const submission = await this.submitTransaction(opportunityId, transaction);
-      if (!submission.success || !submission.transactionHash) {
-        throw new TransactionSubmissionError(
-          opportunityId,
-          submission.failureReason ?? 'Unknown error'
-        );
-      }
-
-      // Monitor confirmation
-      this.transitionStage(opportunityId, TransactionStage.PENDING, 'Monitoring confirmation');
-      const confirmation = await this.monitorConfirmation(
-        opportunityId,
-        submission.transactionHash
-      );
-
-      return confirmation;
-    } catch (error) {
-      const executionTime = Date.now() - startTime;
-      const failureReason = error instanceof Error ? error.message : String(error);
-
-      this.transitionStage(opportunityId, TransactionStage.FAILED, failureReason);
-
-      this.logger.error('Transaction lifecycle processing failed', {
-        opportunityId,
-        error: failureReason,
-        executionTime,
+      this.logger.info('Transaction built successfully', {
+        transactionId,
+        nonce,
+        gasLimit: gasLimit.toString(),
       });
 
-      return {
-        success: false,
-        failureReason,
-        confirmationTime: executionTime,
-      };
+      return lifecycleData;
+    } catch (error) {
+      // Release nonce on failure
+      const fromAddress = await this.signer.getAddress();
+      if (request.nonce !== undefined) {
+        this.releaseNonce(fromAddress, request.nonce);
+      }
+
+      const buildError = new TransactionBuildError(
+        `Failed to build transaction: ${error}`,
+        transactionId,
+        error instanceof Error ? error : new Error(String(error))
+      );
+
+      this.logger.error('Transaction build failed', { transactionId, error: buildError });
+      throw buildError;
     }
   }
 
   /**
    * Estimate gas for transaction
    */
-  private async estimateGas(
-    to: Address,
-    data: string,
-    value: bigint
-  ): Promise<GasEstimationResult> {
+  private async estimateGas(request: TransactionRequest): Promise<GasEstimationResult> {
     try {
-      // Get current gas prices
-      const feeData = await this.provider.getFeeData();
-
-      // Estimate gas limit
-      const estimatedGas = await this.provider.estimateGas({
-        to,
-        data,
-        value,
-      });
-
-      // Apply buffer to gas estimate
-      const gasLimit = BigInt(
-        Math.floor(Number(estimatedGas) * (1 + this.config.gasEstimationBuffer / 100))
-      );
-
-      const maxFeePerGas = feeData.maxFeePerGas ?? 25000000000n; // 25 gwei fallback
-      const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? 2000000000n; // 2 gwei fallback
-
-      const estimatedCost = gasLimit * maxFeePerGas;
+      const gasLimit = await this.provider.estimateGas(request);
+      const gasLimitWithBuffer = (gasLimit * BigInt(100 + this.config.gasEstimationBuffer)) / 100n;
 
       return {
-        gasLimit,
-        maxFeePerGas,
-        maxPriorityFeePerGas,
-        estimatedCost,
-        confidence: 0.8,
+        gasLimit: gasLimitWithBuffer,
+        estimatedGas: gasLimit,
+        buffer: this.config.gasEstimationBuffer,
       };
     } catch (error) {
-      this.logger.warn('Gas estimation failed, using defaults', {
-        to,
-        error: error instanceof Error ? error.message : String(error),
-      });
-
-      // Return conservative defaults
-      return {
-        gasLimit: 300000n,
-        maxFeePerGas: 30000000000n, // 30 gwei
-        maxPriorityFeePerGas: 2000000000n, // 2 gwei
-        estimatedCost: 300000n * 30000000000n,
-        confidence: 0.5,
-      };
+      throw new Error(`Gas estimation failed: ${error}`);
     }
   }
 
   /**
-   * Get next nonce for signer
+   * Helper method to create transaction errors using error types
    */
-  private async getNextNonce(): Promise<number> {
-    if (!this.config.enableNonceManagement) {
-      return await this.signer.getNonce();
-    }
-
-    const signerAddress = (await this.signer.getAddress()) as Address;
-    let nonceState = this.nonceStates.get(signerAddress);
-
-    if (!nonceState) {
-      const currentNonce = await this.signer.getNonce();
-      nonceState = {
-        address: signerAddress,
-        currentNonce,
-        pendingNonces: new Set(),
-        lastUpdated: Date.now(),
-      };
-      this.nonceStates.set(signerAddress, nonceState);
-    }
-
-    // Find next available nonce
-    let nextNonce = nonceState.currentNonce;
-    while (nonceState.pendingNonces.has(nextNonce)) {
-      nextNonce++;
-    }
-
-    return nextNonce;
+  private createTransactionError(opportunityId: string, message: string): TransactionReplacedError {
+    this.logger.debug('Creating transaction error', { opportunityId, message });
+    return new TransactionReplacedError(opportunityId, 'old-hash', 'new-hash');
   }
 
   /**
-   * Reserve nonce to prevent conflicts
+   * Convert ethers TransactionReceipt to our TransactionReceipt type
    */
-  private async reserveNonce(nonce: number): Promise<void> {
-    if (!this.config.enableNonceManagement) return;
-
-    const signerAddress = (await this.signer.getAddress()) as Address;
-    const nonceState = this.nonceStates.get(signerAddress);
-    if (nonceState) {
-      nonceState.pendingNonces.add(nonce);
-      nonceState.currentNonce = Math.max(nonceState.currentNonce, nonce + 1);
-      nonceState.lastUpdated = Date.now();
-    }
-  }
-
-  /**
-   * Release nonce after confirmation or failure
-   */
-  private async releaseNonce(nonce: number): Promise<void> {
-    if (!this.config.enableNonceManagement) return;
-
-    const signerAddress = (await this.signer.getAddress()) as Address;
-    const nonceState = this.nonceStates.get(signerAddress);
-    if (nonceState) {
-      nonceState.pendingNonces.delete(nonce);
-      nonceState.lastUpdated = Date.now();
-    }
-  }
-
-  /**
-   * Initialize nonce state for signer
-   */
-  private async initializeNonceState(): Promise<void> {
-    if (!this.config.enableNonceManagement) return;
-
-    const signerAddress = (await this.signer.getAddress()) as Address;
-    const currentNonce = await this.signer.getNonce();
-
-    this.nonceStates.set(signerAddress, {
-      address: signerAddress,
-      currentNonce,
-      pendingNonces: new Set(),
-      lastUpdated: Date.now(),
-    });
-
-    this.logger.debug('Nonce state initialized', {
-      address: signerAddress,
-      currentNonce,
-    });
-  }
-
-  /**
-   * Handle nonce-related errors
-   */
-  private async handleNonceError(error: Error): Promise<void> {
-    if (!this.config.nonceGapRecovery) return;
-
-    // Try to extract nonce information from error and recover
-    this.logger.warn('Handling nonce error', { error: error.message });
-
-    // Check if this is a nonce gap error and create appropriate error
-    const nonceMatch = error.message.match(/nonce.*?(\d+).*?(\d+)/);
-    if (nonceMatch && nonceMatch[1] && nonceMatch[2]) {
-      const expected = parseInt(nonceMatch[1]);
-      const actual = parseInt(nonceMatch[2]);
-      const nonceGapError = this.createNonceGapError('nonce-recovery', expected, actual);
-      this.logger.error('Nonce gap detected', {
-        expected,
-        actual,
-        error: nonceGapError.message,
-      });
-    }
-
-    // Refresh nonce state
-    await this.initializeNonceState();
-  }
-
-  /**
-   * Helper method to create nonce gap errors using NonceGapError type
-   */
-  private createNonceGapError(
-    opportunityId: string,
-    expected: number,
-    actual: number
-  ): NonceGapError {
-    this.logger.debug('Creating nonce gap error', { opportunityId, expected, actual });
-    return new NonceGapError(opportunityId, expected, actual);
-  }
-
-  /**
-   * Check if error is nonce-related
-   */
-  private isNonceError(error: Error): boolean {
-    const message = error.message.toLowerCase();
-    return (
-      message.includes('nonce') ||
-      message.includes('replacement transaction underpriced') ||
-      message.includes('already known')
-    );
-  }
-
-  /**
-   * Transition transaction stage
-   */
-  private transitionStage(
-    opportunityId: string,
-    newStage: TransactionStage,
-    reason?: string
-  ): void {
-    const lifecycleData = this.transactions.get(opportunityId);
-    if (!lifecycleData) return;
-
-    const transition: TransactionStageTransition = {
-      from: lifecycleData.stage,
-      to: newStage,
-      timestamp: Date.now(),
-      reason,
+  private convertReceipt(ethersReceipt: any): TransactionReceipt {
+    return {
+      transactionHash: ethersReceipt.hash || ethersReceipt.transactionHash,
+      blockNumber: ethersReceipt.blockNumber,
+      blockHash: ethersReceipt.blockHash,
+      transactionIndex: ethersReceipt.index || ethersReceipt.transactionIndex || 0,
+      from: ethersReceipt.from,
+      to: ethersReceipt.to,
+      gasUsed: ethersReceipt.gasUsed,
+      effectiveGasPrice: ethersReceipt.gasPrice || ethersReceipt.effectiveGasPrice,
+      status: ethersReceipt.status,
+      logs: ethersReceipt.logs || [],
+      cumulativeGasUsed: ethersReceipt.cumulativeGasUsed || ethersReceipt.gasUsed,
     };
-
-    lifecycleData.stage = newStage;
-    lifecycleData.updatedAt = Date.now();
-    lifecycleData.stageHistory.push(transition);
-
-    this.logger.debug('Transaction stage transition', {
-      opportunityId,
-      from: transition.from,
-      to: newStage,
-      reason,
-    });
-  }
-
-  /**
-   * Monitor confirmation implementation
-   */
-  private async doMonitorConfirmation(
-    opportunityId: string,
-    transactionHash: string,
-    timeoutMs: number,
-    startTime: number
-  ): Promise<TransactionConfirmationResult> {
-    this.transitionStage(opportunityId, TransactionStage.CONFIRMING, 'Monitoring confirmation');
-
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        reject(new TransactionTimeoutError(opportunityId, transactionHash, timeoutMs));
-      }, timeoutMs);
-    });
-
-    try {
-      const receipt = await Promise.race([
-        this.provider.waitForTransaction(transactionHash, this.config.confirmationBlocks),
-        timeoutPromise,
-      ]);
-
-      if (!receipt) {
-        throw new TransactionConfirmationError(
-          opportunityId,
-          transactionHash,
-          'No receipt received'
-        );
-      }
-
-      const confirmationTime = Date.now() - startTime;
-
-      // Update lifecycle data
-      const lifecycleData = this.transactions.get(opportunityId);
-      if (lifecycleData) {
-        lifecycleData.receipt = this.convertReceipt(receipt);
-        lifecycleData.gasUsed = receipt.gasUsed;
-        lifecycleData.effectiveGasPrice = receipt.gasPrice;
-
-        // Release nonce after successful confirmation - get nonce from transaction response stored earlier
-        if (receipt.status === 1) {
-          // Get the transaction to access the nonce
-          const txResponse = await this.provider.getTransaction(transactionHash);
-          if (txResponse && txResponse.nonce !== undefined) {
-            await this.releaseNonce(txResponse.nonce);
-          }
-        }
-      }
-
-      if (receipt.status === 1) {
-        this.transitionStage(opportunityId, TransactionStage.CONFIRMED, 'Transaction confirmed');
-
-        this.logger.info('Transaction confirmed successfully', {
-          opportunityId,
-          transactionHash,
-          blockNumber: receipt.blockNumber,
-          gasUsed: receipt.gasUsed.toString(),
-          confirmationTime,
-        });
-
-        // Emit confirmation event
-        this.emit('transactionConfirmed', {
-          opportunityId,
-          receipt: this.convertReceipt(receipt),
-          confirmationTime,
-          timestamp: Date.now(),
-        } satisfies TransactionEvents['transactionConfirmed']);
-
-        return {
-          success: true,
-          receipt: this.convertReceipt(receipt),
-          confirmationTime,
-          blockNumber: receipt.blockNumber,
-          gasUsed: receipt.gasUsed,
-          effectiveGasPrice: receipt.gasPrice,
-        };
-      } else {
-        this.transitionStage(opportunityId, TransactionStage.FAILED, 'Transaction reverted');
-
-        const failureReason = 'Transaction reverted on-chain';
-
-        this.logger.error('Transaction reverted', {
-          opportunityId,
-          transactionHash,
-          blockNumber: receipt.blockNumber,
-          confirmationTime,
-        });
-
-        // Emit failure event
-        this.emit('transactionFailed', {
-          opportunityId,
-          stage: TransactionStage.CONFIRMING,
-          reason: failureReason,
-          transactionHash,
-          timestamp: Date.now(),
-        } satisfies TransactionEvents['transactionFailed']);
-
-        return {
-          success: false,
-          receipt: this.convertReceipt(receipt),
-          confirmationTime,
-          failureReason,
-        };
-      }
-    } catch (error) {
-      const confirmationTime = Date.now() - startTime;
-      const failureReason = error instanceof Error ? error.message : String(error);
-
-      this.transitionStage(opportunityId, TransactionStage.FAILED, failureReason);
-
-      this.logger.error('Transaction confirmation failed', {
-        opportunityId,
-        transactionHash,
-        error: failureReason,
-        confirmationTime,
-      });
-
-      // Emit failure event
-      this.emit('transactionFailed', {
-        opportunityId,
-        stage: TransactionStage.CONFIRMING,
-        reason: failureReason,
-        transactionHash,
-        timestamp: Date.now(),
-      } satisfies TransactionEvents['transactionFailed']);
-
-      return {
-        success: false,
-        confirmationTime,
-        failureReason,
-      };
-    }
-  }
-
-  /**
-   * Monitor pending transactions for status updates
-   */
-  private async monitorPendingTransactions(): Promise<void> {
-    // Get current pool status for monitoring context
-    const poolStatus = this.createPoolStatus();
-
-    const pendingTransactions = Array.from(this.transactions.values()).filter(
-      tx => tx.stage === TransactionStage.PENDING || tx.stage === TransactionStage.CONFIRMING
-    );
-
-    this.logger.debug('Monitoring pending transactions', {
-      pendingCount: pendingTransactions.length,
-      poolStatus: poolStatus.congestionLevel,
-    });
-
-    for (const tx of pendingTransactions) {
-      if (!tx.transactionHash) continue;
-
-      try {
-        const receipt = await this.provider.getTransactionReceipt(tx.transactionHash);
-        if (receipt && !this.confirmationPromises.has(tx.opportunityId)) {
-          // Transaction was confirmed outside of our monitoring
-          this.logger.info('Detected external transaction confirmation', {
-            opportunityId: tx.opportunityId,
-            transactionHash: tx.transactionHash,
-          });
-        }
-      } catch (error) {
-        // Transaction might have been replaced or dropped
-        this.logger.debug('Error checking transaction status', {
-          opportunityId: tx.opportunityId,
-          transactionHash: tx.transactionHash,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
   }
 }

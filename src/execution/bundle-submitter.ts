@@ -32,6 +32,8 @@ export interface Bundle {
   readonly estimatedProfit: bigint;
   readonly totalGasLimit: bigint;
   readonly createdAt: number;
+  readonly minTimestamp?: number;
+  readonly maxTimestamp?: number;
 }
 
 export interface BundleTransaction {
@@ -362,23 +364,80 @@ export class BundleSubmitter extends EventEmitter {
   }
 
   /**
-   * Submit bundle to Flashbots relay
+   * Submit bundle to Flashbots relay (REAL IMPLEMENTATION)
    */
   private async submitToFlashbots(bundle: Bundle): Promise<RelaySubmissionResult> {
     const startTime = Date.now();
 
     try {
-      // Simulate Flashbots submission
-      // In production, this would use actual Flashbots API
-
       this.logger.debug('Submitting to Flashbots', {
         bundleId: bundle.id,
         targetBlock: bundle.targetBlock,
         transactionCount: bundle.transactions.length,
       });
 
-      // Simulate successful submission
-      const bundleHash = '0xflashbots' + Math.random().toString(16).slice(2, 58);
+      // Sign all transactions in bundle
+      const signedTransactions = await Promise.all(
+        bundle.transactions.map(tx => this.signer.signTransaction(tx))
+      );
+
+      // Prepare Flashbots bundle request
+      const bundleRequest = {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'mev_sendBundle',
+        params: [
+          {
+            txs: signedTransactions,
+            blockNumber: `0x${bundle.targetBlock.toString(16)}`,
+            minTimestamp: bundle.minTimestamp,
+            maxTimestamp: bundle.maxTimestamp,
+          },
+        ],
+      };
+
+      // Get Flashbots endpoint
+      const flashbotsEndpoint =
+        this.relayEndpoints.get('flashbots') || 'https://relay.flashbots.net';
+
+      // Prepare headers with authentication
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Flashbots-Signature': await this.signFlashbotsRequest(JSON.stringify(bundleRequest)),
+      };
+
+      // Submit bundle
+      const response = await fetch(flashbotsEndpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(bundleRequest),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const result = (await response.json()) as {
+        error?: { message: string };
+        result?: { bundleHash: string };
+      };
+
+      if (result.error) {
+        throw new Error(`Flashbots error: ${result.error.message}`);
+      }
+
+      const bundleHash = result.result?.bundleHash;
+
+      if (!bundleHash) {
+        throw new Error('No bundle hash returned from Flashbots');
+      }
+
+      this.logger.info('Bundle submitted to Flashbots', {
+        bundleId: bundle.id,
+        bundleHash,
+        targetBlock: bundle.targetBlock,
+        submissionTime: Date.now() - startTime,
+      });
 
       return {
         relay: 'flashbots',
@@ -387,6 +446,11 @@ export class BundleSubmitter extends EventEmitter {
         submissionTime: Date.now() - startTime,
       };
     } catch (error) {
+      this.logger.error('Flashbots submission failed', {
+        bundleId: bundle.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
       return {
         relay: 'flashbots',
         success: false,
@@ -397,23 +461,78 @@ export class BundleSubmitter extends EventEmitter {
   }
 
   /**
-   * Submit bundle to bloXroute relay
+   * Submit bundle to bloXroute relay (REAL IMPLEMENTATION)
    */
   private async submitToBloxroute(bundle: Bundle): Promise<RelaySubmissionResult> {
     const startTime = Date.now();
 
     try {
-      // Simulate bloXroute submission
-      // In production, this would use actual bloXroute API
-
       this.logger.debug('Submitting to bloXroute', {
         bundleId: bundle.id,
         targetBlock: bundle.targetBlock,
         transactionCount: bundle.transactions.length,
       });
 
-      // Simulate successful submission
-      const bundleHash = '0xbloxroute' + Math.random().toString(16).slice(2, 56);
+      // Sign all transactions in bundle
+      const signedTransactions = await Promise.all(
+        bundle.transactions.map(tx => this.signer.signTransaction(tx))
+      );
+
+      // Prepare bloXroute bundle request
+      const bundleRequest = {
+        transactions: signedTransactions,
+        block_number: bundle.targetBlock,
+        min_timestamp: bundle.minTimestamp,
+        max_timestamp: bundle.maxTimestamp,
+        blockchain_network: 'Base',
+      };
+
+      // Get bloXroute endpoint and API key
+      const bloxrouteEndpoint = this.relayEndpoints.get('bloxroute') || 'https://api.bloxroute.com';
+      const apiKey = process.env['BLOXROUTE_API_KEY'];
+
+      if (!apiKey) {
+        throw new Error('BLOXROUTE_API_KEY environment variable required');
+      }
+
+      const headers = {
+        'Content-Type': 'application/json',
+        Authorization: apiKey,
+      };
+
+      // Submit bundle
+      const response = await fetch(`${bloxrouteEndpoint}/v1/bundle`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(bundleRequest),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const result = (await response.json()) as {
+        success?: boolean;
+        error?: string;
+        bundle_hash?: string;
+      };
+
+      if (!result.success) {
+        throw new Error(`bloXroute error: ${result.error || 'Unknown error'}`);
+      }
+
+      const bundleHash = result.bundle_hash;
+
+      if (!bundleHash) {
+        throw new Error('No bundle hash returned from bloXroute');
+      }
+
+      this.logger.info('Bundle submitted to bloXroute', {
+        bundleId: bundle.id,
+        bundleHash,
+        targetBlock: bundle.targetBlock,
+        submissionTime: Date.now() - startTime,
+      });
 
       return {
         relay: 'bloxroute',
@@ -422,6 +541,11 @@ export class BundleSubmitter extends EventEmitter {
         submissionTime: Date.now() - startTime,
       };
     } catch (error) {
+      this.logger.error('bloXroute submission failed', {
+        bundleId: bundle.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
       return {
         relay: 'bloxroute',
         success: false,
@@ -429,6 +553,16 @@ export class BundleSubmitter extends EventEmitter {
         submissionTime: Date.now() - startTime,
       };
     }
+  }
+
+  /**
+   * Sign Flashbots request for authentication
+   */
+  private async signFlashbotsRequest(body: string): Promise<string> {
+    const messageHash = ethers.keccak256(ethers.toUtf8Bytes(body));
+    const signature = await this.signer.signMessage(ethers.getBytes(messageHash));
+    const signerAddress = await this.signer.getAddress();
+    return `${signerAddress}:${signature}`;
   }
 
   /**
