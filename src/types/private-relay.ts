@@ -111,6 +111,7 @@ export interface RelaySubmissionResult {
   failureReason?: string;
   retryCount: number;
   timestamp: number;
+  pending?: boolean;
 }
 
 /**

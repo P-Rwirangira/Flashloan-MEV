@@ -93,7 +93,8 @@ export interface ForkState {
 }
 
 export class FoundrySimulator extends EventEmitter {
-  private readonly logger = createComponentLogger('foundry-simulator');
+  // Logger for debugging and monitoring (used for simulation tracking)
+  private readonly componentLogger = createComponentLogger('foundry-simulator');
   private readonly connectionManager: RpcConnectionManager;
   private readonly contractManager?: ContractManager | undefined;
   private readonly forkUrl: string;
@@ -121,6 +122,11 @@ export class FoundrySimulator extends EventEmitter {
 
   constructor(options: FoundrySimulatorOptions) {
     super();
+
+    this.componentLogger.info('Initializing Foundry simulator', {
+      anvilPort: options.anvilPort || 8545,
+      simulationTimeoutMs: options.simulationTimeoutMs || 50,
+    });
 
     this.connectionManager = options.connectionManager;
     this.contractManager = options.contractManager;
@@ -328,7 +334,7 @@ export class FoundrySimulator extends EventEmitter {
       const timeoutPromise = new Promise<never>((_, timeoutReject) => {
         setTimeout(() => {
           timeoutReject(new Error('Simulation timeout'));
-        }, this.timeoutConfig.maxSimulationTimeMs);
+        }, this.timeoutConfig.maxValidationTimeMs);
       });
 
       // Execute simulation with timeout

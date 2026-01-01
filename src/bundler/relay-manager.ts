@@ -42,6 +42,7 @@ export interface RelaySubmissionResult {
   profit?: bigint | undefined;
   latency: number;
   blockNumber?: number | undefined;
+  pending?: boolean | undefined;
 }
 
 export interface RelayManagerOptions {
@@ -76,6 +77,7 @@ export class RelayManager extends EventEmitter {
   // Relay implementations
   private flashbotsRelay?: FlashbotsRelay | undefined;
   private bloxrouteRelay?: BloXrouteRelay | undefined;
+  private initialized = false;
 
   constructor(options: RelayManagerOptions) {
     super();
@@ -115,21 +117,37 @@ export class RelayManager extends EventEmitter {
     );
 
     if (flashbotsConfig) {
-      // Validate Flashbots auth key
-      const flashbotsAuthKey = process.env['FLASHBOTS_AUTH_KEY'];
-      if (!flashbotsAuthKey || flashbotsAuthKey.trim() === '') {
-        throw new Error('FLASHBOTS_AUTH_KEY environment variable is required but not set or empty');
+      // Check if Flashbots is supported on current network
+      const supportedNetworks = ['mainnet', 'goerli', 'sepolia'];
+      const currentNetwork = 'base'; // This should be configurable in a real implementation
+
+      if (!supportedNetworks.includes(currentNetwork)) {
+        this.logger.warn(
+          `Flashbots not supported on network: ${currentNetwork}. Skipping Flashbots initialization.`,
+          {
+            supportedNetworks,
+            currentNetwork,
+          }
+        );
+      } else {
+        // Validate Flashbots auth key
+        const flashbotsAuthKey = process.env['FLASHBOTS_AUTH_KEY'];
+        if (!flashbotsAuthKey || flashbotsAuthKey.trim() === '') {
+          throw new Error(
+            'FLASHBOTS_AUTH_KEY environment variable is required but not set or empty'
+          );
+        }
+
+        this.flashbotsRelay = new FlashbotsRelay({
+          connectionManager: this.connectionManager,
+          wallet: this.wallet,
+          authSignerPrivateKey: flashbotsAuthKey,
+          network: currentNetwork,
+        });
+
+        await this.flashbotsRelay.initialize();
+        this.logger.info('Flashbots relay initialized');
       }
-
-      this.flashbotsRelay = new FlashbotsRelay({
-        connectionManager: this.connectionManager,
-        wallet: this.wallet,
-        authSignerPrivateKey: flashbotsAuthKey,
-        network: 'base',
-      });
-
-      await this.flashbotsRelay.initialize();
-      this.logger.info('Flashbots relay initialized');
     }
 
     // Initialize bloXroute relay if configured
@@ -148,6 +166,7 @@ export class RelayManager extends EventEmitter {
       this.logger.info('bloXroute relay initialized');
     }
 
+    this.initialized = true;
     this.logger.info('Relay implementations initialized successfully');
   }
 
@@ -163,6 +182,11 @@ export class RelayManager extends EventEmitter {
       timeout?: number | undefined;
     }
   ): Promise<RelaySubmissionResult> {
+    // Check if RelayManager has been initialized
+    if (!this.initialized) {
+      throw new Error('RelayManager not initialized: call initialize() before submitTransaction');
+    }
+
     const operationId = `relay-submit-${Date.now()}`;
     this.logger.startPerformanceTracking(operationId);
 
@@ -588,12 +612,12 @@ export class RelayManager extends EventEmitter {
           // Transaction is still pending, spawn background watcher
           this.spawnBackgroundWatcher(tx);
 
-          // Return immediately with pending status
+          // Return success: true with pending: true to indicate submission succeeded but is unconfirmed
           return {
-            success: false,
+            success: true,
+            pending: true,
             relayProvider: relay.provider,
             transactionHash: tx.hash,
-            error: `Transaction pending after ${timeout}ms timeout`,
             latency: Date.now() - startTime,
           };
         }

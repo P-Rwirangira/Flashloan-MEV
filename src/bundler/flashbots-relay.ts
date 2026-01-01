@@ -47,13 +47,19 @@ export class FlashbotsRelay {
     this.wallet = options.wallet;
     this.network = options.network || 'base';
 
-    // Flashbots RPC URLs by network
+    // Flashbots RPC URLs by network (Base is not supported by Flashbots)
     const flashbotsUrls: Record<string, string> = {
       mainnet: 'https://relay.flashbots.net',
       goerli: 'https://relay-goerli.flashbots.net',
       sepolia: 'https://relay-sepolia.flashbots.net',
-      base: 'https://rpc.flashbots.net', // Flashbots Protect for Base
     };
+
+    // Check if network is supported by Flashbots
+    if (!flashbotsUrls[this.network]) {
+      throw new Error(
+        `Flashbots not supported on network: ${this.network}. Supported networks: ${Object.keys(flashbotsUrls).join(', ')}`
+      );
+    }
 
     this.flashbotsRpcUrl =
       options.flashbotsRpcUrl ?? flashbotsUrls[this.network] ?? 'https://rpc.flashbots.net';

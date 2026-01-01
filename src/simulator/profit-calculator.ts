@@ -12,6 +12,7 @@ import { GasEstimator } from './gas-estimator';
 import { RpcConnectionManager } from '../rpc/connection-manager';
 import { ChainlinkPriceOracleImpl } from '../oracles/chainlink-oracle';
 import { AdvancedGasOptimizer } from './advanced-gas-optimizer';
+import { createComponentLogger } from '../utils/logger';
 
 export interface ProfitCalculatorOptions {
   readonly gasEstimator: GasEstimator;
@@ -247,7 +248,7 @@ export class EnhancedPriceOracle implements IPriceOracle {
             this.provider
           );
 
-          const poolAddress = await factoryContract['getPool'](tokenAddress, WETH_ADDRESS, fee);
+          const poolAddress = await factoryContract?.['getPool']?.(tokenAddress, WETH_ADDRESS, fee);
 
           if (poolAddress && poolAddress !== ethers.ZeroAddress) {
             // Get pool state
@@ -262,8 +263,8 @@ export class EnhancedPriceOracle implements IPriceOracle {
             );
 
             const [slot0, token0] = await Promise.all([
-              poolContract['slot0'](),
-              poolContract['token0'](),
+              poolContract?.['slot0']?.(),
+              poolContract?.['token0']?.(),
             ]);
 
             if (slot0.sqrtPriceX96 > 0) {
@@ -316,7 +317,11 @@ export class EnhancedPriceOracle implements IPriceOracle {
       // Try both stable and volatile pools
       for (const stable of [false, true]) {
         try {
-          const poolAddress = await factoryContract['getPool'](tokenAddress, WETH_ADDRESS, stable);
+          const poolAddress = await factoryContract?.['getPool']?.(
+            tokenAddress,
+            WETH_ADDRESS,
+            stable
+          );
 
           if (poolAddress && poolAddress !== ethers.ZeroAddress) {
             const poolContract = new ethers.Contract(
@@ -330,8 +335,8 @@ export class EnhancedPriceOracle implements IPriceOracle {
             );
 
             const [reserves, token0] = await Promise.all([
-              poolContract['getReserves'](),
-              poolContract['token0'](),
+              poolContract?.['getReserves']?.(),
+              poolContract?.['token0']?.(),
             ]);
 
             if (reserves.reserve0 > 0 && reserves.reserve1 > 0) {

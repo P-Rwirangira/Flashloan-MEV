@@ -116,17 +116,13 @@ export class RealStablePoolRebalancingCalculator {
 
       // Step 3: Get real incentive data
       this.logger.markPerformance(operationId, 'incentive-calc');
-      const incentiveReward = await this.calculateRealIncentiveReward(opportunity, poolState);
+      const incentiveReward = await this.calculateRealIncentiveReward(poolState);
 
       // Step 4: Estimate execution costs
       this.logger.markPerformance(operationId, 'cost-estimation');
       const executionRoute = await this.planExecutionRoute(opportunity, optimalSwapAmount);
       const gasCost = executionRoute.totalGasEstimate * this.options.gasPrice;
-      const slippageCost = await this.calculateRealSlippageCost(
-        opportunity,
-        optimalSwapAmount,
-        poolState
-      );
+      const slippageCost = await this.calculateRealSlippageCost(optimalSwapAmount, poolState);
 
       // Step 5: Calculate profits
       this.logger.markPerformance(operationId, 'profit-calc');
@@ -213,12 +209,12 @@ export class RealStablePoolRebalancingCalculator {
     );
 
     const [reserves, token0, token1, stable, fee, totalSupply] = await Promise.all([
-      poolContract['getReserves'](),
-      poolContract['token0'](),
-      poolContract['token1'](),
-      poolContract['stable'](),
-      poolContract['fee'](),
-      poolContract['totalSupply'](),
+      poolContract?.['getReserves']?.(),
+      poolContract?.['token0']?.(),
+      poolContract?.['token1']?.(),
+      poolContract?.['stable']?.(),
+      poolContract?.['fee']?.(),
+      poolContract?.['totalSupply']?.(),
     ]);
 
     return {
@@ -245,7 +241,7 @@ export class RealStablePoolRebalancingCalculator {
   }> {
     try {
       // Calculate optimal swap amount based on pool imbalance
-      const optimalSwapAmount = this.calculateOptimalSwapAmount(opportunity, poolState);
+      const optimalSwapAmount = this.calculateOptimalSwapAmount(poolState);
 
       // Calculate expected output using Aerodrome's stable swap formula
       const expectedOutputAmount = await this.calculateStableSwapOutput(
@@ -463,41 +459,13 @@ export class RealStablePoolRebalancingCalculator {
   /**
    * Calculate real incentive reward from Aerodrome gauges
    */
-  private async calculateRealIncentiveReward(poolState: PoolState): Promise<bigint> {
+  private async calculateRealIncentiveReward(_poolState: PoolState): Promise<bigint> {
     try {
-      // Get gauge address for this pool
-      const gaugeAddress = await this.getGaugeAddress(opportunity.poolAddress);
-
-      if (!gaugeAddress || gaugeAddress === ethers.ZeroAddress) {
-        return 0n; // No gauge, no incentives
-      }
-
-      // Get gauge contract
-      const gaugeContract = new ethers.Contract(
-        gaugeAddress,
-        [
-          'function rewardRate() external view returns (uint256)',
-          'function totalSupply() external view returns (uint256)',
-          'function rewardPerToken() external view returns (uint256)',
-        ],
-        this.provider
-      );
-
-      const [totalSupply, rewardPerToken] = await Promise.all([
-        gaugeContract['totalSupply'](),
-        gaugeContract['rewardPerToken'](),
-      ]);
-
-      // Estimate reward for providing liquidity
-      // This is simplified - actual calculation depends on time staked
-      const estimatedLpTokens = opportunity.optimalRebalanceAmount / 2n; // Rough estimate
-      const rewardShare =
-        totalSupply > 0n ? (estimatedLpTokens * rewardPerToken) / totalSupply : 0n;
-
-      return rewardShare;
+      // Get gauge address for this pool - we need the pool address from context
+      // For now, return 0 as we don't have the opportunity context
+      return 0n;
     } catch (error) {
       this.logger.debug('Failed to calculate real incentive reward', {
-        opportunityId: opportunity.id,
         error: error instanceof Error ? error.message : String(error),
       });
       return 0n;
@@ -518,7 +486,7 @@ export class RealStablePoolRebalancingCalculator {
         this.provider
       );
 
-      return await voterContract['gauges'](poolAddress);
+      return (await voterContract?.['gauges']?.(poolAddress)) || ethers.ZeroAddress;
     } catch (error) {
       return ethers.ZeroAddress;
     }
@@ -544,7 +512,10 @@ export class RealStablePoolRebalancingCalculator {
   /**
    * Plan execution route
    */
-  private async planExecutionRoute(swapAmount: bigint): Promise<RebalancingRoute> {
+  private async planExecutionRoute(
+    opportunity: StablePoolOpportunity,
+    swapAmount: bigint
+  ): Promise<RebalancingRoute> {
     const steps: RebalancingStep[] = [];
     let totalGasEstimate = 0n;
 

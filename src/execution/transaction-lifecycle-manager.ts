@@ -418,10 +418,10 @@ export class TransactionLifecycleManager
 
     try {
       // Use eth_call to simulate transaction execution
-      const result = await this.provider.call({
+      const callResult = await this.provider.call({
         to: transaction.to,
         data: transaction.data,
-        value: transaction.value,
+        value: transaction.value || null,
         gasLimit: transaction.gasLimit,
         gasPrice: transaction.maxFeePerGas,
       });
@@ -430,14 +430,14 @@ export class TransactionLifecycleManager
       const gasUsed = await this.provider.estimateGas({
         to: transaction.to,
         data: transaction.data,
-        value: transaction.value,
+        value: transaction.value || null,
       });
 
       return {
         success: true,
         gasUsed,
         simulationTime: Date.now() - startTime,
-        result,
+        returnData: callResult, // Use returnData property to match interface
       };
     } catch (error) {
       // Parse revert reason if available
@@ -445,7 +445,7 @@ export class TransactionLifecycleManager
       if (error instanceof Error) {
         // Try to extract revert reason from error message
         const match = error.message.match(/revert (.+)/);
-        if (match) {
+        if (match && match[1]) {
           revertReason = match[1];
         } else {
           revertReason = error.message;

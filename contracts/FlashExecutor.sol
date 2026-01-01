@@ -187,16 +187,27 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
     ) external override onlyAuthorizedPool {
         require(amount0Delta > 0 || amount1Delta > 0, "Invalid swap");
         
+        // Compute the actual owed amount from deltas (positive delta is what we owe)
+        uint256 actualAmountOwed;
+        if (amount0Delta > 0) {
+            actualAmountOwed = uint256(amount0Delta);
+        } else {
+            actualAmountOwed = uint256(amount1Delta);
+        }
+        
         // Decode callback data to get payer and token info
-        (address tokenIn, address payer, uint256 amountOwed) = abi.decode(data, (address, address, uint256));
+        (address tokenIn, address payer, uint256 decodedAmountOwed) = abi.decode(data, (address, address, uint256));
+        
+        // Validate that decoded amount matches computed amount for security
+        require(decodedAmountOwed == actualAmountOwed, "Amount mismatch: decoded vs computed");
         
         // Transfer owed tokens to pool - handle self-payment case
         if (payer == address(this)) {
-            // Contract is paying from its own balance
-            IERC20(tokenIn).safeTransfer(msg.sender, amountOwed);
+            // Contract is paying from its own balance using delta-derived amount
+            IERC20(tokenIn).safeTransfer(msg.sender, actualAmountOwed);
         } else {
-            // External payer needs approval
-            IERC20(tokenIn).safeTransferFrom(payer, msg.sender, amountOwed);
+            // External payer needs approval using delta-derived amount
+            IERC20(tokenIn).safeTransferFrom(payer, msg.sender, actualAmountOwed);
         }
     }
 

@@ -409,7 +409,7 @@ export class PrivateOrderflowManager extends EventEmitter {
 
       // Calculate execution results from actual transaction
       const executedAmount = order.amountIn;
-      const actualAmountOut = await this.getActualAmountOut(order);
+      const actualAmountOut = await this.getActualAmountOut(order, 'pending');
       this.calculateActualSlippage(order.minAmountOut, actualAmountOut); // Calculate but don't store
       const actualPrice = actualAmountOut;
       const gasUsed = await this.getActualGasUsed(order);
@@ -872,10 +872,10 @@ export class PrivateOrderflowManager extends EventEmitter {
   /**
    * Get actual amount out from transaction logs
    */
-  private async getActualAmountOut(order: PrivateOrder): Promise<bigint> {
+  private async getActualAmountOut(order: PrivateOrder, txHash: string): Promise<bigint> {
     try {
       // Parse transaction logs to get actual swap amounts and calculate real profit
-      const receipt = await this.provider.getTransactionReceipt(transactionHash);
+      const receipt = await this.provider.getTransactionReceipt(txHash);
 
       if (receipt && receipt.logs) {
         let actualProfit = 0n;

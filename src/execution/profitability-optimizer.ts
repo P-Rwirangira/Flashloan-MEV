@@ -102,6 +102,7 @@ export class ProfitabilityOptimizer extends EventEmitter {
   private readonly logger = createComponentLogger('profitability-optimizer');
   private readonly config: ProfitabilityOptimizerConfig;
   private readonly connectionManager: RpcConnectionManager;
+  // Provider for blockchain interactions (used for gas estimation and validation)
   private readonly provider: ethers.Provider;
 
   // Market condition tracking
@@ -368,10 +369,10 @@ export class ProfitabilityOptimizer extends EventEmitter {
           const poolContract = new ethers.Contract(
             poolAddress,
             ['function liquidity() external view returns (uint128)'],
-            this.connectionManager.getProvider()
+            this.provider // Use the provider for contract calls
           );
 
-          const liquidity = await poolContract.liquidity();
+          const liquidity = await poolContract?.['liquidity']?.();
           totalLiquidity += liquidity;
           poolCount++;
         } catch (error) {

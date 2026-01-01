@@ -77,7 +77,7 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
   private readonly stateMachine: OpportunityStateMachine;
   private readonly flashLoanManager: FlashLoanManager;
   private readonly transactionManager: TransactionLifecycleManager;
-  private readonly transactionValidator?: RealTransactionValidator;
+  private readonly transactionValidator: RealTransactionValidator | undefined;
 
   private readonly flashExecutorInterface: ethers.Interface;
 
@@ -233,7 +233,7 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
 
       // Validate opportunity using real transaction validator before execution
       if (this.transactionValidator) {
-        const validationResult = await this.transactionValidator.validate(arbOpp);
+        const validationResult = await this.transactionValidator.validate(arbOpp as any);
         if (!validationResult.success) {
           throw new Error(`Opportunity validation failed: ${validationResult.error}`);
         }
@@ -309,7 +309,7 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
     try {
       // Use transaction validator for accurate gas estimation if available
       if (this.transactionValidator) {
-        const validationResult = await this.transactionValidator.validate(arbOpp);
+        const validationResult = await this.transactionValidator.validate(arbOpp as any);
         if (validationResult.success) {
           return validationResult.gasUsed;
         }
@@ -418,39 +418,6 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
       });
       throw error;
     }
-  }
-
-  /**
-   * Validate profitability of execution plan
-   */
-  private async validateProfitability(
-    plan: RouteExecutionPlan,
-    opportunity: ArbitrageOpportunity
-  ): Promise<void> {
-    // Check if net profit is still positive
-    if (plan.netProfit <= 0n) {
-      throw new Error(`Execution would be unprofitable: net profit ${plan.netProfit}`);
-    }
-
-    // Check if profit meets minimum threshold
-    const netProfitUsd = Number(plan.netProfit) / 1e18;
-    if (netProfitUsd < this.config.minProfitThresholdUsd) {
-      throw new Error(
-        `Net profit ${netProfitUsd} below threshold ${this.config.minProfitThresholdUsd}`
-      );
-    }
-
-    // Validate slippage tolerance
-    const maxSlippage = BigInt(this.config.maxSlippageBps);
-    const slippageTolerance = (opportunity.expectedAmountOut * maxSlippage) / 10000n;
-    const minAmountOut = opportunity.expectedAmountOut - slippageTolerance;
-
-    this.logger.debug('Profitability validation passed', {
-      opportunityId: opportunity.id,
-      netProfitUsd,
-      minAmountOut: minAmountOut.toString(),
-      slippageTolerance: slippageTolerance.toString(),
-    });
   }
 
   /**

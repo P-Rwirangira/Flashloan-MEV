@@ -413,18 +413,18 @@ export class MempoolMonitor extends EventEmitter {
     try {
       // Calculate backrun profit using real pool state and gas estimation
       const poolContract = new ethers.Contract(
-        swap.poolAddress,
+        swap.poolAddress || '0x0000000000000000000000000000000000000000',
         [
           'function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
           'function liquidity() external view returns (uint128)',
         ],
-        this.provider
+        this.connectionManager.getProvider()
       );
 
       try {
-        const [slot0, liquidity] = await Promise.all([
-          poolContract.slot0(),
-          poolContract['liquidity'](),
+        const [, liquidity] = await Promise.all([
+          poolContract?.['slot0']?.(),
+          poolContract?.['liquidity']?.(),
         ]);
 
         // Calculate potential profit based on price impact
