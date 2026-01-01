@@ -34,9 +34,9 @@ export interface DetailedProfitCalculation {
   readonly gasCost: bigint;
   readonly slippageCost: bigint;
   readonly bridgeFees: bigint;
-  readonly competitionCost: bigint; // Cost to outbid competitors
+  readonly competitionCost: bigint;
   readonly netProfit: bigint;
-  readonly profitMargin: number; // percentage
+  readonly profitMargin: number;
   readonly profitUsd: number;
   readonly isViable: boolean;
   readonly breakdownBps: {
@@ -47,7 +47,7 @@ export interface DetailedProfitCalculation {
     readonly competitionBps: number;
   };
   readonly calculatedAt: number;
-  readonly confidence: number; // 0-1 scale based on data quality
+  readonly confidence: number;
 }
 
 export interface ProfitThresholds {
@@ -57,14 +57,16 @@ export interface ProfitThresholds {
   readonly maxSlippagePercent: number;
 }
 
-// Enhanced price oracle implementation with real Chainlink feeds
+/**
+ * Enhanced price oracle implementation with real Chainlink feeds
+ */
 export class EnhancedPriceOracle implements IPriceOracle {
   private readonly logger = createComponentLogger('enhanced-price-oracle');
   private readonly provider: ethers.Provider;
   private readonly chainlinkOracle: ChainlinkPriceOracleImpl;
   private priceCache: Map<string, { price: number; timestamp: number; confidence: number }> =
     new Map();
-  private readonly cacheTimeMs = 30000; // 30 seconds cache for enhanced responsiveness
+  private readonly cacheTimeMs = 30000; // 30 seconds cache
 
   constructor(connectionManager: RpcConnectionManager) {
     this.provider = connectionManager.getProvider();
@@ -86,7 +88,7 @@ export class EnhancedPriceOracle implements IPriceOracle {
       this.priceCache.set(cacheKey, {
         price,
         timestamp: Date.now(),
-        confidence: 0.95, // High confidence for Chainlink
+        confidence: 0.95,
       });
 
       return price;
@@ -96,15 +98,51 @@ export class EnhancedPriceOracle implements IPriceOracle {
         return cached.price;
       }
 
-      // Ultimate fallback with external price API
+      // Try to get price from DEX as last resort
       try {
-        const apiPrice = await this.fetchEthPriceFromExternalApi();
-        console.warn('Using external API price as fallback', { price: apiPrice });
-        return apiPrice;
-      } catch (apiError) {
-        console.warn('Failed to get ETH price from all sources, using emergency fallback');
-        return 3000; // Emergency fallback
+        const ethPrice = await this.getEthPriceFromDex();
+        this.priceCache.set(cacheKey, {
+          price: ethPrice,
+          timestamp: Date.now(),
+          confidence: 0.7,
+        });
+        return ethPrice;
+      } catch (dexError) {
+        this.logger.error('Failed to get ETH price from any source', {
+          chainlinkError: error instanceof Error ? error.message : String(error),
+          dexError: dexError instanceof Error ? dexError.message : String(dexError),
+        });
+        throw new Error('Unable to fetch ETH price from any source');
       }
+    }
+  }
+
+  /**
+   * Get ETH price from DEX pools as fallback
+   */
+  private async getEthPriceFromDex(): Promise<number> {
+    try {
+      // Query WETH/USDC pool on Uniswap V3 (Base)
+      const wethUsdcPool = '0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18';
+      const poolContract = new ethers.Contract(
+        wethUsdcPool,
+        ['function slot0() view returns (uint160, int24, uint16, uint16, uint16, uint8, bool)'],
+        this.provider
+      );
+
+      const slot0 = await (poolContract['slot0'] as any)();
+      const sqrtPriceX96 = slot0[0];
+
+      // Convert sqrtPriceX96 to price
+      const price = Math.pow(Number(sqrtPriceX96) / Math.pow(2, 96), 2) * Math.pow(10, 6 - 18);
+      const ethPriceUsd = (1 / price) * Math.pow(10, 12);
+
+      return ethPriceUsd;
+    } catch (error) {
+      this.logger.error('Failed to get ETH price from DEX', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
     }
   }
 
@@ -123,7 +161,7 @@ export class EnhancedPriceOracle implements IPriceOracle {
       this.priceCache.set(cacheKey, {
         price,
         timestamp: Date.now(),
-        confidence: 0.9, // High confidence for Chainlink
+        confidence: 0.9,
       });
 
       return price;
@@ -139,219 +177,78 @@ export class EnhancedPriceOracle implements IPriceOracle {
   }
 
   private async deriveTokenPriceFromEth(tokenAddress: Address): Promise<number> {
-    const ethPrice = await this.getEthUsdPrice();
-    const tokenAddressLower = tokenAddress.toLowerCase();
-
-    // Enhanced token type detection
-    if (
-      tokenAddressLower.includes('usdc') ||
-      tokenAddressLower.includes('dai') ||
-      tokenAddressLower.includes('usdt') ||
-      tokenAddressLower === '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
-    ) {
-      // USDC on Base
-      return 1.0;
-    }
-
-    if (
-      tokenAddressLower.includes('weth') ||
-      tokenAddressLower === '0x4200000000000000000000000000000000000006'
-    ) {
-      // WETH on Base
-      return ethPrice;
-    }
-
-    // For unknown tokens, use more sophisticated price discovery
     try {
-      // Try to get price from DEX pools first
-      const dexPrice = await this.queryTokenPriceFromDex(tokenAddress);
+      // First try to get price from DEX pools
+      const dexPrice = await this.getTokenPriceFromDex(tokenAddress);
       if (dexPrice > 0) {
+        this.priceCache.set(`${tokenAddress}-USD`, {
+          price: dexPrice,
+          timestamp: Date.now(),
+          confidence: 0.8,
+        });
         return dexPrice;
       }
     } catch (error) {
-      // Continue to fallback estimation
-    }
-
-    // Enhanced fallback based on token analysis
-    return ethPrice * this.estimateTokenValueRatio(tokenAddress);
-  }
-
-  /**
-   * Get ETH price from oracle (alias for getEthUsdPrice for compatibility)
-   */
-  async getEthPriceFromOracle(): Promise<number> {
-    return this.getEthUsdPrice();
-  }
-
-  /**
-   * Fetch ETH price from external API as fallback
-   */
-  private async fetchEthPriceFromExternalApi(): Promise<number> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
-
-    try {
-      // Use CoinGecko API as fallback
-      const response = await fetch(
-        'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd',
-        { signal: controller.signal }
-      );
-
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const data = (await response.json()) as any;
-
-      if (!data.ethereum || typeof data.ethereum.usd !== 'number' || !isFinite(data.ethereum.usd)) {
-        throw new Error('Invalid API response: missing or invalid ethereum.usd price');
-      }
-
-      return data.ethereum.usd;
-    } catch (error) {
-      clearTimeout(timeoutId);
-
-      if (error instanceof Error) {
-        if (error.name === 'AbortError') {
-          throw new Error('CoinGecko API request timed out after 5 seconds');
-        }
-        throw new Error(`CoinGecko API error: ${error.message}`);
-      }
-
-      throw new Error('Unknown error fetching ETH price from CoinGecko API');
-    }
-  }
-
-  /**
-   * Query token price from DEX pools using real on-chain data
-   */
-  private async queryTokenPriceFromDex(tokenAddress: Address): Promise<number> {
-    try {
-      // Get WETH address for Base
-      const WETH_ADDRESS = '0x4200000000000000000000000000000000000006';
-
-      // Try to find a WETH pair for this token
-      const uniswapV3Factory = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD'; // Base Uniswap V3 Factory
-
-      // Common fee tiers to check
-      const feeTiers = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
-
-      for (const fee of feeTiers) {
-        try {
-          const factoryContract = new ethers.Contract(
-            uniswapV3Factory,
-            [
-              'function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)',
-            ],
-            this.provider
-          );
-
-          const poolAddress = await factoryContract?.['getPool']?.(tokenAddress, WETH_ADDRESS, fee);
-
-          if (poolAddress && poolAddress !== ethers.ZeroAddress) {
-            // Get pool state
-            const poolContract = new ethers.Contract(
-              poolAddress,
-              [
-                'function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
-                'function token0() external view returns (address)',
-                'function token1() external view returns (address)',
-              ],
-              this.provider
-            );
-
-            const [slot0, token0] = await Promise.all([
-              poolContract?.['slot0']?.(),
-              poolContract?.['token0']?.(),
-            ]);
-
-            if (slot0.sqrtPriceX96 > 0) {
-              // Calculate price from sqrtPriceX96
-              const sqrtPriceX96 = slot0.sqrtPriceX96;
-              const price = (Number(sqrtPriceX96) / 2 ** 96) ** 2;
-
-              // Adjust for token order (token0/token1 vs token1/token0)
-              const isToken0 = token0.toLowerCase() === tokenAddress.toLowerCase();
-              const tokenPrice = isToken0 ? price : 1 / price;
-
-              // Get current ETH price and convert
-              const ethPrice = await this.getEthPriceFromOracle();
-              return tokenPrice * ethPrice;
-            }
-          }
-        } catch (error) {
-          // Continue to next fee tier
-          continue;
-        }
-      }
-
-      // Try Aerodrome pools as fallback
-      return await this.queryAerodromePrice(tokenAddress);
-    } catch (error) {
-      this.logger.warn('Failed to query token price from DEX', {
+      this.logger.warn('Failed to get token price from DEX', {
         tokenAddress,
         error: error instanceof Error ? error.message : String(error),
       });
-      return 0;
     }
+
+    // Fallback to known token prices
+    const ethPrice = await this.getEthUsdPrice();
+    const tokenAddressLower = tokenAddress.toLowerCase();
+
+    const knownTokenPrices: Record<string, number> = {
+      '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 1.0, // USDC
+      '0x50c5725949a6f0c72e6c4a641f24049a917db0cb': 1.0, // DAI
+      '0x4200000000000000000000000000000000000006': ethPrice, // WETH
+      '0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452': ethPrice * 1.1, // wstETH
+    };
+
+    const knownPrice = knownTokenPrices[tokenAddressLower];
+    if (knownPrice !== undefined) {
+      return knownPrice;
+    }
+
+    // For unknown tokens, conservative estimate
+    return ethPrice * 0.05;
   }
 
   /**
-   * Query token price from Aerodrome pools
+   * Get token price from DEX pools
    */
-  private async queryAerodromePrice(tokenAddress: Address): Promise<number> {
+  private async getTokenPriceFromDex(tokenAddress: Address): Promise<number> {
     try {
-      const WETH_ADDRESS = '0x4200000000000000000000000000000000000006';
-      const AERODROME_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da'; // Aerodrome Factory on Base
+      const ethPrice = await this.getEthUsdPrice();
 
-      const factoryContract = new ethers.Contract(
-        AERODROME_FACTORY,
-        [
-          'function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool)',
-        ],
-        this.provider
-      );
+      // Try to find a pool with WETH or USDC
+      const wethAddress = '0x4200000000000000000000000000000000000006';
+      const usdcAddress = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 
-      // Try both stable and volatile pools
-      for (const stable of [false, true]) {
+      const feeTiers = [500, 3000, 10000];
+
+      for (const fee of feeTiers) {
         try {
-          const poolAddress = await factoryContract?.['getPool']?.(
-            tokenAddress,
-            WETH_ADDRESS,
-            stable
-          );
-
-          if (poolAddress && poolAddress !== ethers.ZeroAddress) {
-            const poolContract = new ethers.Contract(
-              poolAddress,
-              [
-                'function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast)',
-                'function token0() external view returns (address)',
-                'function token1() external view returns (address)',
-              ],
-              this.provider
-            );
-
-            const [reserves, token0] = await Promise.all([
-              poolContract?.['getReserves']?.(),
-              poolContract?.['token0']?.(),
-            ]);
-
-            if (reserves.reserve0 > 0 && reserves.reserve1 > 0) {
-              const isToken0 = token0.toLowerCase() === tokenAddress.toLowerCase();
-              const tokenReserve = isToken0 ? reserves.reserve0 : reserves.reserve1;
-              const wethReserve = isToken0 ? reserves.reserve1 : reserves.reserve0;
-
-              const tokenPrice = Number(wethReserve) / Number(tokenReserve);
-              const ethPrice = await this.getEthPriceFromOracle();
-
-              return tokenPrice * ethPrice;
-            }
+          // Try WETH pair first
+          const wethPoolAddress = await this.computePoolAddress(tokenAddress, wethAddress, fee);
+          const wethPrice = await this.getPoolPrice(wethPoolAddress, tokenAddress, wethAddress);
+          if (wethPrice > 0) {
+            return wethPrice * ethPrice;
           }
-        } catch (error) {
-          continue;
+        } catch {
+          // Continue to next fee tier
+        }
+
+        try {
+          // Try USDC pair
+          const usdcPoolAddress = await this.computePoolAddress(tokenAddress, usdcAddress, fee);
+          const usdcPrice = await this.getPoolPrice(usdcPoolAddress, tokenAddress, usdcAddress);
+          if (usdcPrice > 0) {
+            return usdcPrice;
+          }
+        } catch {
+          // Continue to next fee tier
         }
       }
 
@@ -361,27 +258,49 @@ export class EnhancedPriceOracle implements IPriceOracle {
     }
   }
 
-  /**
-   * Estimate token value ratio based on token characteristics using address lookup
-   */
-  private estimateTokenValueRatio(tokenAddress: Address): number {
-    const tokenAddressLower = tokenAddress.toLowerCase();
+  private async computePoolAddress(
+    tokenA: Address,
+    tokenB: Address,
+    fee: number
+  ): Promise<Address> {
+    const factory = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
+    const [token0, token1] =
+      tokenA.toLowerCase() < tokenB.toLowerCase() ? [tokenA, tokenB] : [tokenB, tokenA];
 
-    // Known token addresses on Base (normalized to lowercase) with their ratios
-    const knownTokenRatios: Record<string, number> = {
-      '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 0.0003, // USDC (1/3000 assuming $3000 ETH)
-      '0x50c5725949a6f0c72e6c4a641f24049a917db0cb': 0.0003, // DAI
-      '0x4200000000000000000000000000000000000006': 1.0, // WETH
-      '0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452': 1.1, // wstETH (10% premium)
-    };
+    const salt = ethers.solidityPackedKeccak256(
+      ['address', 'address', 'uint24'],
+      [token0, token1, fee]
+    );
 
-    const ratio = knownTokenRatios[tokenAddressLower];
-    if (ratio !== undefined) {
-      return ratio;
+    const initCodeHash = '0xe34f199b19b2b4f47f68442619d555527d244f78a3297ea89325f843f87b8b54';
+
+    return ethers.getCreate2Address(factory, salt, initCodeHash) as Address;
+  }
+
+  private async getPoolPrice(
+    poolAddress: Address,
+    tokenA: Address,
+    tokenB: Address
+  ): Promise<number> {
+    try {
+      const poolContract = new ethers.Contract(
+        poolAddress,
+        ['function slot0() view returns (uint160, int24, uint16, uint16, uint16, uint8, bool)'],
+        this.provider
+      );
+
+      const slot0 = await (poolContract['slot0'] as any)();
+      const sqrtPriceX96 = slot0[0];
+
+      if (sqrtPriceX96 === 0n) {
+        return 0;
+      }
+
+      const price = Math.pow(Number(sqrtPriceX96) / Math.pow(2, 96), 2);
+      return tokenA.toLowerCase() < tokenB.toLowerCase() ? price : 1 / price;
+    } catch (error) {
+      return 0;
     }
-
-    // For unknown tokens, use conservative estimate
-    return 0.05; // 5% of ETH for unknown tokens
   }
 }
 
@@ -391,10 +310,11 @@ export class ProfitCalculator extends EventEmitter {
   private readonly gasOptimizer: AdvancedGasOptimizer | undefined;
   private readonly flashLoanFeeBps: number;
   private readonly minProfitMarginPercent: number;
+  private readonly logger = createComponentLogger('profit-calculator');
 
   // Calculation cache
   private calculationCache: Map<string, DetailedProfitCalculation> = new Map();
-  private readonly cacheTimeoutMs = 5000; // 5 seconds for faster response
+  private readonly cacheTimeoutMs = 5000;
 
   constructor(options: ProfitCalculatorOptions) {
     super();
@@ -407,119 +327,148 @@ export class ProfitCalculator extends EventEmitter {
   }
 
   /**
+   * Get current gas price from provider
+   */
+  private async getCurrentGasPrice(): Promise<bigint> {
+    try {
+      // Use the connection manager from the enhanced price oracle
+      const provider = (this.priceOracle as EnhancedPriceOracle)['provider'];
+      if (provider) {
+        const feeData = await provider.getFeeData();
+        return feeData.gasPrice || ethers.parseUnits('20', 'gwei');
+      }
+
+      // Fallback to default gas price
+      return ethers.parseUnits('20', 'gwei');
+    } catch (error) {
+      this.logger.warn('Failed to get gas price, using default', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return ethers.parseUnits('20', 'gwei');
+    }
+  }
+
+  /**
    * Calculate detailed profit for arbitrage opportunity
    */
   async calculateDetailedProfit(
-    opportunity: ArbitrageOpportunity,
-    thresholds?: ProfitThresholds
+    opportunity: ArbitrageOpportunity
   ): Promise<DetailedProfitCalculation> {
-    const cacheKey = this.getCacheKey(opportunity);
+    const cacheKey = `${opportunity.id}-${opportunity.detectedAt}`;
     const cached = this.calculationCache.get(cacheKey);
 
-    // Return cached calculation if still valid
     if (cached && Date.now() - cached.calculatedAt < this.cacheTimeoutMs) {
       return cached;
     }
 
     try {
-      const calculation = await this.performDetailedCalculation(opportunity, thresholds);
-
-      // Cache the calculation
+      const calculation = await this.performDetailedCalculation(opportunity);
       this.calculationCache.set(cacheKey, calculation);
+
+      // Clean old cache entries
+      this.cleanCache();
 
       return calculation;
     } catch (error) {
-      this.emit('calculationError', error);
+      this.logger.error('Failed to calculate detailed profit', {
+        opportunityId: opportunity.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
       throw error;
     }
   }
 
-  /**
-   * Perform the detailed profit calculation with enhanced accuracy
-   */
   private async performDetailedCalculation(
-    opportunity: ArbitrageOpportunity,
-    thresholds?: ProfitThresholds
+    opportunity: ArbitrageOpportunity
   ): Promise<DetailedProfitCalculation> {
-    const amountIn = BigInt(opportunity.amountIn.toString());
-    const expectedAmountOut = BigInt(opportunity.expectedAmountOut.toString());
+    const startTime = Date.now();
 
     // Calculate gross profit
-    const grossProfit = expectedAmountOut > amountIn ? expectedAmountOut - amountIn : 0n;
+    const grossProfit = BigInt(opportunity.expectedProfit.toString());
 
-    // Calculate flash loan fee with dynamic optimization
-    const flashLoanFee = await this.calculateOptimalFlashLoanFee(amountIn, opportunity);
+    // Calculate flash loan fee
+    const flashLoanFee =
+      (BigInt(opportunity.amountIn.toString()) * BigInt(this.flashLoanFeeBps)) / 10000n;
 
-    // Get enhanced gas estimate
-    let gasCost: bigint;
+    // Calculate gas cost with optimization if available
+    let gasEstimate = await this.gasEstimator.estimateArbitrageGas(opportunity);
+
+    // Apply gas optimization if available
     if (this.gasOptimizer) {
       try {
-        const gasOptimization = await this.gasOptimizer.optimizeGas(opportunity, {
-          urgency: 0.7, // Medium-high urgency for arbitrage
-          targetBlocks: 1,
-          maxGasPrice: ethers.parseUnits('50', 'gwei'), // 50 gwei max
+        const optimizationOptions = {
+          urgency: 0.7, // Medium urgency for arbitrage
+          targetBlocks: 2, // Target inclusion within 2 blocks
+          maxGasPrice: ethers.parseUnits('100', 'gwei'),
           profitMargin: grossProfit,
+          competitionLevel: 0.5, // Medium competition assumption
+        };
+
+        const optimizationResult = await this.gasOptimizer.optimizeGas(
+          opportunity,
+          optimizationOptions
+        );
+
+        // Update gas estimate with optimized values
+        gasEstimate = {
+          ...gasEstimate,
+          gasLimit: optimizationResult.gasLimit,
+          maxFeePerGas: optimizationResult.maxFeePerGas,
+          maxPriorityFeePerGas: optimizationResult.maxPriorityFeePerGas,
+          totalCost: optimizationResult.totalCost,
+        };
+
+        this.logger.debug('Applied gas optimization', {
+          originalGasLimit: gasEstimate.gasLimit.toString(),
+          optimizedGasLimit: optimizationResult.gasLimit.toString(),
+          strategy: optimizationResult.strategy,
+          inclusionProbability: optimizationResult.inclusionProbability,
         });
-        gasCost = gasOptimization.totalCost;
       } catch (error) {
-        // Fallback to basic gas estimation
-        const gasEstimate = await this.gasEstimator.estimateArbitrageGas(opportunity);
-        gasCost = gasEstimate.totalCost;
+        this.logger.warn('Gas optimization failed, using original estimate', {
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
-    } else {
-      const gasEstimate = await this.gasEstimator.estimateArbitrageGas(opportunity);
-      gasCost = gasEstimate.totalCost;
     }
 
-    // Calculate enhanced slippage cost
-    const slippageCost = await this.calculateEnhancedSlippageCost(opportunity);
+    const gasPrice = await this.getCurrentGasPrice();
+    const gasCost = gasEstimate.gasLimit * gasPrice;
 
-    // Calculate bridge fees (if applicable)
-    const bridgeFees = await this.calculateBridgeFees();
+    // Calculate slippage cost (simplified)
+    const slippageCost = (grossProfit * 50n) / 10000n; // 0.5% slippage estimate
 
-    // Calculate competition cost (new feature)
-    const competitionCost = await this.calculateCompetitionCost(opportunity, grossProfit);
+    // Bridge fees (none for single-chain arbitrage)
+    const bridgeFees = 0n;
+
+    // Competition cost
+    const competitionCost = await this.calculateCompetitionCost(grossProfit, opportunity);
 
     // Calculate net profit
     const totalCosts = flashLoanFee + gasCost + slippageCost + bridgeFees + competitionCost;
     const netProfit = grossProfit > totalCosts ? grossProfit - totalCosts : 0n;
 
     // Calculate profit margin
-    const profitMargin = amountIn > 0n ? Number((netProfit * 10000n) / amountIn) / 100 : 0;
+    const profitMargin = grossProfit > 0n ? Number(netProfit) / Number(grossProfit) : 0;
 
-    // Calculate USD value with enhanced accuracy
-    const { profitUsd, confidence } = await this.calculateProfitUsdWithConfidence(
-      netProfit,
-      opportunity.tokenOut
-    );
+    // Calculate USD value
+    const ethPrice = await this.priceOracle.getEthUsdPrice();
+    const profitUsd = Number(ethers.formatEther(netProfit)) * ethPrice;
 
-    // Calculate enhanced breakdown in basis points
-    const breakdownBps = this.calculateEnhancedCostBreakdown(
-      amountIn,
-      flashLoanFee,
-      gasCost,
-      slippageCost,
-      bridgeFees,
-      competitionCost
-    );
+    // Check viability
+    const isViable = netProfit > 0n && profitMargin >= this.minProfitMarginPercent / 100;
 
-    // Determine viability with enhanced criteria
-    const defaultThresholds: ProfitThresholds = {
-      minProfitUsd: 5, // Reduced from $10 to $5 for more opportunities
-      minProfitMargin: this.minProfitMarginPercent,
-      maxGasCostPercent: 60, // Increased from 50% to 60%
-      maxSlippagePercent: 25, // Increased from 20% to 25%
+    // Calculate breakdown in basis points
+    const grossProfitNum = Number(grossProfit);
+    const breakdownBps = {
+      flashLoanFeeBps:
+        grossProfitNum > 0 ? Math.round((Number(flashLoanFee) / grossProfitNum) * 10000) : 0,
+      gasCostBps: grossProfitNum > 0 ? Math.round((Number(gasCost) / grossProfitNum) * 10000) : 0,
+      slippageBps:
+        grossProfitNum > 0 ? Math.round((Number(slippageCost) / grossProfitNum) * 10000) : 0,
+      bridgeFeeBps: 0,
+      competitionBps:
+        grossProfitNum > 0 ? Math.round((Number(competitionCost) / grossProfitNum) * 10000) : 0,
     };
-
-    const activeThresholds = thresholds || defaultThresholds;
-    const isViable = this.checkEnhancedViability(
-      netProfit,
-      profitMargin,
-      profitUsd,
-      breakdownBps,
-      activeThresholds,
-      confidence
-    );
 
     return {
       grossProfit,
@@ -533,244 +482,35 @@ export class ProfitCalculator extends EventEmitter {
       profitUsd,
       isViable,
       breakdownBps,
-      calculatedAt: Date.now(),
-      confidence,
+      calculatedAt: startTime,
+      confidence: 0.85, // Good confidence for real calculation
     };
   }
 
-  /**
-   * Calculate optimal flash loan fee by comparing sources
-   */
-  private async calculateOptimalFlashLoanFee(
-    amountIn: bigint,
+  private async calculateCompetitionCost(
+    grossProfit: bigint,
     opportunity: ArbitrageOpportunity
   ): Promise<bigint> {
-    // Uniswap V3 flash loan fee (0.05%)
-    const uniV3Fee = (amountIn * BigInt(this.flashLoanFeeBps)) / 10000n;
-
-    // Balancer flash loan (0% fee but higher gas) - use opportunity for gas estimation
-    const balancerFee = 0n;
-    const balancerGasOverhead =
-      BigInt(opportunity.route.pools.length) * 25000n * ethers.parseUnits('2', 'gwei');
-
-    // Choose the cheaper option
-    return uniV3Fee < balancerGasOverhead ? uniV3Fee : balancerFee;
-  }
-
-  /**
-   * Calculate enhanced slippage cost with better pool analysis
-   */
-  private async calculateEnhancedSlippageCost(opportunity: ArbitrageOpportunity): Promise<bigint> {
-    const amountIn = BigInt(opportunity.amountIn.toString());
-
-    // Use more sophisticated slippage calculation based on route complexity
-    let totalSlippage = 0n;
-
-    // Main route slippage
-    const mainRouteSlippage = this.calculateRouteSlippage(opportunity.route, amountIn);
-    totalSlippage += mainRouteSlippage;
-
-    // Add buffer for fallback routes (they might be used)
-    const fallbackBuffer =
-      opportunity.fallbackRoutes.length > 0
-        ? mainRouteSlippage / BigInt(opportunity.fallbackRoutes.length * 2)
-        : 0n;
-
-    totalSlippage += fallbackBuffer;
-
-    return totalSlippage;
-  }
-
-  /**
-   * Calculate route-specific slippage
-   */
-  private calculateRouteSlippage(route: any, amountIn: bigint): bigint {
-    // More sophisticated slippage calculation per pool
-    const baseSlippageBps = 30n; // 0.3% base slippage
-    const complexityMultiplier = BigInt(route.pools.length);
-
-    return (amountIn * baseSlippageBps * complexityMultiplier) / 10000n;
-  }
-
-  /**
-   * Calculate competition cost (bribe needed to outbid competitors)
-   */
-  private async calculateCompetitionCost(
-    opportunity: ArbitrageOpportunity,
-    grossProfit: bigint
-  ): Promise<bigint> {
-    // Estimate competition based on opportunity attractiveness
     const profitMargin = grossProfit > 0n ? Number(grossProfit) / Number(opportunity.amountIn) : 0;
 
     if (profitMargin > 0.05) {
       // >5% profit margin attracts competition
       // Assume we need to bid 10-20% of gross profit to win
-      const competitionFactor = Math.min(0.2, profitMargin * 2); // Cap at 20%
-      return (grossProfit * BigInt(Math.floor(competitionFactor * 100))) / 100n;
+      return (grossProfit * BigInt(Math.floor(Math.random() * 10 + 10))) / 100n;
     }
 
-    return 0n; // No significant competition for low-margin opportunities
-  }
-
-  /**
-   * Calculate profit in USD with confidence metrics
-   */
-  private async calculateProfitUsdWithConfidence(
-    profit: bigint,
-    tokenAddress: Address
-  ): Promise<{ profitUsd: number; confidence: number }> {
-    try {
-      const tokenPrice = await this.priceOracle.getTokenUsdPrice(tokenAddress);
-      const profitEth = Number(ethers.formatEther(profit));
-      const profitUsd = profitEth * tokenPrice;
-
-      // Confidence based on price oracle type
-      const confidence = this.priceOracle instanceof EnhancedPriceOracle ? 0.9 : 0.6;
-
-      return { profitUsd, confidence };
-    } catch (error) {
-      return { profitUsd: 0, confidence: 0.1 };
-    }
-  }
-
-  /**
-   * Calculate enhanced cost breakdown
-   */
-  private calculateEnhancedCostBreakdown(
-    amountIn: bigint,
-    flashLoanFee: bigint,
-    gasCost: bigint,
-    slippageCost: bigint,
-    bridgeFees: bigint,
-    competitionCost: bigint
-  ): DetailedProfitCalculation['breakdownBps'] {
-    if (amountIn === 0n) {
-      return {
-        flashLoanFeeBps: 0,
-        gasCostBps: 0,
-        slippageBps: 0,
-        bridgeFeeBps: 0,
-        competitionBps: 0,
-      };
-    }
-
-    return {
-      flashLoanFeeBps: Number((flashLoanFee * 10000n) / amountIn),
-      gasCostBps: Number((gasCost * 10000n) / amountIn),
-      slippageBps: Number((slippageCost * 10000n) / amountIn),
-      bridgeFeeBps: Number((bridgeFees * 10000n) / amountIn),
-      competitionBps: Number((competitionCost * 10000n) / amountIn),
-    };
-  }
-
-  /**
-   * Enhanced viability check with confidence weighting
-   */
-  private checkEnhancedViability(
-    netProfit: bigint,
-    profitMargin: number,
-    profitUsd: number,
-    breakdownBps: DetailedProfitCalculation['breakdownBps'],
-    thresholds: ProfitThresholds,
-    confidence: number
-  ): boolean {
-    // Check minimum profit requirements
-    if (netProfit <= 0n) return false;
-    if (profitMargin < thresholds.minProfitMargin) return false;
-
-    // Adjust USD threshold based on confidence
-    const adjustedMinProfitUsd = thresholds.minProfitUsd / confidence;
-    if (profitUsd < adjustedMinProfitUsd) return false;
-
-    // Check cost thresholds with some flexibility for high-confidence opportunities
-    const gasCostPercent = breakdownBps.gasCostBps / 100;
-    const slippagePercent = breakdownBps.slippageBps / 100;
-    const competitionPercent = breakdownBps.competitionBps / 100;
-
-    // Allow higher costs for high-confidence, high-profit opportunities
-    const flexibilityMultiplier = confidence > 0.8 && profitMargin > 0.02 ? 1.2 : 1.0;
-
-    if (gasCostPercent > thresholds.maxGasCostPercent * flexibilityMultiplier) return false;
-    if (slippagePercent > thresholds.maxSlippagePercent * flexibilityMultiplier) return false;
-    if (competitionPercent > 30) return false; // Max 30% for competition
-
-    return true;
-  }
-
-  /**
-   * Calculate bridge fees (if cross-chain operations are involved)
-   */
-  private async calculateBridgeFees(): Promise<bigint> {
-    // For Base-only arbitrage, bridge fees are typically 0
-    // This would be expanded for cross-chain arbitrage
     return 0n;
   }
 
-  /**
-   * Calculate profit in USD (legacy method - used as fallback)
-   */
-  private async calculateProfitUsd(profit: bigint, tokenAddress: Address): Promise<number> {
-    const { profitUsd } = await this.calculateProfitUsdWithConfidence(profit, tokenAddress);
-    return profitUsd;
+  private cleanCache(): void {
+    const now = Date.now();
+    for (const [key, value] of this.calculationCache.entries()) {
+      if (now - value.calculatedAt > this.cacheTimeoutMs * 2) {
+        this.calculationCache.delete(key);
+      }
+    }
   }
 
-  /**
-   * Calculate cost breakdown (legacy method - used for backward compatibility)
-   */
-  private calculateCostBreakdown(
-    amountIn: bigint,
-    flashLoanFee: bigint,
-    gasCost: bigint,
-    slippageCost: bigint,
-    bridgeFees: bigint
-  ): Omit<DetailedProfitCalculation['breakdownBps'], 'competitionBps'> {
-    const enhanced = this.calculateEnhancedCostBreakdown(
-      amountIn,
-      flashLoanFee,
-      gasCost,
-      slippageCost,
-      bridgeFees,
-      0n
-    );
-
-    // Return without competition cost for legacy compatibility
-    return {
-      flashLoanFeeBps: enhanced.flashLoanFeeBps,
-      gasCostBps: enhanced.gasCostBps,
-      slippageBps: enhanced.slippageBps,
-      bridgeFeeBps: enhanced.bridgeFeeBps,
-    };
-  }
-
-  /**
-   * Check viability (legacy method - used as fallback validation)
-   */
-  private checkViability(
-    netProfit: bigint,
-    profitMargin: number,
-    profitUsd: number,
-    breakdownBps: Omit<DetailedProfitCalculation['breakdownBps'], 'competitionBps'>,
-    thresholds: ProfitThresholds
-  ): boolean {
-    // Use enhanced viability check with default confidence
-    const enhancedBreakdown = {
-      ...breakdownBps,
-      competitionBps: 0, // No competition cost in legacy mode
-    };
-
-    return this.checkEnhancedViability(
-      netProfit,
-      profitMargin,
-      profitUsd,
-      enhancedBreakdown,
-      thresholds,
-      0.8
-    );
-  }
-
-  /**
-   * Calculate minimum required profit in Wei
-   */
   async calculateMinProfitWei(minProfitUsd: number, tokenAddress: Address): Promise<bigint> {
     try {
       const tokenPrice = await this.priceOracle.getTokenUsdPrice(tokenAddress);
@@ -778,141 +518,8 @@ export class ProfitCalculator extends EventEmitter {
       return ethers.parseEther(minProfitToken.toString());
     } catch (error) {
       // Fallback calculation
-      return ethers.parseEther((minProfitUsd / 3000).toString()); // Assume $3000 ETH
-    }
-  }
-
-  /**
-   * Validate opportunity profitability
-   */
-  async validateProfitability(
-    opportunity: ArbitrageOpportunity,
-    thresholds?: ProfitThresholds
-  ): Promise<{ isValid: boolean; reason?: string; calculation: DetailedProfitCalculation }> {
-    const calculation = await this.calculateDetailedProfit(opportunity, thresholds);
-
-    if (calculation.isViable) {
-      return { isValid: true, calculation };
-    }
-
-    // Determine rejection reason
-    let reason = 'Unknown reason';
-    if (calculation.netProfit <= 0n) {
-      reason = 'Net profit is not positive';
-    } else if (calculation.profitMargin < this.minProfitMarginPercent) {
-      reason = `Profit margin ${calculation.profitMargin.toFixed(2)}% below minimum ${this.minProfitMarginPercent}%`;
-    } else if (calculation.profitUsd < (thresholds?.minProfitUsd || 10)) {
-      reason = `Profit $${calculation.profitUsd.toFixed(2)} below minimum $${thresholds?.minProfitUsd || 10}`;
-    } else if (calculation.breakdownBps.gasCostBps > 5000) {
-      // 50%
-      reason = 'Gas costs too high relative to profit';
-    }
-
-    return { isValid: false, reason, calculation };
-  }
-
-  /**
-   * Generate cache key for opportunity
-   */
-  private getCacheKey(opportunity: ArbitrageOpportunity): string {
-    return `${opportunity.id}-${opportunity.amountIn}-${opportunity.expectedAmountOut}`;
-  }
-
-  /**
-   * Clear calculation cache
-   */
-  clearCache(): void {
-    this.calculationCache.clear();
-    this.emit('cacheCleared');
-  }
-
-  /**
-   * Get calculation statistics
-   */
-  getStats(): {
-    cacheSize: number;
-    flashLoanFeeBps: number;
-    minProfitMarginPercent: number;
-  } {
-    return {
-      cacheSize: this.calculationCache.size,
-      flashLoanFeeBps: this.flashLoanFeeBps,
-      minProfitMarginPercent: this.minProfitMarginPercent,
-    };
-  }
-
-  /**
-   * Validate opportunity profitability using legacy methods as fallback
-   */
-  async validateProfitabilityLegacy(
-    opportunity: ArbitrageOpportunity,
-    thresholds?: ProfitThresholds
-  ): Promise<{ isValid: boolean; reason?: string; calculation: DetailedProfitCalculation }> {
-    try {
-      // Try enhanced calculation first
-      const calculation = await this.calculateDetailedProfit(opportunity, thresholds);
-      return { isValid: calculation.isViable, calculation };
-    } catch (error) {
-      // Fallback to legacy methods for compatibility
-      const amountIn = BigInt(opportunity.amountIn.toString());
-      const expectedAmountOut = BigInt(opportunity.expectedAmountOut.toString());
-      const grossProfit = expectedAmountOut > amountIn ? expectedAmountOut - amountIn : 0n;
-
-      const flashLoanFee = (amountIn * BigInt(this.flashLoanFeeBps)) / 10000n;
-      const gasEstimate = await this.gasEstimator.estimateArbitrageGas(opportunity);
-      const gasCost = gasEstimate.totalCost;
-      const slippageCost = await this.calculateEnhancedSlippageCost(opportunity);
-      const bridgeFees = await this.calculateBridgeFees();
-
-      const netProfit = grossProfit - (flashLoanFee + gasCost + slippageCost + bridgeFees);
-      const profitMargin = amountIn > 0n ? Number((netProfit * 10000n) / amountIn) / 100 : 0;
-      const profitUsd = await this.calculateProfitUsd(netProfit, opportunity.tokenOut);
-
-      const breakdownBps = this.calculateCostBreakdown(
-        amountIn,
-        flashLoanFee,
-        gasCost,
-        slippageCost,
-        bridgeFees
-      );
-
-      const defaultThresholds: ProfitThresholds = {
-        minProfitUsd: 10,
-        minProfitMargin: this.minProfitMarginPercent,
-        maxGasCostPercent: 50,
-        maxSlippagePercent: 20,
-      };
-
-      const activeThresholds = thresholds || defaultThresholds;
-      const isValid = this.checkViability(
-        netProfit,
-        profitMargin,
-        profitUsd,
-        breakdownBps,
-        activeThresholds
-      );
-
-      const legacyCalculation: DetailedProfitCalculation = {
-        grossProfit,
-        flashLoanFee,
-        gasCost,
-        slippageCost,
-        bridgeFees,
-        competitionCost: 0n,
-        netProfit,
-        profitMargin,
-        profitUsd,
-        isViable: isValid,
-        breakdownBps: { ...breakdownBps, competitionBps: 0 },
-        calculatedAt: Date.now(),
-        confidence: 0.7, // Lower confidence for legacy calculation
-      };
-
-      return {
-        isValid,
-        ...(isValid ? {} : { reason: 'Legacy calculation failed viability check' }),
-        calculation: legacyCalculation,
-      };
+      const ethPrice = await this.priceOracle.getEthUsdPrice();
+      return ethers.parseEther((minProfitUsd / ethPrice).toString());
     }
   }
 }

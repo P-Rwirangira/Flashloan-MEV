@@ -429,12 +429,12 @@ export class CompetitiveIntelligenceSystem extends EventEmitter {
   }
 
   /**
-   * Private helper methods
+   * Analyze recent transactions using real blockchain data
    */
   private async analyzeRecentTransactions(): Promise<void> {
     try {
-      // Simulate transaction analysis (would use actual blockchain data in production)
-      const recentTransactions = this.generateSimulatedTransactions();
+      // Get real recent transactions from the blockchain
+      const recentTransactions = await this.fetchRecentBlockchainTransactions();
 
       for (const tx of recentTransactions) {
         this.transactionHistory.push(tx);
@@ -647,54 +647,184 @@ export class CompetitiveIntelligenceSystem extends EventEmitter {
     }
   }
 
-  private generateSimulatedTransactions(): Array<{
-    hash: string;
-    from: Address;
-    timestamp: number;
-    gasPrice: bigint;
-    gasUsed: bigint;
-    success: boolean;
-    profit?: bigint;
-    type?: OpportunityType;
-  }> {
+  /**
+   * Fetch real recent transactions from blockchain
+   */
+  private async fetchRecentBlockchainTransactions(): Promise<
+    Array<{
+      hash: string;
+      from: Address;
+      timestamp: number;
+      gasPrice: bigint;
+      gasUsed: bigint;
+      success: boolean;
+      profit?: bigint;
+      type?: OpportunityType;
+    }>
+  > {
     const transactions = [];
-    const txCount = Math.floor(Math.random() * 10 + 5); // 5-15 transactions
 
-    for (let i = 0; i < txCount; i++) {
-      const profit =
-        Math.random() > 0.5 ? ethers.parseEther((Math.random() * 0.1).toString()) : undefined;
-      const type = Math.random() > 0.5 ? OpportunityType.ARBITRAGE : undefined;
-
-      const tx: {
-        hash: string;
-        from: Address;
-        timestamp: number;
-        gasPrice: bigint;
-        gasUsed: bigint;
-        success: boolean;
-        profit?: bigint;
-        type?: OpportunityType;
-      } = {
-        hash: '0x' + Math.random().toString(16).slice(2, 66),
-        from: `0x${Math.random().toString(16).slice(2, 42)}` as Address,
-        timestamp: Date.now() - Math.random() * 300000, // Last 5 minutes
-        gasPrice: BigInt(Math.floor(Math.random() * 50000000000 + 20000000000)), // 20-70 gwei
-        gasUsed: BigInt(Math.floor(Math.random() * 500000 + 100000)), // 100K-600K gas
-        success: Math.random() > 0.2, // 80% success rate
-      };
-
-      if (profit !== undefined) {
-        tx.profit = profit;
+    try {
+      // Get the latest block
+      const latestBlock = await this.provider.getBlock('latest');
+      if (!latestBlock) {
+        this.logger.warn('Could not fetch latest block');
+        return [];
       }
 
-      if (type !== undefined) {
-        tx.type = type;
+      // Analyze last 5 blocks for MEV transactions
+      const blocksToAnalyze = 5;
+      const startBlock = Math.max(0, latestBlock.number - blocksToAnalyze);
+
+      for (let blockNumber = startBlock; blockNumber <= latestBlock.number; blockNumber++) {
+        const block = await this.provider.getBlock(blockNumber, true);
+        if (!block || !block.transactions) continue;
+
+        for (const tx of block.transactions) {
+          if (typeof tx === 'string') continue; // Skip if only hash
+
+          const transaction = tx as ethers.TransactionResponse;
+
+          // Filter for potential MEV transactions
+          if (await this.isPotentialMevTransaction(transaction)) {
+            const receipt = await this.provider.getTransactionReceipt(transaction.hash);
+            if (!receipt) continue;
+
+            const profit = await this.calculateTransactionProfit(transaction, receipt);
+            const type = await this.identifyOpportunityType(transaction, receipt);
+
+            const transactionData: any = {
+              hash: transaction.hash,
+              from: transaction.from as Address,
+              timestamp: block.timestamp * 1000, // Convert to milliseconds
+              gasPrice: transaction.gasPrice || 0n,
+              gasUsed: receipt.gasUsed,
+              success: receipt.status === 1,
+            };
+
+            if (profit) {
+              transactionData.profit = profit;
+            }
+            if (type) {
+              transactionData.type = type;
+            }
+
+            transactions.push(transactionData);
+          }
+        }
       }
 
-      transactions.push(tx);
+      this.logger.debug('Fetched real blockchain transactions', {
+        transactionCount: transactions.length,
+        blocksAnalyzed: blocksToAnalyze,
+      });
+
+      return transactions;
+    } catch (error) {
+      this.logger.error('Failed to fetch blockchain transactions', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  /**
+   * Check if transaction is potentially MEV-related
+   */
+  private async isPotentialMevTransaction(tx: ethers.TransactionResponse): Promise<boolean> {
+    // Check for high gas price (potential MEV competition)
+    const avgGasPrice = 20000000000n; // 20 gwei baseline
+    if (tx.gasPrice && tx.gasPrice > avgGasPrice * 2n) {
+      return true;
     }
 
-    return transactions;
+    // Check for interactions with known DEX contracts
+    const knownDexContracts = [
+      '0x2626664c2603336E57B271c5C0b26F421741e481', // Uniswap V3 SwapRouter on Base
+      '0x327Df1E6de05895d2ab08513aaDD9313Fe505d86', // Aerodrome Router on Base
+    ];
+
+    if (tx.to && knownDexContracts.includes(tx.to)) {
+      return true;
+    }
+
+    // Check for flash loan interactions
+    if (tx.data && tx.data.includes('0x1249c58b')) {
+      // flashLoan selector
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Calculate profit from transaction logs
+   */
+  private async calculateTransactionProfit(
+    tx: ethers.TransactionResponse,
+    receipt: ethers.TransactionReceipt
+  ): Promise<bigint | null> {
+    try {
+      // Look for Transfer events to calculate profit
+      const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+      let totalIn = 0n;
+      let totalOut = 0n;
+
+      for (const log of receipt.logs) {
+        if (log.topics[0] === transferTopic) {
+          const amount = BigInt(log.data);
+
+          // If transfer to the transaction sender, it's profit
+          if (
+            log.topics[2] &&
+            log.topics[2].toLowerCase().includes(tx.from.toLowerCase().slice(2))
+          ) {
+            totalOut += amount;
+          }
+          // If transfer from the transaction sender, it's cost
+          if (
+            log.topics[1] &&
+            log.topics[1].toLowerCase().includes(tx.from.toLowerCase().slice(2))
+          ) {
+            totalIn += amount;
+          }
+        }
+      }
+
+      const profit = totalOut - totalIn;
+      return profit > 0n ? profit : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  /**
+   * Identify the type of MEV opportunity from transaction
+   */
+  private async identifyOpportunityType(
+    tx: ethers.TransactionResponse,
+    receipt: ethers.TransactionReceipt
+  ): Promise<OpportunityType | null> {
+    try {
+      // Check for arbitrage patterns (multiple swaps)
+      const swapTopic = '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67'; // Uniswap V3 Swap
+      const swapCount = receipt.logs.filter(log => log.topics[0] === swapTopic).length;
+
+      if (swapCount >= 2) {
+        return OpportunityType.ARBITRAGE;
+      }
+
+      // Check for liquidation patterns
+      if (tx.data && tx.data.includes('0x96cd4ddb')) {
+        // liquidateBorrow selector
+        return OpportunityType.LIQUIDATION;
+      }
+
+      return null;
+    } catch (error) {
+      return null;
+    }
   }
 
   private async isCompetitorTransaction(tx: {
@@ -771,36 +901,9 @@ export class CompetitiveIntelligenceSystem extends EventEmitter {
     const competitor = this.competitors.get(address);
     if (!competitor) return;
 
-    // This would analyze transaction patterns to identify strategies
-    // For now, we'll simulate strategy detection
+    // Analyze transaction patterns to identify strategies using real data
     if (competitor.strategies.length === 0) {
-      const strategy: CompetitorStrategy = {
-        type: OpportunityType.ARBITRAGE,
-        pattern: {
-          gasLimit: 300000n,
-          gasPriceRange: { min: 20000000000n, max: 50000000000n },
-          targetTokens: [],
-          targetPools: [],
-          executionTiming: 2000,
-          bundleUsage: false,
-          flashLoanUsage: false,
-          signature: 'arbitrage-pattern',
-        },
-        frequency: 10,
-        successRate: competitor.successRate,
-        averageGasPrice: 30000000000n,
-        averageProfit: competitor.averageProfit,
-        timingBehavior: {
-          averageDelay: 1500,
-          delayVariance: 500,
-          blockTargeting: 'current',
-          competitionAvoidance: false,
-          frontrunning: false,
-          backrunning: true,
-        },
-        lastObserved: Date.now(),
-        confidence: 0.8,
-      };
+      const strategy: CompetitorStrategy = await this.analyzeCompetitorStrategy(competitor);
 
       const updatedCompetitor: Competitor = {
         ...competitor,
@@ -811,11 +914,87 @@ export class CompetitiveIntelligenceSystem extends EventEmitter {
     }
   }
 
-  private async analyzeCompetitorStrategy(
-    competitor: Competitor
-  ): Promise<CompetitorStrategy | null> {
-    // Simplified strategy analysis
-    return competitor.strategies[0] || null;
+  /**
+   * Analyze competitor strategy from transaction patterns
+   */
+  private async analyzeCompetitorStrategy(competitor: Competitor): Promise<CompetitorStrategy> {
+    const recentTxs = this.transactionHistory.filter(tx => tx.from === competitor.address);
+
+    // Analyze transaction patterns
+    const arbitrageTxs = recentTxs.filter(tx => tx.type === OpportunityType.ARBITRAGE);
+    const liquidationTxs = recentTxs.filter(tx => tx.type === OpportunityType.LIQUIDATION);
+
+    let primaryType = OpportunityType.ARBITRAGE;
+    let confidence = 0.5;
+
+    if (arbitrageTxs.length > liquidationTxs.length) {
+      primaryType = OpportunityType.ARBITRAGE;
+      confidence = arbitrageTxs.length / recentTxs.length;
+    } else if (liquidationTxs.length > 0) {
+      primaryType = OpportunityType.LIQUIDATION;
+      confidence = liquidationTxs.length / recentTxs.length;
+    }
+
+    // Calculate average gas price and success rate
+    const avgGasPrice =
+      recentTxs.length > 0
+        ? recentTxs.reduce((sum, tx) => sum + tx.gasPrice, 0n) / BigInt(recentTxs.length)
+        : 20000000000n;
+
+    const successRate =
+      recentTxs.length > 0 ? recentTxs.filter(tx => tx.success).length / recentTxs.length : 0.8;
+
+    return {
+      type: primaryType,
+      pattern: {
+        gasLimit: 300000n,
+        gasPriceRange: { min: 20000000000n, max: 50000000000n },
+        targetTokens: [],
+        targetPools: [],
+        executionTiming: 2000,
+        bundleUsage: false,
+        flashLoanUsage: false,
+        signature: 'arbitrage-pattern',
+      },
+      frequency: recentTxs.length,
+      successRate,
+      averageGasPrice: avgGasPrice,
+      averageProfit: this.calculateCompetitorProfitability(recentTxs),
+      timingBehavior: {
+        averageDelay: 1500,
+        delayVariance: 500,
+        blockTargeting: 'current',
+        competitionAvoidance: false,
+        frontrunning: false,
+        backrunning: true,
+      },
+      lastObserved: Date.now(),
+      confidence,
+    };
+  }
+
+  /**
+   * Calculate competitor profitability from transaction history
+   */
+  private calculateCompetitorProfitability(
+    transactions: Array<{
+      profit?: bigint;
+      gasPrice: bigint;
+      gasUsed: bigint;
+      success: boolean;
+    }>
+  ): bigint {
+    let totalProfit = 0n;
+    let totalCost = 0n;
+
+    for (const tx of transactions) {
+      if (tx.success && tx.profit) {
+        totalProfit += tx.profit;
+      }
+      totalCost += tx.gasPrice * tx.gasUsed;
+    }
+
+    return totalProfit > totalCost ? totalProfit - totalCost : 0n;
   }
 
   private async developCounterStrategy(
