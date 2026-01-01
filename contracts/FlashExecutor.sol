@@ -7,13 +7,14 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3FlashCallback.sol";
+import "@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol";
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 
 /**
  * @title FlashExecutor
  * @dev Executes flash loan arbitrage on Base blockchain
  */
-contract FlashExecutor is IUniswapV3FlashCallback, Ownable, ReentrancyGuard, Pausable {
+contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
     struct RouteData {
@@ -32,6 +33,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, Ownable, ReentrancyGuard, Pau
         address tokenOut;
         uint256 amountIn;
         uint256 minProfit;
+        address recipient;
         RouteData route;
     }
 
@@ -122,7 +124,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, Ownable, ReentrancyGuard, Pau
         FlashParams memory params = abi.decode(data, (FlashParams));
         
         uint256 gasStart = gasleft();
-        uint256 amountOwed = params.amountIn + (fee0 > 0 ? fee0 : fee1);
+        uint256 amountOwed = params.amountIn + fee0 + fee1; // Sum both fees
         
         // Record initial balance
         uint256 initialBalance = IERC20(params.tokenIn).balanceOf(address(this));
@@ -132,27 +134,45 @@ contract FlashExecutor is IUniswapV3FlashCallback, Ownable, ReentrancyGuard, Pau
         
         // Calculate profit
         uint256 finalBalance = IERC20(params.tokenIn).balanceOf(address(this));
-        require(finalBalance >= amountOwed, "Insufficient funds to repay");
+        require(finalBalance >= initialBalance + amountOwed, "Insufficient funds to repay");
         
-        uint256 profit = finalBalance - initialBalance;
+        uint256 profit = (amountOut > amountOwed) ? amountOut - amountOwed : 0;
         require(profit >= params.minProfit, "Insufficient profit");
         
         // Repay flash loan
         IERC20(params.tokenIn).safeTransfer(msg.sender, amountOwed);
         
-        // Transfer profit to caller
+        // Transfer profit to validated recipient
+        require(params.recipient != address(0), "Invalid recipient");
         if (profit > 0) {
-            IERC20(params.tokenIn).safeTransfer(tx.origin, profit);
+            IERC20(params.tokenIn).safeTransfer(params.recipient, profit);
         }
         
         emit ArbitrageExecuted(
-            tx.origin,
+            params.recipient,
             params.tokenIn,
             params.tokenOut,
             params.amountIn,
             profit,
             gasStart - gasleft()
         );
+    }
+
+    /**
+     * @dev Uniswap V3 swap callback
+     */
+    function uniswapV3SwapCallback(
+        int256 amount0Delta,
+        int256 amount1Delta,
+        bytes calldata data
+    ) external override onlyAuthorizedPool {
+        require(amount0Delta > 0 || amount1Delta > 0, "Invalid swap");
+        
+        // Decode callback data to get payer and token info
+        (address tokenIn, address payer, uint256 amountOwed) = abi.decode(data, (address, address, uint256));
+        
+        // Transfer owed tokens to pool
+        IERC20(tokenIn).safeTransferFrom(payer, msg.sender, amountOwed);
     }
 
     /**
@@ -186,7 +206,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, Ownable, ReentrancyGuard, Pau
     }
 
     /**
-     * @dev Execute swap on a single pool
+     * @dev Execute swap on a single pool using callback pattern
      */
     function _swapOnPool(
         address pool,
@@ -194,16 +214,16 @@ contract FlashExecutor is IUniswapV3FlashCallback, Ownable, ReentrancyGuard, Pau
         uint256 amountIn,
         bool zeroForOne
     ) internal returns (uint256 amountOut) {
-        // Transfer tokens to pool
-        IERC20(tokenIn).safeTransfer(pool, amountIn);
+        // Encode callback data for the swap
+        bytes memory callbackData = abi.encode(tokenIn, address(this), amountIn);
         
-        // Execute swap
+        // Execute swap - tokens will be transferred in callback
         (int256 amount0, int256 amount1) = IUniswapV3Pool(pool).swap(
             address(this),
             zeroForOne,
             int256(amountIn),
             zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341, // sqrt price limits
-            ""
+            callbackData
         );
         
         return uint256(-(zeroForOne ? amount1 : amount0));

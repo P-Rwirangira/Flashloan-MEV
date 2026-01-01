@@ -48,6 +48,11 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
 
     this.signer = signer;
 
+    // Filter out undefined values from config to prevent overwriting defaults
+    const filteredConfig = Object.fromEntries(
+      Object.entries(config).filter(([, value]) => value !== undefined)
+    );
+
     this.config = {
       defaultRelay: config.defaultRelay ?? RelayProvider.FLASHBOTS_PROTECT,
       enableFallback: config.enableFallback ?? true,
@@ -58,7 +63,7 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
       enableBundles: config.enableBundles ?? true,
       maxBundleSize: config.maxBundleSize ?? 5,
       relayProviders: config.relayProviders ?? this.getDefaultRelayConfigs(),
-      ...config,
+      ...filteredConfig,
     };
 
     this.initializeRelayConfigs();
@@ -254,11 +259,12 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
         headers['Authorization'] = `Bearer ${config.authentication.apiKey}`;
       }
 
-      // Submit to Flashbots Protect
+      // Submit to Flashbots Protect with timeout
       const response = await fetch(config.endpoint, {
         method: 'POST',
         headers,
         body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(config.timeoutMs),
       });
 
       if (!response.ok) {
@@ -339,11 +345,12 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
         Authorization: config.authentication.apiKey,
       };
 
-      // Submit to bloXroute
+      // Submit to bloXroute with timeout
       const response = await fetch(`${config.endpoint}/v1/tx`, {
         method: 'POST',
         headers,
         body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(config.timeoutMs),
       });
 
       if (!response.ok) {

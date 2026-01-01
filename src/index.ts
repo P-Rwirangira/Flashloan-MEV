@@ -106,6 +106,11 @@ export class BaseMEVPlatform extends EventEmitter {
   private platformLogger = createComponentLogger('platform');
   private config?: PlatformConfig;
 
+  // Performance monitoring intervals
+  private gcInterval?: NodeJS.Timeout | undefined;
+  private cpuMonitorInterval?: NodeJS.Timeout | undefined;
+  private eventLoopMonitorRunning = false;
+
   constructor() {
     super();
 
@@ -545,8 +550,18 @@ export class BaseMEVPlatform extends EventEmitter {
       const privateKey = process.env['EXECUTION_PRIVATE_KEY'];
       if (!privateKey) {
         this.platformLogger.warn('No execution private key provided, execution engine disabled');
+        // Set flag but continue with other components
+        const executionEnabled = false;
+        this.platformLogger.info('Continuing initialization without execution engine', {
+          executionEnabled,
+        });
         return;
       }
+
+      const executionEnabled = true;
+      this.platformLogger.info('Execution engine will be initialized', {
+        executionEnabled,
+      });
 
       try {
         // Create provider and signer for execution
@@ -1017,7 +1032,7 @@ export class BaseMEVPlatform extends EventEmitter {
   private setupPerformanceOptimization(): void {
     // Memory management and garbage collection optimization
     if (global.gc) {
-      setInterval(() => {
+      this.gcInterval = setInterval(() => {
         const memUsage = process.memoryUsage();
         const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
         const heapTotalMB = Math.round(memUsage.heapTotal / 1024 / 1024);
@@ -1039,7 +1054,7 @@ export class BaseMEVPlatform extends EventEmitter {
 
     // CPU usage monitoring and throttling
     let lastCpuUsage = process.cpuUsage();
-    setInterval(() => {
+    this.cpuMonitorInterval = setInterval(() => {
       const currentCpuUsage = process.cpuUsage(lastCpuUsage);
       const cpuPercent = (currentCpuUsage.user + currentCpuUsage.system) / 1000000; // Convert to seconds
 
@@ -1120,8 +1135,13 @@ export class BaseMEVPlatform extends EventEmitter {
 
   private monitorEventLoopLag(): void {
     let start = process.hrtime.bigint();
+    this.eventLoopMonitorRunning = true;
 
     const measureLag = () => {
+      if (!this.eventLoopMonitorRunning) {
+        return; // Stop the loop
+      }
+
       const delta = process.hrtime.bigint() - start;
       const lagMs = Number(delta) / 1000000; // Convert to milliseconds
 
@@ -1701,6 +1721,19 @@ export class BaseMEVPlatform extends EventEmitter {
 
       // Stop health check system
       this.healthCheckSystem.stop();
+
+      // Stop event loop monitoring
+      this.eventLoopMonitorRunning = false;
+
+      // Clear performance monitoring intervals
+      if (this.gcInterval) {
+        clearInterval(this.gcInterval);
+        this.gcInterval = undefined;
+      }
+      if (this.cpuMonitorInterval) {
+        clearInterval(this.cpuMonitorInterval);
+        this.cpuMonitorInterval = undefined;
+      }
 
       // Stop health check server
       try {

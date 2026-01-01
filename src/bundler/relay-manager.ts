@@ -115,10 +115,16 @@ export class RelayManager extends EventEmitter {
     );
 
     if (flashbotsConfig) {
+      // Validate Flashbots auth key
+      const flashbotsAuthKey = process.env['FLASHBOTS_AUTH_KEY'];
+      if (!flashbotsAuthKey || flashbotsAuthKey.trim() === '') {
+        throw new Error('FLASHBOTS_AUTH_KEY environment variable is required but not set or empty');
+      }
+
       this.flashbotsRelay = new FlashbotsRelay({
         connectionManager: this.connectionManager,
         wallet: this.wallet,
-        authSignerPrivateKey: process.env['FLASHBOTS_AUTH_KEY'],
+        authSignerPrivateKey: flashbotsAuthKey,
         network: 'base',
       });
 

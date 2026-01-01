@@ -302,7 +302,12 @@ export class FlashLoanExecutionError extends FlashLoanError {
 
 export class ProviderUnavailableError extends FlashLoanError {
   constructor(provider: FlashLoanProvider, reason: string) {
-    super(`Provider ${provider} unavailable: ${reason}`, provider, '0x0' as Address, 0n);
+    super(
+      `Provider ${provider} unavailable: ${reason}`,
+      provider,
+      '0x0000000000000000000000000000000000000000' as Address,
+      0n
+    );
     this.name = 'ProviderUnavailableError';
   }
 }

@@ -60,19 +60,34 @@ export class BloXrouteRelay {
     }
 
     try {
-      // Verify API key by making a test request
-      const response = await fetch(`${this.endpoint}/api/v1/status`, {
-        headers: {
-          Authorization: this.apiKey,
-        },
-      });
+      // Create AbortController for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
 
-      if (!response.ok) {
-        throw new Error(`bloXroute API returned ${response.status}: ${response.statusText}`);
+      try {
+        // Verify API key by making a test request
+        const response = await fetch(`${this.endpoint}/api/v1/status`, {
+          headers: {
+            Authorization: this.apiKey,
+          },
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          throw new Error(`bloXroute API returned ${response.status}: ${response.statusText}`);
+        }
+
+        this.initialized = true;
+        this.logger.info('bloXroute relay initialized successfully');
+      } catch (error) {
+        clearTimeout(timeoutId);
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw new Error('bloXroute initialization timeout after 10 seconds');
+        }
+        throw error;
       }
-
-      this.initialized = true;
-      this.logger.info('bloXroute relay initialized successfully');
     } catch (error) {
       this.logger.logError(error as Error, {
         operation: 'bloxroute-initialization',
@@ -97,38 +112,52 @@ export class BloXrouteRelay {
       // Sign the transaction
       const signedTx = await this.wallet.signTransaction(transaction);
 
-      // Send via bloXroute private transaction endpoint
-      const response = await fetch(`${this.endpoint}/api/v1/tx`, {
-        method: 'POST',
-        headers: {
-          Authorization: this.apiKey,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          transaction: signedTx,
-          blockchain_network: this.network,
-        }),
-      });
+      // Create AbortController for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
-      const latency = Date.now() - startTime;
+      try {
+        // Send via bloXroute private transaction endpoint
+        const response = await fetch(`${this.endpoint}/api/v1/tx`, {
+          method: 'POST',
+          headers: {
+            Authorization: this.apiKey,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            transaction: signedTx,
+            blockchain_network: this.network,
+          }),
+          signal: controller.signal,
+        });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`bloXroute API error: ${response.status} - ${errorText}`);
+        clearTimeout(timeoutId);
+        const latency = Date.now() - startTime;
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`bloXroute API error: ${response.status} - ${errorText}`);
+        }
+
+        const result = (await response.json()) as { tx_hash: string };
+
+        this.logger.info('Private transaction sent via bloXroute', {
+          transactionHash: result.tx_hash,
+          latency,
+        });
+
+        return {
+          success: true,
+          transactionHash: result.tx_hash,
+          latency,
+        };
+      } catch (error) {
+        clearTimeout(timeoutId);
+        if (error instanceof Error && error.name === 'AbortError') {
+          throw new Error('bloXroute transaction submission timeout after 30 seconds');
+        }
+        throw error;
       }
-
-      const result = (await response.json()) as { tx_hash: string };
-
-      this.logger.info('Private transaction sent via bloXroute', {
-        transactionHash: result.tx_hash,
-        latency,
-      });
-
-      return {
-        success: true,
-        transactionHash: result.tx_hash,
-        latency,
-      };
     } catch (error) {
       this.logger.logError(error as Error, {
         operation: 'bloxroute-send-private-tx',

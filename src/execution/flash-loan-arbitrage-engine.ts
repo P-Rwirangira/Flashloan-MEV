@@ -18,6 +18,8 @@ import {
   ArbitrageOpportunity,
   ExecutionResult,
   ExecutionContext,
+  OpportunityType,
+  OpportunityPhase,
   IExecutionEngine,
   SwapRoute,
 } from '../types/execution';
@@ -354,7 +356,7 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
       const executionData = await this.buildExecutionData(opportunity.route);
 
       // Calculate expected profit after fees
-      const flashLoanFee = (flashLoanSource.fee * opportunity.amountIn) / flashLoanSource.maxAmount;
+      const flashLoanFee = flashLoanSource.fee; // Fee is already for the requested amount
       const expectedProfit = opportunity.estimatedProfit - flashLoanFee - totalGasCost;
 
       const plan: RouteExecutionPlan = {
@@ -472,8 +474,29 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
       executionData,
     ]);
 
-    // Estimate gas with buffer
-    const gasLimit = await this.estimateGas({ route: swapRoute } as any);
+    // Estimate gas with buffer - create minimal opportunity object for gas estimation
+    const firstSwap = swapRoute[0];
+    if (!firstSwap) {
+      throw new Error('Invalid swap route: no swaps defined');
+    }
+
+    const gasEstimationOpportunity = {
+      id: 'gas-estimation',
+      type: OpportunityType.ARBITRAGE,
+      phase: OpportunityPhase.CROSS_DEX,
+      tokenIn: firstSwap.tokenIn,
+      tokenOut: firstSwap.tokenOut,
+      amountIn: firstSwap.amountIn,
+      estimatedProfit: 0n,
+      estimatedGasCost: 0n,
+      route: swapRoute,
+      timestamp: Date.now(),
+      detectedAt: Date.now(),
+      priority: 1,
+      confidence: 1.0,
+      metadata: {},
+    };
+    const gasLimit = await this.estimateGas(gasEstimationOpportunity);
 
     const transaction: TransactionRequest = {
       to: this.config.flashExecutorAddress,

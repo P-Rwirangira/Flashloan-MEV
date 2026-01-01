@@ -6,6 +6,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { ethers } from 'ethers';
 import { createComponentLogger } from '../utils/logger';
 import { Address } from '../types/common';
 import {
@@ -291,7 +292,9 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
       try {
         const fee = (amount * BigInt(Math.floor(config.feeRate * 1e18))) / BigInt(1e18);
         const gasOverhead = BigInt(50000); // Mock gas overhead
-        const totalCost = fee + gasOverhead;
+        const gasPrice = BigInt(2000000000); // 2 gwei default
+        const gasCost = gasOverhead * gasPrice;
+        const totalCost = fee + gasCost;
 
         estimates.push({
           provider: providerType as FlashLoanProvider,
@@ -301,7 +304,7 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
           fee,
           gasOverhead,
           totalCost,
-          costPercentage: Number((totalCost * BigInt(10000)) / amount) / 100, // Percentage with 2 decimals
+          costPercentage: amount > 0n ? Number((totalCost * BigInt(10000)) / amount) / 100 : 0, // Percentage with 2 decimals
         });
       } catch (error) {
         this.logger.warn('Failed to estimate cost for provider', {
@@ -344,7 +347,8 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
       token,
       totalCapacity,
       availableCapacity,
-      utilizationRate: totalCapacity > 0n ? Number(availableCapacity) / Number(totalCapacity) : 0,
+      utilizationRate:
+        totalCapacity > 0n ? Number(totalCapacity - availableCapacity) / Number(totalCapacity) : 0,
       sources,
     };
   }
@@ -395,7 +399,7 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
       // In production, this would interact with actual flash loan contracts
       return {
         success: true,
-        transactionHash: '0x' + Math.random().toString(16).substr(2, 64),
+        transactionHash: ethers.hexlify(ethers.randomBytes(32)),
         gasUsed: BigInt(200000),
         feesPaid: source.fee,
         profit: BigInt(0),
@@ -439,7 +443,7 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
 
       return {
         success: true,
-        transactionHash: '0x' + Math.random().toString(16).substr(2, 64),
+        transactionHash: ethers.hexlify(ethers.randomBytes(32)),
         gasUsed: BigInt(300000),
         feesPaid: primarySplit.fee,
         profit: BigInt(0),
@@ -475,10 +479,14 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
 
       const splitAmount = remainingAmount > source.maxAmount ? source.maxAmount : remainingAmount;
 
+      // Calculate fee proportionally based on the fee rate
+      const feeRate = source.maxAmount > 0n ? Number(source.fee) / Number(source.maxAmount) : 0;
+      const splitFee = BigInt(Math.floor(Number(splitAmount) * feeRate));
+
       splits.push({
         source,
         amount: splitAmount,
-        fee: (splitAmount * source.fee) / source.maxAmount,
+        fee: splitFee,
         gasOverhead: source.gasOverhead,
       });
 

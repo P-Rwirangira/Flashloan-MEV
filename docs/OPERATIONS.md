@@ -54,7 +54,7 @@
 
 3. **Verify Deployment**
    ```bash
-   curl http://localhost:3002/health
+   curl http://localhost:8080/health
    ```
 
 ### Production Deployment Checklist
@@ -132,7 +132,7 @@ gracefulDegradation:
 
 ### Health Checks
 
-**Endpoint:** `http://localhost:3002/health`
+**Endpoint:** `http://localhost:8080/health`
 
 Monitor these key metrics:
 - System status (healthy/degraded/unhealthy)
@@ -168,7 +168,7 @@ Monitor these key metrics:
 Access metrics via `/metrics` endpoint:
 
 ```bash
-curl http://localhost:3002/metrics | jq '.'
+curl http://localhost:9090/metrics | jq '.'
 ```
 
 ### Log Monitoring
@@ -215,7 +215,7 @@ monitoring:
 **Solutions:**
 ```bash
 # Check RPC connection
-curl http://localhost:3002/health | jq '.checks.rpcConnection'
+curl http://localhost:8080/health | jq '.checks.rpcConnection'
 
 # Review configuration
 cat config/default.yaml | grep -A 10 "strategies:"
