@@ -12,6 +12,7 @@ import { Address } from '../types/common';
 import { OpportunityStateMachine } from './opportunity-state-machine';
 import { FlashLoanManager } from './flash-loan-manager';
 import { TransactionLifecycleManager } from './transaction-lifecycle-manager';
+import { RealTransactionValidator } from '../simulator/real-transaction-validator';
 import { OpportunityState } from '../types/execution-state';
 import {
   BaseOpportunity,
@@ -76,6 +77,7 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
   private readonly stateMachine: OpportunityStateMachine;
   private readonly flashLoanManager: FlashLoanManager;
   private readonly transactionManager: TransactionLifecycleManager;
+  private readonly transactionValidator?: RealTransactionValidator;
 
   private readonly flashExecutorInterface: ethers.Interface;
 
@@ -96,13 +98,15 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
     stateMachine: OpportunityStateMachine,
     flashLoanManager: FlashLoanManager,
     transactionManager: TransactionLifecycleManager,
-    config: Partial<ArbitrageEngineConfig> = {}
+    config: Partial<ArbitrageEngineConfig> = {},
+    transactionValidator?: RealTransactionValidator
   ) {
     super();
 
     this.stateMachine = stateMachine;
     this.flashLoanManager = flashLoanManager;
     this.transactionManager = transactionManager;
+    this.transactionValidator = transactionValidator;
 
     this.config = {
       flashExecutorAddress:
@@ -227,9 +231,18 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
       // Build execution plan
       const executionPlan = await this.buildExecutionPlan(arbOpp, context);
 
-      // Validate profit if enabled
-      if (this.config.enableProfitValidation) {
-        await this.validateProfitability(executionPlan, arbOpp);
+      // Validate opportunity using real transaction validator before execution
+      if (this.transactionValidator) {
+        const validationResult = await this.transactionValidator.validate(arbOpp);
+        if (!validationResult.success) {
+          throw new Error(`Opportunity validation failed: ${validationResult.error}`);
+        }
+
+        this.logger.debug('Opportunity validation passed', {
+          opportunityId: opportunity.id,
+          actualProfit: validationResult.actualProfit.toString(),
+          gasUsed: validationResult.gasUsed.toString(),
+        });
       }
 
       // Build flash loan transaction
@@ -288,35 +301,49 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
   }
 
   /**
-   * Estimate gas for arbitrage execution
+   * Estimate gas for arbitrage execution using real transaction data
    */
   async estimateGas(opportunity: BaseOpportunity): Promise<bigint> {
     const arbOpp = opportunity as ArbitrageOpportunity;
 
     try {
-      // Base gas for flash loan callback
-      let gasEstimate = 150000n; // Base overhead
+      // Use transaction validator for accurate gas estimation if available
+      if (this.transactionValidator) {
+        const validationResult = await this.transactionValidator.validate(arbOpp);
+        if (validationResult.success) {
+          return validationResult.gasUsed;
+        }
+      }
 
-      // Add gas per swap in route
-      gasEstimate += BigInt(arbOpp.route.length * 80000); // ~80k per swap
+      // Fallback to route-based estimation
+      let gasEstimate = 200000n; // Base flash loan overhead
 
-      // Add buffer for complex routes
+      // Add gas per swap based on protocol
+      for (const swap of arbOpp.route) {
+        if (swap.protocol === 'uniswap-v3') {
+          gasEstimate += 150000n; // Uniswap V3 swap
+        } else if (swap.protocol === 'aerodrome') {
+          gasEstimate += 120000n; // Aerodrome swap (more efficient)
+        } else {
+          gasEstimate += 100000n; // Generic DEX swap
+        }
+      }
+
+      // Add complexity overhead for multi-hop routes
       if (arbOpp.route.length > 2) {
-        gasEstimate += 50000n;
+        gasEstimate += BigInt(arbOpp.route.length - 2) * 50000n;
       }
 
-      // Add gas optimization buffer (increase for safety, not decrease)
-      if (this.config.gasOptimizationEnabled) {
-        gasEstimate = BigInt(Math.ceil(Number(gasEstimate) * 1.1)); // 10% safety buffer
-      }
+      // Add safety buffer (15% for real execution)
+      gasEstimate = (gasEstimate * 115n) / 100n;
 
       return gasEstimate;
     } catch (error) {
-      this.logger.warn('Gas estimation failed, using default', {
+      this.logger.warn('Gas estimation failed, using conservative default', {
         opportunityId: opportunity.id,
         error: error instanceof Error ? error.message : String(error),
       });
-      return 200000n; // Conservative default
+      return 400000n; // Conservative default for arbitrage
     }
   }
 

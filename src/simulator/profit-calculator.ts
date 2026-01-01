@@ -58,12 +58,15 @@ export interface ProfitThresholds {
 
 // Enhanced price oracle implementation with real Chainlink feeds
 export class EnhancedPriceOracle implements IPriceOracle {
+  private readonly logger = createComponentLogger('enhanced-price-oracle');
+  private readonly provider: ethers.Provider;
   private readonly chainlinkOracle: ChainlinkPriceOracleImpl;
   private priceCache: Map<string, { price: number; timestamp: number; confidence: number }> =
     new Map();
   private readonly cacheTimeMs = 30000; // 30 seconds cache for enhanced responsiveness
 
   constructor(connectionManager: RpcConnectionManager) {
+    this.provider = connectionManager.getProvider();
     this.chainlinkOracle = new ChainlinkPriceOracleImpl(connectionManager);
   }
 
@@ -173,6 +176,13 @@ export class EnhancedPriceOracle implements IPriceOracle {
   }
 
   /**
+   * Get ETH price from oracle (alias for getEthUsdPrice for compatibility)
+   */
+  async getEthPriceFromOracle(): Promise<number> {
+    return this.getEthUsdPrice();
+  }
+
+  /**
    * Fetch ETH price from external API as fallback
    */
   private async fetchEthPriceFromExternalApi(): Promise<number> {
@@ -214,12 +224,136 @@ export class EnhancedPriceOracle implements IPriceOracle {
   }
 
   /**
-   * Query token price from DEX pools
+   * Query token price from DEX pools using real on-chain data
    */
-  private async queryTokenPriceFromDex(_tokenAddress: Address): Promise<number> {
-    // This would implement real DEX pool queries
-    // For now, return 0 to indicate no price found
-    return 0;
+  private async queryTokenPriceFromDex(tokenAddress: Address): Promise<number> {
+    try {
+      // Get WETH address for Base
+      const WETH_ADDRESS = '0x4200000000000000000000000000000000000006';
+
+      // Try to find a WETH pair for this token
+      const uniswapV3Factory = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD'; // Base Uniswap V3 Factory
+
+      // Common fee tiers to check
+      const feeTiers = [500, 3000, 10000]; // 0.05%, 0.3%, 1%
+
+      for (const fee of feeTiers) {
+        try {
+          const factoryContract = new ethers.Contract(
+            uniswapV3Factory,
+            [
+              'function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool)',
+            ],
+            this.provider
+          );
+
+          const poolAddress = await factoryContract['getPool'](tokenAddress, WETH_ADDRESS, fee);
+
+          if (poolAddress && poolAddress !== ethers.ZeroAddress) {
+            // Get pool state
+            const poolContract = new ethers.Contract(
+              poolAddress,
+              [
+                'function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+                'function token0() external view returns (address)',
+                'function token1() external view returns (address)',
+              ],
+              this.provider
+            );
+
+            const [slot0, token0] = await Promise.all([
+              poolContract['slot0'](),
+              poolContract['token0'](),
+            ]);
+
+            if (slot0.sqrtPriceX96 > 0) {
+              // Calculate price from sqrtPriceX96
+              const sqrtPriceX96 = slot0.sqrtPriceX96;
+              const price = (Number(sqrtPriceX96) / 2 ** 96) ** 2;
+
+              // Adjust for token order (token0/token1 vs token1/token0)
+              const isToken0 = token0.toLowerCase() === tokenAddress.toLowerCase();
+              const tokenPrice = isToken0 ? price : 1 / price;
+
+              // Get current ETH price and convert
+              const ethPrice = await this.getEthPriceFromOracle();
+              return tokenPrice * ethPrice;
+            }
+          }
+        } catch (error) {
+          // Continue to next fee tier
+          continue;
+        }
+      }
+
+      // Try Aerodrome pools as fallback
+      return await this.queryAerodromePrice(tokenAddress);
+    } catch (error) {
+      this.logger.warn('Failed to query token price from DEX', {
+        tokenAddress,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 0;
+    }
+  }
+
+  /**
+   * Query token price from Aerodrome pools
+   */
+  private async queryAerodromePrice(tokenAddress: Address): Promise<number> {
+    try {
+      const WETH_ADDRESS = '0x4200000000000000000000000000000000000006';
+      const AERODROME_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da'; // Aerodrome Factory on Base
+
+      const factoryContract = new ethers.Contract(
+        AERODROME_FACTORY,
+        [
+          'function getPool(address tokenA, address tokenB, bool stable) external view returns (address pool)',
+        ],
+        this.provider
+      );
+
+      // Try both stable and volatile pools
+      for (const stable of [false, true]) {
+        try {
+          const poolAddress = await factoryContract['getPool'](tokenAddress, WETH_ADDRESS, stable);
+
+          if (poolAddress && poolAddress !== ethers.ZeroAddress) {
+            const poolContract = new ethers.Contract(
+              poolAddress,
+              [
+                'function getReserves() external view returns (uint256 reserve0, uint256 reserve1, uint256 blockTimestampLast)',
+                'function token0() external view returns (address)',
+                'function token1() external view returns (address)',
+              ],
+              this.provider
+            );
+
+            const [reserves, token0] = await Promise.all([
+              poolContract['getReserves'](),
+              poolContract['token0'](),
+            ]);
+
+            if (reserves.reserve0 > 0 && reserves.reserve1 > 0) {
+              const isToken0 = token0.toLowerCase() === tokenAddress.toLowerCase();
+              const tokenReserve = isToken0 ? reserves.reserve0 : reserves.reserve1;
+              const wethReserve = isToken0 ? reserves.reserve1 : reserves.reserve0;
+
+              const tokenPrice = Number(wethReserve) / Number(tokenReserve);
+              const ethPrice = await this.getEthPriceFromOracle();
+
+              return tokenPrice * ethPrice;
+            }
+          }
+        } catch (error) {
+          continue;
+        }
+      }
+
+      return 0;
+    } catch (error) {
+      return 0;
+    }
   }
 
   /**

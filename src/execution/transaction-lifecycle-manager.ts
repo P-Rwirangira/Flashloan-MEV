@@ -411,23 +411,50 @@ export class TransactionLifecycleManager
   }
 
   /**
-   * Simulate transaction execution
+   * Validate transaction execution using real blockchain state
    */
   async simulateTransaction(transaction: TransactionRequest): Promise<TransactionSimulationResult> {
     const startTime = Date.now();
 
     try {
-      // For now, return a simple simulation result
-      // In production, this would use a simulation service
+      // Use eth_call to simulate transaction execution
+      const result = await this.provider.call({
+        to: transaction.to,
+        data: transaction.data,
+        value: transaction.value,
+        gasLimit: transaction.gasLimit,
+        gasPrice: transaction.maxFeePerGas,
+      });
+
+      // If call succeeds, estimate gas usage
+      const gasUsed = await this.provider.estimateGas({
+        to: transaction.to,
+        data: transaction.data,
+        value: transaction.value,
+      });
+
       return {
         success: true,
-        gasUsed: transaction.gasLimit,
+        gasUsed,
         simulationTime: Date.now() - startTime,
+        result,
       };
     } catch (error) {
+      // Parse revert reason if available
+      let revertReason = 'Unknown error';
+      if (error instanceof Error) {
+        // Try to extract revert reason from error message
+        const match = error.message.match(/revert (.+)/);
+        if (match) {
+          revertReason = match[1];
+        } else {
+          revertReason = error.message;
+        }
+      }
+
       return {
         success: false,
-        revertReason: error instanceof Error ? error.message : String(error),
+        revertReason,
         simulationTime: Date.now() - startTime,
       };
     }

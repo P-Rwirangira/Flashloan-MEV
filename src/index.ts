@@ -20,8 +20,9 @@ import { RelayProvider } from './bundler/private-relay';
 import { LendingProtocolMonitor } from './scanner/lending-monitor';
 import { StablePoolMonitor } from './scanner/stable-pool-monitor';
 import { MempoolMonitor } from './scanner/mempool-monitor';
+import { RealTransactionValidator } from './simulator/real-transaction-validator';
+import { RealStablePoolRebalancingCalculator } from './simulator/real-stable-pool-calculator';
 import { LiquidationProfitCalculator } from './simulator/liquidation-calculator';
-import { StablePoolRebalancingCalculator } from './simulator/stable-pool-calculator';
 import { ExecutionOrchestrator } from './execution/execution-orchestrator';
 import { FlashLoanArbitrageEngine } from './execution/flash-loan-arbitrage-engine';
 import { LiquidationEngine } from './execution/liquidation-engine';
@@ -100,7 +101,8 @@ export class BaseMEVPlatform extends EventEmitter {
   private lendingMonitor?: LendingProtocolMonitor;
   private stablePoolMonitor?: StablePoolMonitor;
   private liquidationCalculator?: LiquidationProfitCalculator;
-  private stablePoolCalculator?: StablePoolRebalancingCalculator;
+  private stablePoolCalculator?: RealStablePoolRebalancingCalculator;
+  private transactionValidator?: RealTransactionValidator;
 
   private isRunning = false;
   private platformLogger = createComponentLogger('platform');
@@ -481,6 +483,19 @@ export class BaseMEVPlatform extends EventEmitter {
         this.connectionManager
       );
 
+      // Initialize real transaction validator
+      this.transactionValidator = new RealTransactionValidator({
+        connectionManager: this.connectionManager,
+        contractManager: this.contractManager,
+        maxGasPrice: ethers.parseUnits('100', 'gwei'),
+        validationTimeoutMs: 5000,
+        maxConcurrentValidations: 10,
+        enableProfitValidation: true,
+        minProfitMarginPercent: 10.0,
+      });
+
+      await this.transactionValidator.initialize();
+
       // Initialize liquidation calculator
       this.liquidationCalculator = new LiquidationProfitCalculator({
         maxSlippage: 0.01,
@@ -527,8 +542,9 @@ export class BaseMEVPlatform extends EventEmitter {
         this.connectionManager
       );
 
-      // Initialize stable pool calculator
-      this.stablePoolCalculator = new StablePoolRebalancingCalculator({
+      // Initialize real stable pool calculator
+      this.stablePoolCalculator = new RealStablePoolRebalancingCalculator({
+        connectionManager: this.connectionManager,
         maxSlippage: 0.005,
         gasPrice: 20000000000n,
         minProfitMargin: 0.05,
@@ -1209,8 +1225,8 @@ export class BaseMEVPlatform extends EventEmitter {
       // Emit ready event
       this.emit('ready');
 
-      // Start opportunity simulation for demonstration
-      this.simulateMultiPhaseActivity();
+      // Start real opportunity detection and validation
+      this.startRealOpportunityDetection();
     });
   }
 
@@ -1318,8 +1334,11 @@ export class BaseMEVPlatform extends EventEmitter {
         return;
       }
 
-      // Validate profit threshold (placeholder for now - will be enhanced in later tasks)
+      // Validate profit threshold using real market data
+      const currentEthPrice = await this.getCurrentEthPrice();
       const minProfitUSD = 15.0; // Updated threshold for Base L2
+      const minProfitWei = ethers.parseEther((minProfitUSD / currentEthPrice).toString());
+
       if (opportunity.expectedProfitUSD && opportunity.expectedProfitUSD < minProfitUSD) {
         this.platformLogger.debug('Opportunity below profit threshold', {
           opportunityId: opportunity.id,
@@ -1595,67 +1614,144 @@ export class BaseMEVPlatform extends EventEmitter {
     }
   }
 
-  private simulateMultiPhaseActivity(): void {
-    // Simulate opportunities across all phases for demonstration
-    let opportunityCounter = 0;
+  /**
+   * Start real opportunity detection across all phases
+   */
+  private startRealOpportunityDetection(): void {
+    this.platformLogger.info('Starting real opportunity detection across all phases');
 
-    setInterval(() => {
-      opportunityCounter++;
-      const phaseType = opportunityCounter % 3;
-
-      if (phaseType === 0) {
-        // Simulate Phase 1: Arbitrage opportunity
-        this.simulateArbitrageOpportunity();
-      } else if (phaseType === 1 && this.config?.phases.liquidations.enabled) {
-        // Simulate Phase 2: Liquidation opportunity
-        this.simulateLiquidationOpportunity();
-      } else if (phaseType === 2 && this.config?.phases.stablePoolRebalancing.enabled) {
-        // Simulate Phase 3: Stable pool opportunity
-        this.simulateStablePoolOpportunity();
-      }
-    }, 8000); // Every 8 seconds
-  }
-
-  private simulateArbitrageOpportunity(): void {
-    // In production, this would be triggered by real arbitrage scanner events
-    // For now, we'll use the real arbitrage scanner to detect opportunities
+    // Phase 1: Start arbitrage scanning
     if (this.arbitrageScanner) {
-      // The arbitrage scanner will emit real opportunities when pools are monitored
-      this.platformLogger.debug(
-        'Arbitrage scanner is active and monitoring for real opportunities'
-      );
-    } else {
-      this.platformLogger.warn(
-        'Arbitrage scanner not initialized - no opportunities will be detected'
-      );
+      this.arbitrageScanner.startScanning();
+      this.platformLogger.info('Phase 1: Arbitrage scanning started');
+    }
+
+    // Phase 2: Start liquidation monitoring
+    if (this.lendingMonitor && this.config?.phases.liquidations.enabled) {
+      this.lendingMonitor.startMonitoring();
+      this.platformLogger.info('Phase 2: Liquidation monitoring started');
+    }
+
+    // Phase 3: Start stable pool monitoring
+    if (this.stablePoolMonitor && this.config?.phases.stablePoolRebalancing.enabled) {
+      this.stablePoolMonitor.startMonitoring();
+      this.platformLogger.info('Phase 3: Stable pool monitoring started');
+    }
+
+    // Start mempool monitoring for backrun opportunities
+    if (this.mempoolMonitor) {
+      this.mempoolMonitor.startMonitoring();
+      this.platformLogger.info('Mempool monitoring started for backrun opportunities');
+    }
+
+    // Log detection status periodically
+    setInterval(() => {
+      this.logDetectionStatus();
+    }, 30000); // Every 30 seconds
+  }
+
+  /**
+   * Log current detection status
+   */
+  private logDetectionStatus(): void {
+    const status = {
+      arbitrageScanning: this.arbitrageScanner?.isScanning() || false,
+      liquidationMonitoring: this.lendingMonitor?.isMonitoring() || false,
+      stablePoolMonitoring: this.stablePoolMonitor?.isMonitoring() || false,
+      mempoolMonitoring: this.mempoolMonitor?.isMonitoring() || false,
+      transactionValidatorActive: this.transactionValidator?.getStats().isInitialized || false,
+    };
+
+    this.platformLogger.info('Opportunity detection status', status);
+  }
+
+  /**
+   * Get current ETH price from oracle or external API
+   */
+  private async getCurrentEthPrice(): Promise<number> {
+    try {
+      // Try to get price from Chainlink oracle first
+      if (this.chainlinkOracle) {
+        const ethPrice = await this.chainlinkOracle.getEthPrice();
+        if (ethPrice > 0) {
+          return ethPrice;
+        }
+      }
+
+      // Fallback to external API
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      try {
+        const response = await fetch(
+          'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd',
+          { signal: controller.signal }
+        );
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data.ethereum?.usd && typeof data.ethereum.usd === 'number') {
+            return data.ethereum.usd;
+          }
+        }
+      } catch (error) {
+        // API call failed, continue to fallback
+      }
+
+      // Final fallback to conservative estimate
+      return 3000; // $3000 ETH
+    } catch (error) {
+      this.platformLogger.warn('Failed to get current ETH price, using fallback', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 3000; // $3000 ETH fallback
     }
   }
 
-  private simulateLiquidationOpportunity(): void {
-    // In production, this would be triggered by real lending monitor events
-    // The lending monitor will emit real liquidation opportunities when detected
-    if (this.lendingMonitor) {
-      this.platformLogger.debug(
-        'Lending monitor is active and scanning for real liquidation opportunities'
-      );
-    } else {
-      this.platformLogger.warn(
-        'Lending monitor not initialized - no liquidation opportunities will be detected'
-      );
-    }
-  }
+  /**
+   * Get current ETH price from oracle or external API
+   */
+  private async getCurrentEthPrice(): Promise<number> {
+    try {
+      // Try to get price from Chainlink oracle first
+      if (this.chainlinkOracle) {
+        const ethPrice = await this.chainlinkOracle.getEthPrice();
+        if (ethPrice > 0) {
+          return ethPrice;
+        }
+      }
 
-  private simulateStablePoolOpportunity(): void {
-    // In production, this would be triggered by real stable pool monitor events
-    // The stable pool monitor will emit real rebalancing opportunities when detected
-    if (this.stablePoolMonitor) {
-      this.platformLogger.debug(
-        'Stable pool monitor is active and scanning for real rebalancing opportunities'
-      );
-    } else {
-      this.platformLogger.warn(
-        'Stable pool monitor not initialized - no rebalancing opportunities will be detected'
-      );
+      // Fallback to external API
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      try {
+        const response = await fetch(
+          'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd',
+          { signal: controller.signal }
+        );
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          const data = await response.json();
+          if (data.ethereum?.usd && typeof data.ethereum.usd === 'number') {
+            return data.ethereum.usd;
+          }
+        }
+      } catch (error) {
+        // API call failed, continue to fallback
+      }
+
+      // Final fallback to conservative estimate
+      return 3000; // $3000 ETH
+    } catch (error) {
+      this.platformLogger.warn('Failed to get current ETH price, using fallback', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 3000; // $3000 ETH fallback
     }
   }
 

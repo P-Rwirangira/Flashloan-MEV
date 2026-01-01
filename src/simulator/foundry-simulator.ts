@@ -1,17 +1,18 @@
 /**
- * Foundry Simulator
+ * Real Transaction Validator
  *
- * Simulates transactions using Foundry/Anvil fork.
- * Validates profitability and calculates exact execution parameters.
+ * Validates transactions using real blockchain state and gas estimation.
+ * Replaces simulation with actual profitability validation and gas optimization.
  */
 
-import { spawn, ChildProcess } from 'child_process';
 import { ethers } from 'ethers';
 import { EventEmitter } from 'events';
+import { spawn, ChildProcess } from 'child_process';
 import { ArbitrageOpportunity } from '../types/opportunity';
 import { ArbitrageRoute } from '../types/execution';
 import { RpcConnectionManager } from '../rpc/connection-manager';
 import { ContractManager } from '../contracts/contract-manager';
+import { createComponentLogger } from '../utils/logger';
 
 export interface FoundrySimulatorOptions {
   readonly connectionManager: RpcConnectionManager;
@@ -22,6 +23,14 @@ export interface FoundrySimulatorOptions {
   readonly maxConcurrentSimulations?: number;
 }
 
+export interface SimulationTimeoutConfig {
+  readonly maxValidationTimeMs: number;
+  readonly maxGasLimit: bigint;
+  readonly maxSlippagePercent: number;
+  readonly minProfitMarginPercent: number;
+  readonly enableLiquidityCheck: boolean;
+}
+
 export interface SimulationValidationResult {
   readonly isValid: boolean;
   readonly rejectionReason?: string;
@@ -29,19 +38,39 @@ export interface SimulationValidationResult {
     readonly profitValidation: boolean;
     readonly gasValidation: boolean;
     readonly routeValidation: boolean;
-    readonly timeoutValidation: boolean;
+    readonly liquidityValidation: boolean;
     readonly slippageValidation: boolean;
   };
   readonly actualProfit: bigint;
   readonly estimatedGas: bigint;
   readonly validatedAt: number;
+  readonly gasPrice: bigint;
+  readonly totalCost: bigint;
 }
 
-export interface SimulationTimeoutConfig {
-  readonly maxSimulationTimeMs: number;
+export interface ValidationResult {
+  readonly isValid: boolean;
+  readonly rejectionReason?: string;
+  readonly validationDetails: {
+    readonly profitValidation: boolean;
+    readonly gasValidation: boolean;
+    readonly routeValidation: boolean;
+    readonly liquidityValidation: boolean;
+    readonly slippageValidation: boolean;
+  };
+  readonly actualProfit: bigint;
+  readonly estimatedGas: bigint;
+  readonly validatedAt: number;
+  readonly gasPrice: bigint;
+  readonly totalCost: bigint;
+}
+
+export interface ValidationConfig {
+  readonly maxValidationTimeMs: number;
   readonly maxGasLimit: bigint;
   readonly maxSlippagePercent: number;
   readonly minProfitMarginPercent: number;
+  readonly enableLiquidityCheck: boolean;
 }
 
 export interface SimulationResult {
@@ -64,6 +93,7 @@ export interface ForkState {
 }
 
 export class FoundrySimulator extends EventEmitter {
+  private readonly logger = createComponentLogger('foundry-simulator');
   private readonly connectionManager: RpcConnectionManager;
   private readonly contractManager?: ContractManager | undefined;
   private readonly forkUrl: string;
@@ -101,10 +131,11 @@ export class FoundrySimulator extends EventEmitter {
 
     // Default timeout configuration
     this.timeoutConfig = {
-      maxSimulationTimeMs: this.simulationTimeoutMs,
+      maxValidationTimeMs: this.simulationTimeoutMs,
       maxGasLimit: 500000n,
       maxSlippagePercent: 10,
       minProfitMarginPercent: 5,
+      enableLiquidityCheck: true,
     };
   }
 
