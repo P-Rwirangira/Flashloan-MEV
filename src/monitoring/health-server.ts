@@ -64,7 +64,7 @@ export class HealthServer {
   /**
    * Handle incoming HTTP requests
    */
-  private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+  private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const url = req.url || '/';
     const method = req.method || 'GET';
 
@@ -90,19 +90,19 @@ export class HealthServer {
     try {
       switch (url) {
         case '/health':
-          this.handleHealthCheck(res);
+          await this.handleHealthCheck(res);
           break;
         case '/ready':
-          this.handleReadinessCheck(res);
+          await this.handleReadinessCheck(res);
           break;
         case '/live':
-          this.handleLivenessCheck(res);
+          await this.handleLivenessCheck(res);
           break;
         case '/metrics':
-          this.handleMetrics(res);
+          await this.handleMetrics(res);
           break;
         case '/status':
-          this.handleStatus(res);
+          await this.handleStatus(res);
           break;
         default:
           this.sendResponse(res, 404, { error: 'Not found' });

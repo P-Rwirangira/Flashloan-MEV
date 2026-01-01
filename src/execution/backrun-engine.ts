@@ -246,7 +246,7 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
       let protectionLevel: 'none' | 'basic' | 'advanced' = 'none';
 
       // Check for Flashbots Protect patterns
-      if (tx.to && this.isFlashbotsProtectAddress(tx.to)) {
+      if (tx.to && this.isFlashbotsProtectAddress(null, [tx])) {
         hasProtection = true;
         protectionService = 'Flashbots Protect';
         protectionLevel = 'advanced';
@@ -409,15 +409,22 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
         return false;
       }
 
-      // Check if still profitable
+      // Check if still profitable - convert USD threshold to ETH properly
       const currentProfit = await this.calculateCurrentProfit(opportunity);
-      const minProfitThreshold = ethers.parseEther(this.config.minProfitThresholdUsd.toString());
+
+      // Convert USD threshold to ETH amount first, then to wei
+      // Note: In production, fetch ETH/USD price from oracle
+      const ethPriceUsd = 2500; // Placeholder - should be fetched from price oracle
+      const minProfitEth = this.config.minProfitThresholdUsd / ethPriceUsd;
+      const minProfitThreshold = ethers.parseEther(minProfitEth.toString());
 
       if (currentProfit < minProfitThreshold) {
         this.logger.debug('Backrun no longer profitable', {
           opportunityId: opportunity.id,
           currentProfit: currentProfit.toString(),
           minThreshold: minProfitThreshold.toString(),
+          minProfitUsd: this.config.minProfitThresholdUsd,
+          ethPriceUsd,
         });
         return false;
       }
@@ -578,15 +585,32 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
     opportunity: MempoolBackrunOpportunity
   ): Promise<BackrunTransaction | null> {
     try {
+      // Validate required fields
+      if (!opportunity.tokenIn || !ethers.isAddress(opportunity.tokenIn)) {
+        throw new Error('Invalid or missing tokenIn address');
+      }
+      if (!opportunity.tokenOut || !ethers.isAddress(opportunity.tokenOut)) {
+        throw new Error('Invalid or missing tokenOut address');
+      }
+      if (!opportunity.poolAddress || !ethers.isAddress(opportunity.poolAddress)) {
+        throw new Error('Invalid or missing poolAddress');
+      }
+      if (!opportunity.backrunAmount || opportunity.backrunAmount <= 0n) {
+        throw new Error('Invalid or missing backrunAmount');
+      }
+      if (!opportunity.expectedAmountOut || opportunity.expectedAmountOut <= 0n) {
+        throw new Error('Invalid or missing expectedAmountOut');
+      }
+
       return {
         type: 'arbitrage',
-        tokenIn: opportunity.tokenIn || '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC
-        tokenOut: opportunity.tokenOut || '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', // DAI
-        amountIn: opportunity.backrunAmount || ethers.parseEther('1000'),
-        expectedAmountOut: opportunity.expectedAmountOut || ethers.parseEther('1005'),
+        tokenIn: opportunity.tokenIn,
+        tokenOut: opportunity.tokenOut,
+        amountIn: opportunity.backrunAmount,
+        expectedAmountOut: opportunity.expectedAmountOut,
         dexProtocol: opportunity.dexProtocol || 'uniswap-v3',
-        poolAddress: opportunity.poolAddress || '0x1234567890123456789012345678901234567890',
-        gasEstimate: 200000n,
+        poolAddress: opportunity.poolAddress,
+        gasEstimate: opportunity.gasEstimate || 200000n,
       };
     } catch (error) {
       this.logger.error('Failed to create arbitrage backrun', {
@@ -604,15 +628,32 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
     opportunity: MempoolBackrunOpportunity
   ): Promise<BackrunTransaction | null> {
     try {
+      // Validate required fields
+      if (!opportunity.tokenIn || !ethers.isAddress(opportunity.tokenIn)) {
+        throw new Error('Invalid or missing tokenIn address');
+      }
+      if (!opportunity.tokenOut || !ethers.isAddress(opportunity.tokenOut)) {
+        throw new Error('Invalid or missing tokenOut address');
+      }
+      if (!opportunity.poolAddress || !ethers.isAddress(opportunity.poolAddress)) {
+        throw new Error('Invalid or missing poolAddress');
+      }
+      if (!opportunity.backrunAmount || opportunity.backrunAmount <= 0n) {
+        throw new Error('Invalid or missing backrunAmount');
+      }
+      if (!opportunity.expectedAmountOut || opportunity.expectedAmountOut <= 0n) {
+        throw new Error('Invalid or missing expectedAmountOut');
+      }
+
       return {
         type: 'liquidation',
-        tokenIn: opportunity.tokenIn || '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC
-        tokenOut: opportunity.tokenOut || '0x4200000000000000000000000000000000000006', // WETH
-        amountIn: opportunity.backrunAmount || ethers.parseEther('5000'),
-        expectedAmountOut: opportunity.expectedAmountOut || ethers.parseEther('2.1'),
+        tokenIn: opportunity.tokenIn,
+        tokenOut: opportunity.tokenOut,
+        amountIn: opportunity.backrunAmount,
+        expectedAmountOut: opportunity.expectedAmountOut,
         dexProtocol: opportunity.dexProtocol || 'moonwell',
-        poolAddress: opportunity.poolAddress || '0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180',
-        gasEstimate: 350000n,
+        poolAddress: opportunity.poolAddress,
+        gasEstimate: opportunity.gasEstimate || 350000n,
       };
     } catch (error) {
       this.logger.error('Failed to create liquidation backrun', {
@@ -630,15 +671,32 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
     opportunity: MempoolBackrunOpportunity
   ): Promise<BackrunTransaction | null> {
     try {
+      // Validate required fields
+      if (!opportunity.tokenIn || !ethers.isAddress(opportunity.tokenIn)) {
+        throw new Error('Invalid or missing tokenIn address');
+      }
+      if (!opportunity.tokenOut || !ethers.isAddress(opportunity.tokenOut)) {
+        throw new Error('Invalid or missing tokenOut address');
+      }
+      if (!opportunity.poolAddress || !ethers.isAddress(opportunity.poolAddress)) {
+        throw new Error('Invalid or missing poolAddress');
+      }
+      if (!opportunity.backrunAmount || opportunity.backrunAmount <= 0n) {
+        throw new Error('Invalid or missing backrunAmount');
+      }
+      if (!opportunity.expectedAmountOut || opportunity.expectedAmountOut <= 0n) {
+        throw new Error('Invalid or missing expectedAmountOut');
+      }
+
       return {
         type: 'rebalancing',
-        tokenIn: opportunity.tokenIn || '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC
-        tokenOut: opportunity.tokenOut || '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', // DAI
-        amountIn: opportunity.backrunAmount || ethers.parseEther('10000'),
-        expectedAmountOut: opportunity.expectedAmountOut || ethers.parseEther('10050'),
+        tokenIn: opportunity.tokenIn,
+        tokenOut: opportunity.tokenOut,
+        amountIn: opportunity.backrunAmount,
+        expectedAmountOut: opportunity.expectedAmountOut,
         dexProtocol: opportunity.dexProtocol || 'aerodrome',
-        poolAddress: opportunity.poolAddress || '0x420DD381b31aEf6683db6B902084cB0FFECe40Da',
-        gasEstimate: 250000n,
+        poolAddress: opportunity.poolAddress,
+        gasEstimate: opportunity.gasEstimate || 250000n,
       };
     } catch (error) {
       this.logger.error('Failed to create rebalancing backrun', {
@@ -750,32 +808,31 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
       backrunType: route.backrunTransaction.type,
     });
 
+    // Validate target address from environment
+    const targetAddress = process.env['FLASH_EXECUTOR_ADDRESS'];
+    if (!targetAddress || targetAddress.trim() === '') {
+      this.logger.error('FLASH_EXECUTOR_ADDRESS environment variable not configured');
+      throw new Error('Target contract address not configured - FLASH_EXECUTOR_ADDRESS required');
+    }
+
     // Encode transaction data based on backrun type
     let transactionData: string;
-    let targetAddress: string;
 
     switch (backrunTx.type) {
       case 'arbitrage':
-        targetAddress = process.env['FLASH_EXECUTOR_ADDRESS'] || '';
         transactionData = await this.encodeArbitrageBackrun(backrunTx);
         break;
 
       case 'liquidation':
-        targetAddress = backrunTx.poolAddress;
         transactionData = await this.encodeLiquidationBackrun(backrunTx);
         break;
 
       case 'rebalancing':
-        targetAddress = backrunTx.poolAddress;
         transactionData = await this.encodeRebalancingBackrun(backrunTx);
         break;
 
       default:
         throw new Error(`Unsupported backrun type: ${backrunTx.type}`);
-    }
-
-    if (!targetAddress) {
-      throw new Error('Target contract address not configured');
     }
 
     return {
@@ -887,13 +944,86 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
   }
 
   /**
-   * Check if address is a known Flashbots Protect address
+   * Check if transaction shows Flashbots Protect/MEV-Share indicators
    */
-  private isFlashbotsProtectAddress(address: string): boolean {
-    const flashbotsAddresses = [
-      '0x0000000000000000000000000000000000000000', // Placeholder - would have real addresses
+  private isFlashbotsProtectAddress(_block: any, transactions: any[]): boolean {
+    try {
+      // Analyze on-chain signals for Flashbots Protect/MEV-Share
+
+      // 1. Look for refund transfers/payments in the same block
+      const hasRefundPatterns = this.detectRefundTransfers(transactions);
+      if (hasRefundPatterns) {
+        return true;
+      }
+
+      // 2. Check for bundle-like transaction ordering
+      const hasBundleOrdering = this.detectBundleOrdering(transactions);
+      if (hasBundleOrdering) {
+        return true;
+      }
+
+      // 3. Look for MEV-Share/refund artifacts
+      const hasMevShareArtifacts = this.detectMevShareArtifacts(transactions);
+      if (hasMevShareArtifacts) {
+        return true;
+      }
+
+      return false;
+    } catch (error) {
+      this.logger.warn('Failed to detect Flashbots Protect indicators', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+  }
+
+  private detectRefundTransfers(transactions: any[]): boolean {
+    // Look for transfers that reimburse frontrunners or relayers
+    const knownRelayerAddresses = [
+      '0x0000000000000000000000000000000000000000', // Placeholder
     ];
-    return flashbotsAddresses.includes(address.toLowerCase());
+
+    return transactions.some(
+      tx =>
+        tx.to &&
+        knownRelayerAddresses.includes(tx.to.toLowerCase()) &&
+        tx.value &&
+        BigInt(tx.value) > 0n
+    );
+  }
+
+  private detectBundleOrdering(transactions: any[]): boolean {
+    // Look for contiguous transactions with matching sender/beneficiary patterns
+    if (transactions.length < 2) return false;
+
+    let consecutiveRelated = 0;
+    for (let i = 1; i < transactions.length; i++) {
+      const prev = transactions[i - 1];
+      const curr = transactions[i];
+
+      if (prev && curr && prev.from === curr.from) {
+        consecutiveRelated++;
+      }
+    }
+
+    return consecutiveRelated >= 2; // At least 3 consecutive related transactions
+  }
+
+  private detectMevShareArtifacts(transactions: any[]): boolean {
+    // Look for MEV-Share style refund patterns or metadata
+    return transactions.some(tx => {
+      // Check for unusual gas patterns typical of MEV-Share
+      if (tx.maxPriorityFeePerGas === '0x0' && tx.maxFeePerGas) {
+        return true;
+      }
+
+      // Check for memo/metadata patterns in transaction data
+      if (tx.data && tx.data.includes('mevshare')) {
+        return true;
+      }
+
+      return false;
+    });
   }
 
   /**

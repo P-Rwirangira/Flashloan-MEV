@@ -357,10 +357,72 @@ export class HealthCheckSystem extends EventEmitter {
   getHealthStatus(): HealthCheckResult {
     if (!this.lastHealthCheck) {
       // Perform immediate check if none exists
-      this.performHealthCheck();
+      try {
+        this.performHealthCheck();
+      } catch (error) {
+        // Set a safe default if health check fails
+        this.lastHealthCheck = {
+          status: HealthStatus.UNHEALTHY,
+          timestamp: Date.now(),
+          checks: {
+            rpcConnection: {
+              status: HealthStatus.UNHEALTHY,
+              message: 'Health check failed',
+              lastCheck: Date.now(),
+            },
+            circuitBreaker: {
+              status: HealthStatus.UNHEALTHY,
+              message: 'Health check failed',
+              lastCheck: Date.now(),
+            },
+            memoryUsage: {
+              status: HealthStatus.UNHEALTHY,
+              message: 'Health check failed',
+              lastCheck: Date.now(),
+            },
+            opportunityDetection: {
+              status: HealthStatus.UNHEALTHY,
+              message: 'Health check failed',
+              lastCheck: Date.now(),
+            },
+          },
+          uptime: process.uptime(),
+          version: '1.0.0',
+        };
+      }
     }
 
-    return this.lastHealthCheck!;
+    // Return with fallback to avoid non-null assertion
+    return (
+      this.lastHealthCheck || {
+        status: HealthStatus.UNHEALTHY,
+        timestamp: Date.now(),
+        checks: {
+          rpcConnection: {
+            status: HealthStatus.UNHEALTHY,
+            message: 'Not initialized',
+            lastCheck: Date.now(),
+          },
+          circuitBreaker: {
+            status: HealthStatus.UNHEALTHY,
+            message: 'Not initialized',
+            lastCheck: Date.now(),
+          },
+          memoryUsage: {
+            status: HealthStatus.UNHEALTHY,
+            message: 'Not initialized',
+            lastCheck: Date.now(),
+          },
+          opportunityDetection: {
+            status: HealthStatus.UNHEALTHY,
+            message: 'Not initialized',
+            lastCheck: Date.now(),
+          },
+        },
+        uptime: process.uptime(),
+        version: '1.0.0',
+      }
+    );
   }
 
   /**

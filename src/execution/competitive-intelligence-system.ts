@@ -729,15 +729,19 @@ export class CompetitiveIntelligenceSystem extends EventEmitter {
     const existing = this.competitors.get(tx.from);
 
     if (existing) {
-      // Update existing competitor
+      // Update existing competitor with proper running average
+      const totalProfit =
+        existing.averageProfit * BigInt(existing.transactionCount) + (tx.profit || 0n);
+      const newTransactionCount = existing.transactionCount + 1;
+
       const updatedCompetitor: Competitor = {
         ...existing,
         lastSeen: tx.timestamp,
-        transactionCount: existing.transactionCount + 1,
+        transactionCount: newTransactionCount,
         successRate:
           (existing.successRate * existing.transactionCount + (tx.success ? 1 : 0)) /
-          (existing.transactionCount + 1),
-        averageProfit: (existing.averageProfit + (tx.profit || 0n)) / 2n,
+          newTransactionCount,
+        averageProfit: totalProfit / BigInt(newTransactionCount),
         active: true,
       };
 

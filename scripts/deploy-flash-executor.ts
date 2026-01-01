@@ -48,6 +48,10 @@ async function main() {
     gasLimit: deploymentConfig.gasLimit,
   });
 
+  const deploymentTx = flashExecutor.deploymentTransaction();
+  const receipt = await deploymentTx?.wait();
+  const actualGasUsed = receipt?.gasUsed || 'unknown';
+
   await flashExecutor.waitForDeployment();
 
   const contractAddress = await flashExecutor.getAddress();
@@ -103,7 +107,7 @@ async function main() {
   console.log('Min Profit:', minProfit.toString(), 'wei');
   console.log('Authorized Pools:', authorizedPools.length);
   console.log('Deployment Block:', deploymentBlock);
-  console.log('Gas Used: ~', deploymentConfig.gasLimit);
+  console.log('Gas Used:', actualGasUsed.toString());
 
   return {
     contractAddress,

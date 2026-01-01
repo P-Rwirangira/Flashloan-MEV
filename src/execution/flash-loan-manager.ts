@@ -245,9 +245,18 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
         );
       }
 
-      if (request.amount > BigInt(this.config.maxBorrowAmountUsd * 1e18)) {
+      // Convert requested amount to USD value for comparison
+      // TODO: In production, fetch token decimals and price from oracle
+      const tokenDecimals = 18; // Assume 18 decimals for now
+      const tokenPriceUsd = 1; // Assume $1 per token for now - should fetch from price oracle
+
+      // Convert amount to normalized decimal value
+      const tokenAmount = Number(request.amount) / Math.pow(10, tokenDecimals);
+      const usdValue = tokenAmount * tokenPriceUsd;
+
+      if (usdValue > this.config.maxBorrowAmountUsd) {
         throw new FlashLoanError(
-          'Amount exceeds maximum borrow limit',
+          `USD value (${usdValue.toFixed(2)}) exceeds maximum borrow limit (${this.config.maxBorrowAmountUsd})`,
           FlashLoanProvider.UNISWAP_V3,
           request.token,
           request.amount
@@ -479,9 +488,11 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
 
       const splitAmount = remainingAmount > source.maxAmount ? source.maxAmount : remainingAmount;
 
-      // Calculate fee proportionally based on the fee rate
-      const feeRate = source.maxAmount > 0n ? Number(source.fee) / Number(source.maxAmount) : 0;
-      const splitFee = BigInt(Math.floor(Number(splitAmount) * feeRate));
+      // Calculate fee proportionally using pure bigint arithmetic
+      let splitFee = 0n;
+      if (source.maxAmount > 0n) {
+        splitFee = (splitAmount * source.fee) / source.maxAmount;
+      }
 
       splits.push({
         source,

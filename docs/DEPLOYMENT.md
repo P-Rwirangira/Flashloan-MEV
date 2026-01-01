@@ -70,6 +70,8 @@ This guide covers deploying the Base MEV Platform in various environments, from 
    FLASHBOTS_AUTH_KEY=your_auth_key
    ```
 
+   **Security Note**: The `.env` file contains sensitive information including your private key. Never commit `.env` to version control. For production deployments, use a secrets manager (e.g., AWS Secrets Manager, HashiCorp Vault) instead of storing secrets in files. See the [Security Hardening](#security-hardening) section for detailed security practices.
+
 4. **Build Project**
    ```bash
    npm run build
@@ -172,7 +174,7 @@ npm run lint
 - **prometheus**: Metrics collection (port 9090)
 - **grafana**: Metrics visualization (port 3000)
 
-Access Grafana at `http://localhost:3000` (default credentials: admin/admin)
+Access Grafana at `http://localhost:3000` (default credentials: admin/admin - **immediately change these credentials** and configure a secure admin account for production use)
 
 ## Production Deployment
 
@@ -289,17 +291,23 @@ Access Grafana at `http://localhost:3000` (default credentials: admin/admin)
    # Allow only necessary ports
    sudo ufw allow 22/tcp    # SSH
    
-   # Health checks - restrict to monitoring networks only
-   # Option 1: Allow from specific monitoring subnet
+   # Health checks - PRODUCTION SECURITY NOTE:
+   # The health endpoint (port 3002) must be restricted to internal monitoring systems only.
+   # Public exposure can leak system information. Choose one of these secure approaches:
+   
+   # RECOMMENDED: Option 1 - Reverse proxy with authentication (best practice)
+   # Configure nginx/apache with HTTP basic auth or OAuth
+   # Bind health endpoint to localhost only, then proxy with authentication
+   
+   # Option 2: Allow from specific monitoring subnet
    sudo ufw allow from 10.0.1.0/24 to any port 3002
    
-   # Option 2: Allow from specific monitoring IPs
+   # Option 3: Allow from specific monitoring IPs
    sudo ufw allow from 192.168.1.100 to any port 3002
    sudo ufw allow from 192.168.1.101 to any port 3002
    
-   # Option 3: Bind to localhost and use reverse proxy
-   # Configure health endpoint to bind to 127.0.0.1:3002
-   # Then use nginx/apache with authentication
+   # Option 4: VPN + private subnet access
+   # Deploy in private subnet with VPN-only access for monitoring
    
    sudo ufw enable
    ```
@@ -562,10 +570,24 @@ Configure log rotation:
 # Daily backup script
 #!/bin/bash
 DATE=$(date +%Y%m%d)
+
+# SECURITY WARNING: Never backup .env files containing secrets
+# Use a secrets manager or encrypted backup workflow for environment secrets
 tar -czf /backup/mev-platform-$DATE.tar.gz \
     config/ \
-    .env \
-    logs/
+    logs/ \
+    --exclude='.env*'
+
+# For secrets backup (if absolutely required):
+# Use encrypted storage with GPG or cloud KMS
+# gpg --cipher-algo AES256 --compress-algo 1 --s2k-mode 3 \
+#     --s2k-digest-algo SHA512 --s2k-count 65536 --symmetric \
+#     --output /secure-backup/secrets-$DATE.gpg .env
+# 
+# Store in access-controlled encrypted storage with:
+# - Restricted file permissions (600)
+# - Short retention period (7 days max)
+# - Audit logging of access
 
 # Keep last 30 days
 find /backup -name "mev-platform-*.tar.gz" -mtime +30 -delete

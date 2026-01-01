@@ -250,16 +250,23 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
       // Calculate actual profit (simplified)
       const actualProfit = await this.calculateArbitrageProfit(opportunity, arbOpp);
 
+      // Get transaction receipt from transaction manager
+      const receipt = await this.getTransactionReceipt(transactionHash);
+
+      // Calculate actual costs from receipt
+      const gasCost = receipt.gasUsed * receipt.effectiveGasPrice;
+      const netProfit = actualProfit - gasCost;
+
       const result: ExecutionResult = {
         opportunityId: opportunity.id,
-        success: true,
-        profit: actualProfit,
-        gasCost: BigInt(300000) * BigInt(50e9), // 300k gas * 50 gwei
+        success: receipt.status === 1,
+        profit: netProfit,
+        gasCost,
         executionTime,
         transactionHash,
-        blockNumber: 0, // Would be filled from receipt
-        gasUsed: BigInt(300000),
-        effectiveGasPrice: BigInt(50e9),
+        blockNumber: receipt.blockNumber,
+        gasUsed: receipt.gasUsed,
+        effectiveGasPrice: receipt.effectiveGasPrice,
       };
 
       this.handleSuccessfulExecution(result, executionPlan);
@@ -298,9 +305,9 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
         gasEstimate += 50000n;
       }
 
-      // Add gas optimization buffer
+      // Add gas optimization buffer (increase for safety, not decrease)
       if (this.config.gasOptimizationEnabled) {
-        gasEstimate = BigInt(Math.floor(Number(gasEstimate) * 0.9)); // 10% reduction for optimizations
+        gasEstimate = BigInt(Math.ceil(Number(gasEstimate) * 1.1)); // 10% safety buffer
       }
 
       return gasEstimate;
@@ -700,5 +707,55 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
       config: this.config,
       timestamp: Date.now(),
     });
+  }
+
+  /**
+   * Get transaction receipt from transaction hash
+   */
+  private async getTransactionReceipt(transactionHash: string): Promise<{
+    status: number;
+    gasUsed: bigint;
+    effectiveGasPrice: bigint;
+    blockNumber: number;
+  }> {
+    try {
+      // Get receipt from provider
+      const receipt = await this.getProvider().getTransactionReceipt(transactionHash);
+
+      if (!receipt) {
+        throw new Error('Transaction receipt not found');
+      }
+
+      return {
+        status: receipt.status || 0,
+        gasUsed: receipt.gasUsed,
+        effectiveGasPrice: receipt.gasPrice || 0n,
+        blockNumber: receipt.blockNumber,
+      };
+    } catch (error) {
+      this.logger.error('Failed to get transaction receipt', {
+        transactionHash,
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      // Return default values for failed receipt retrieval
+      return {
+        status: 0,
+        gasUsed: 300000n,
+        effectiveGasPrice: 50000000000n, // 50 gwei
+        blockNumber: 0,
+      };
+    }
+  }
+
+  /**
+   * Get ethers provider for blockchain interactions
+   */
+  private getProvider(): ethers.Provider {
+    // Access provider through transaction manager or create new one
+    return (
+      this.transactionManager.getProvider() ||
+      new ethers.JsonRpcProvider(process.env['BASE_RPC_URL'])
+    );
   }
 }

@@ -153,7 +153,12 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
 
       // Calculate maximum profitable liquidation based on liquidation bonus
       const liquidationBonusRate = opportunity.liquidationBonus;
-      const minProfitThreshold = ethers.parseEther(this.config.minProfitThresholdUsd.toString());
+
+      // Convert USD threshold to ETH amount properly
+      // TODO: In production, fetch current ETH/USD price from price oracle
+      const ethPriceUsd = 2500; // Placeholder - should be fetched from price oracle
+      const minProfitEth = this.config.minProfitThresholdUsd / ethPriceUsd;
+      const minProfitThreshold = ethers.parseEther(minProfitEth.toString());
 
       this.logger.debug('Liquidation parameters', {
         opportunityId: opportunity.id,
@@ -177,7 +182,7 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
       }
 
       // Calculate expected profit for this size
-      const expectedProfit = await this.calculateLiquidationProfit(opportunity, optimalSize);
+      let expectedProfit = await this.calculateLiquidationProfit(opportunity, optimalSize);
 
       if (expectedProfit < minProfitThreshold) {
         // Try smaller sizes to find profitable amount
@@ -187,11 +192,12 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
           const profit = await this.calculateLiquidationProfit(opportunity, size);
           if (profit >= minProfitThreshold) {
             optimalSize = size;
+            expectedProfit = profit; // Update expectedProfit when profitable size found
             break;
           }
         }
 
-        // If no profitable size found, return 0
+        // Check the updated expectedProfit before returning 0
         if (expectedProfit < minProfitThreshold) {
           return 0n;
         }
@@ -479,17 +485,31 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
     opportunity: LiquidationOpportunity,
     route: LiquidationRoute
   ): Promise<TransactionRequest> {
-    // Get protocol liquidation contract
+    // Get protocol liquidation contract and resolve correct address
     const protocolInterface = this.protocolInterfaces.get(opportunity.protocol);
     if (!protocolInterface) {
       throw new Error(`Protocol ${opportunity.protocol} not supported`);
+    }
+
+    // Resolve the correct address field based on protocol type
+    let contractAddress: string;
+    if (opportunity.protocol === 'moonwell' || opportunity.protocol === 'seamless') {
+      contractAddress = (protocolInterface as any).comptrollerAddress;
+    } else if (opportunity.protocol === 'aave-v3') {
+      contractAddress = (protocolInterface as any).poolAddress;
+    } else {
+      contractAddress = (protocolInterface as any).address;
+    }
+
+    if (!contractAddress) {
+      throw new Error(`No contract address found for protocol ${opportunity.protocol}`);
     }
 
     // Encode liquidation call
     const liquidationData = this.encodeDirectLiquidationData(opportunity, route);
 
     return {
-      to: protocolInterface.address as `0x${string}`,
+      to: contractAddress as `0x${string}`,
       data: liquidationData,
       value: 0n,
       gasLimit: route.totalGasEstimate,

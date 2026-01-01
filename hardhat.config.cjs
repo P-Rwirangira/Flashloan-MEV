@@ -13,15 +13,9 @@ const config = {
           },
         },
       },
-      {
-        version: "0.7.6",
-        settings: {
-          optimizer: {
-            enabled: true,
-            runs: 200,
-          },
-        },
-      },
+      // 0.7.6 compiler removed - no contracts in this project require it
+      // If external dependencies need 0.7.6, they should be compiled separately
+      // All project contracts use 0.8.20 with built-in overflow protection
     ],
   },
   networks: {

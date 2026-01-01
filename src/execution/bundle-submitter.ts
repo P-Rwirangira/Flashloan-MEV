@@ -280,6 +280,11 @@ export class BundleSubmitter extends EventEmitter {
    * Optimize gas usage across bundle transactions
    */
   private optimizeGasUsage(transactions: BundleTransaction[]): BundleTransaction[] {
+    // Guard against empty transactions array
+    if (transactions.length === 0) {
+      return transactions;
+    }
+
     // Calculate optimal gas prices based on bundle profitability
     const avgGasLimit =
       transactions.reduce((sum, tx) => sum + tx.gasLimit, 0n) / BigInt(transactions.length);
@@ -376,10 +381,43 @@ export class BundleSubmitter extends EventEmitter {
         transactionCount: bundle.transactions.length,
       });
 
-      // Sign all transactions in bundle
+      // Sign all transactions in bundle - convert to proper ethers.TransactionLike format
       const signedTransactions = await Promise.all(
-        bundle.transactions.map(tx => this.signer.signTransaction(tx))
+        bundle.transactions.map(async tx => {
+          // Get network info for proper transaction formatting
+          const network = await this.provider.getNetwork();
+
+          // Convert BundleTransaction to ethers.TransactionLike
+          const ethersTransaction: ethers.TransactionRequest = {
+            to: tx.to,
+            data: tx.data,
+            value: tx.value || 0n,
+            gasLimit: tx.gasLimit,
+            nonce: tx.nonce,
+            type: tx.maxFeePerGas ? 2 : 0, // EIP-1559 if maxFeePerGas present
+            chainId: network.chainId,
+          };
+
+          // Add EIP-1559 fields if present
+          if (tx.maxFeePerGas) {
+            ethersTransaction.maxFeePerGas = tx.maxFeePerGas;
+          }
+          if (tx.maxPriorityFeePerGas) {
+            ethersTransaction.maxPriorityFeePerGas = tx.maxPriorityFeePerGas;
+          }
+          // BundleTransaction always uses EIP-1559, no legacy gasPrice
+
+          return await this.signer.signTransaction(ethersTransaction);
+        })
       );
+
+      // Store transaction hashes for inclusion tracking
+      const txHashes = new Set<string>();
+      for (const signedTx of signedTransactions) {
+        const txHash = ethers.keccak256(signedTx);
+        txHashes.add(txHash);
+      }
+      this.bundleTransactionHashes.set(bundle.id, txHashes);
 
       // Prepare Flashbots bundle request
       const bundleRequest = {
@@ -569,20 +607,53 @@ export class BundleSubmitter extends EventEmitter {
    * Start bundle inclusion monitoring
    */
   private startBundleMonitoring(): void {
-    // Monitor for bundle inclusion every block
-    this.provider.on('block', async (blockNumber: number) => {
+    // Create bound handler for block events
+    this.blockListener = async (blockNumber: number) => {
       await this.checkBundleInclusion(blockNumber);
-    });
+    };
+
+    // Monitor for bundle inclusion every block
+    this.provider.on('block', this.blockListener);
 
     // Clean up old bundles periodically
-    setInterval(() => {
+    this.cleanupInterval = setInterval(() => {
       this.cleanupOldBundles();
     }, 60000); // Every minute
 
     // Handle resubmissions
-    setInterval(() => {
+    this.resubmissionInterval = setInterval(() => {
       this.handleResubmissions();
     }, this.config.resubmissionDelayMs);
+  }
+
+  /**
+   * Stop bundle monitoring and cleanup resources
+   */
+  stop(): void {
+    // Remove block listener
+    if (this.blockListener) {
+      this.provider.off('block', this.blockListener);
+      this.blockListener = null;
+    }
+
+    // Clear intervals
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+
+    if (this.resubmissionInterval) {
+      clearInterval(this.resubmissionInterval);
+      this.resubmissionInterval = null;
+    }
+
+    // Clear data structures
+    this.activeBundles.clear();
+    this.submissionHistory.clear();
+    this.resubmissionQueue.clear();
+    this.bundleTransactionHashes.clear();
+
+    this.logger.info('Bundle submitter stopped');
   }
 
   /**
@@ -613,24 +684,36 @@ export class BundleSubmitter extends EventEmitter {
     }
   }
 
+  // Bundle transaction hash tracking
+  private bundleTransactionHashes = new Map<string, Set<string>>();
+
+  // Interval tracking for cleanup
+  private blockListener: ((blockNumber: number) => void) | null = null;
+  private cleanupInterval: NodeJS.Timeout | null = null;
+  private resubmissionInterval: NodeJS.Timeout | null = null;
+
   /**
    * Check if bundle was included in block
    */
   private async isBundleIncluded(bundle: Bundle, block: ethers.Block): Promise<boolean> {
-    // Simple check: see if any of our transaction hashes are in the block
-    // In production, this would be more sophisticated
-
-    const bundleTxHashes = new Set(
-      bundle.transactions.map(tx => ethers.keccak256(ethers.concat([tx.to, tx.data])))
-    );
+    // Get stored transaction hashes for this bundle
+    const bundleTxHashes = this.bundleTransactionHashes.get(bundle.id);
+    if (!bundleTxHashes) {
+      this.logger.warn('No transaction hashes found for bundle', { bundleId: bundle.id });
+      return false;
+    }
 
     for (const txData of block.transactions) {
-      if (typeof txData === 'string') continue;
+      let txHash: string;
 
-      const tx = txData as ethers.TransactionResponse;
-      if (!tx.to || !tx.data) continue;
+      if (typeof txData === 'string') {
+        txHash = txData;
+      } else if (txData && typeof txData === 'object' && 'hash' in txData) {
+        txHash = (txData as any).hash;
+      } else {
+        continue; // Skip invalid transaction data
+      }
 
-      const txHash = ethers.keccak256(ethers.concat([tx.to, tx.data]));
       if (bundleTxHashes.has(txHash)) {
         return true;
       }

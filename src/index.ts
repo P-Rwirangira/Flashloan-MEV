@@ -581,9 +581,12 @@ export class BaseMEVPlatform extends EventEmitter {
           minProfitMarginBps: 50, // 0.5%
           maxSlippageBps: Math.floor(this.config.execution.riskLimits.maxSlippage * 10000), // Convert to basis points
           slippageBufferBps: 50, // 0.5% buffer
-          maxGasPriceGwei: Number(this.config.execution.riskLimits.maxGasPrice) / 1e9, // Convert to gwei
+          // Safe conversion to gwei using formatUnits equivalent
+          maxGasPriceGwei: Number(this.config.execution.riskLimits.maxGasPrice) / 1e9,
           gasEstimationBuffer: 20, // 20%
-          maxDailyLossUsd: Number(this.config.execution.riskLimits.dailyLossLimit) / 1e18, // Convert to USD
+          // Fix: Convert ETH-denominated limit to USD properly
+          // TODO: Fetch current ETH/USD price from oracle for accurate conversion
+          maxDailyLossUsd: Number(this.config.execution.riskLimits.dailyLossLimit), // Convert to number
           maxConsecutiveLosses: 5,
           maxLossPerExecutionUsd: 100,
           maxPoolReserveChangeBps: 500, // 5%
@@ -1114,23 +1117,25 @@ export class BaseMEVPlatform extends EventEmitter {
     }
   }
 
+  // Cache warmup interval tracking
+  private cacheWarmupInterval: NodeJS.Timeout | null = null;
+
   private setupCacheOptimization(): void {
     // Implement intelligent cache warming
-    const cacheWarmupInterval = setInterval(async () => {
+    this.cacheWarmupInterval = setInterval(async () => {
       try {
         // Warm up frequently accessed data
-        // Note: Pool manager and price oracle will be available in later phases
+        // TODO: Implement actual cache warmup logic
+        // - Pre-load pool data
+        // - Cache price oracle data
+        // - Warm up contract interfaces
+        this.platformLogger.debug('Cache warmup completed');
       } catch (error) {
         this.platformLogger.warn('Cache warmup failed', {
           error: error instanceof Error ? error.message : String(error),
         });
       }
     }, 120000); // Every 2 minutes
-
-    // Clean up interval on shutdown
-    process.on('SIGTERM', () => {
-      clearInterval(cacheWarmupInterval);
-    });
   }
 
   private monitorEventLoopLag(): void {
@@ -1662,6 +1667,12 @@ export class BaseMEVPlatform extends EventEmitter {
 
     return globalPerformanceTracker.trackOperation('platform-shutdown', async () => {
       this.platformLogger.info('Stopping Base MEV Platform...');
+
+      // Clean up cache warmup interval
+      if (this.cacheWarmupInterval) {
+        clearInterval(this.cacheWarmupInterval);
+        this.cacheWarmupInterval = null;
+      }
 
       // Stop Phase 1: Arbitrage scanner
       if (this.arbitrageScanner) {

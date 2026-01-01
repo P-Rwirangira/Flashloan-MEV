@@ -574,13 +574,31 @@ export class RelayManager extends EventEmitter {
       // Submit directly to local node
       const tx = await this.wallet.sendTransaction(transaction);
 
-      // Wait for transaction with timeout
-      const receipt = await Promise.race([
-        tx.wait(),
-        new Promise<null>((_, reject) =>
-          setTimeout(() => reject(new Error('Transaction wait timeout')), timeout)
-        ),
-      ]);
+      // Wait for transaction with timeout - don't cancel on timeout
+      let receipt: ethers.TransactionReceipt | null = null;
+      try {
+        receipt = await Promise.race([
+          tx.wait(),
+          new Promise<null>((_, reject) =>
+            setTimeout(() => reject(new Error('Transaction wait timeout')), timeout)
+          ),
+        ]);
+      } catch (error) {
+        if ((error as Error).message.includes('timeout')) {
+          // Transaction is still pending, spawn background watcher
+          this.spawnBackgroundWatcher(tx);
+
+          // Return immediately with pending status
+          return {
+            success: false,
+            relayProvider: relay.provider,
+            transactionHash: tx.hash,
+            error: `Transaction pending after ${timeout}ms timeout`,
+            latency: Date.now() - startTime,
+          };
+        }
+        throw error;
+      }
 
       return {
         success: true,
@@ -833,8 +851,27 @@ export class RelayManager extends EventEmitter {
   }
 
   /**
-   * Get relay statistics
+   * Spawn background watcher for pending transaction
    */
+  private spawnBackgroundWatcher(tx: ethers.TransactionResponse): void {
+    // Don't block - watch in background
+    tx.wait()
+      .then(receipt => {
+        if (receipt) {
+          this.logger.info('Background transaction confirmed', {
+            transactionHash: tx.hash,
+            blockNumber: receipt.blockNumber,
+            gasUsed: receipt.gasUsed.toString(),
+          });
+        }
+      })
+      .catch(error => {
+        this.logger.warn('Background transaction failed', {
+          transactionHash: tx.hash,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }
   getStats(): {
     totalRelays: number;
     enabledRelays: number;

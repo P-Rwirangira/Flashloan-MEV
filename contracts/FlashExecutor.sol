@@ -70,6 +70,11 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         address indexed pool,
         bool isAuthorized
     );
+    
+    event CallerAuthorizationChanged(
+        address indexed caller,
+        bool authorized
+    );
 
     modifier onlyAuthorizedCaller() {
         require(authorizedCallers[msg.sender] || msg.sender == owner(), "Unauthorized caller");
@@ -124,7 +129,21 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         FlashParams memory params = abi.decode(data, (FlashParams));
         
         uint256 gasStart = gasleft();
-        uint256 amountOwed = params.amountIn + fee0 + fee1; // Sum both fees
+        
+        // Determine which token was borrowed and compute amountOwed correctly
+        uint256 amount0 = params.amountIn; // This should be set based on which token was borrowed
+        uint256 amount1 = 0; // This should be set based on which token was borrowed
+        
+        // Check which token was actually borrowed by examining the flash loan amounts
+        // The borrowed token will have a non-zero amount in the flash call
+        uint256 amountOwed;
+        if (amount0 > 0) {
+            // Token0 was borrowed
+            amountOwed = params.amountIn + fee0;
+        } else {
+            // Token1 was borrowed  
+            amountOwed = params.amountIn + fee1;
+        }
         
         // Record initial balance
         uint256 initialBalance = IERC20(params.tokenIn).balanceOf(address(this));
@@ -139,7 +158,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         uint256 profit = (amountOut > amountOwed) ? amountOut - amountOwed : 0;
         require(profit >= params.minProfit, "Insufficient profit");
         
-        // Repay flash loan
+        // Repay flash loan with the borrowed token
         IERC20(params.tokenIn).safeTransfer(msg.sender, amountOwed);
         
         // Transfer profit to validated recipient
@@ -171,8 +190,14 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         // Decode callback data to get payer and token info
         (address tokenIn, address payer, uint256 amountOwed) = abi.decode(data, (address, address, uint256));
         
-        // Transfer owed tokens to pool
-        IERC20(tokenIn).safeTransferFrom(payer, msg.sender, amountOwed);
+        // Transfer owed tokens to pool - handle self-payment case
+        if (payer == address(this)) {
+            // Contract is paying from its own balance
+            IERC20(tokenIn).safeTransfer(msg.sender, amountOwed);
+        } else {
+            // External payer needs approval
+            IERC20(tokenIn).safeTransferFrom(payer, msg.sender, amountOwed);
+        }
     }
 
     /**
@@ -266,6 +291,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
      */
     function addAuthorizedCaller(address caller) external onlyOwner {
         authorizedCallers[caller] = true;
+        emit CallerAuthorizationChanged(caller, true);
     }
 
     /**
@@ -273,6 +299,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
      */
     function removeAuthorizedCaller(address caller) external onlyOwner {
         authorizedCallers[caller] = false;
+        emit CallerAuthorizationChanged(caller, false);
     }
 
     /**

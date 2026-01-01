@@ -44,9 +44,12 @@ async function main() {
 }
 
 function getExplorerUrl(network: string, address: string): string {
-  switch (network.toLowerCase()) {
+  const normalizedNetwork = network.toLowerCase().replace(/-/g, '');
+
+  switch (normalizedNetwork) {
     case 'base':
       return `https://basescan.org/address/${address}`;
+    case 'basesepolia':
     case 'base-sepolia':
       return `https://sepolia.basescan.org/address/${address}`;
     default:

@@ -345,11 +345,17 @@ export class AdvancedRiskManager extends EventEmitter {
       const winProbability = 1 - riskScore;
       const avgWin = Number(expectedReturn) / 1e18;
       const avgLoss = avgWin * 0.5; // Assume 50% of expected return as potential loss
-      const kellyFraction = winProbability - (1 - winProbability) / (avgWin / avgLoss);
-      const kellySize =
-        (availableCapital *
-          BigInt(Math.floor(Math.max(0, Math.min(0.25, kellyFraction)) * 10000))) /
-        10000n;
+
+      // Guard against division by zero in Kelly calculation
+      let kellyFraction = 0;
+      if (avgWin > 0 && avgLoss > 0) {
+        kellyFraction = winProbability - (1 - winProbability) / (avgWin / avgLoss);
+      }
+
+      // Bound Kelly fraction to reasonable range
+      kellyFraction = Math.max(0, Math.min(0.25, kellyFraction));
+
+      const kellySize = (availableCapital * BigInt(Math.floor(kellyFraction * 10000))) / 10000n;
       reasoning.push(`Kelly fraction: ${kellyFraction.toFixed(4)}`);
 
       // Volatility-adjusted sizing
@@ -897,6 +903,11 @@ export class AdvancedRiskManager extends EventEmitter {
     volatility: number,
     riskScore: number
   ): Promise<number> {
+    // Guard against division by zero
+    if (this.currentRiskMetrics.portfolioValue === 0n) {
+      return 0; // Neutral contribution when portfolio value is zero
+    }
+
     const returnPercent = Number(expectedReturn) / Number(this.currentRiskMetrics.portfolioValue);
     const riskAdjustedReturn = returnPercent * (1 - riskScore);
     const riskAdjustedVolatility = volatility * (1 + riskScore);
@@ -1093,15 +1104,18 @@ export class AdvancedRiskManager extends EventEmitter {
     };
   }
 
+  private riskMetricsInterval: NodeJS.Timeout | null = null;
+  private stressTestInterval: NodeJS.Timeout | null = null;
+
   private startRiskMonitoring(): void {
     // Update risk metrics periodically
-    setInterval(async () => {
+    this.riskMetricsInterval = setInterval(async () => {
       await this.calculateRiskMetrics();
       await this.checkRiskAlerts();
     }, this.config.riskMetricsUpdateInterval);
 
     // Run stress tests periodically
-    setInterval(async () => {
+    this.stressTestInterval = setInterval(async () => {
       if (this.config.stressTestingEnabled) {
         await this.runStressTests();
       }
@@ -1141,6 +1155,17 @@ export class AdvancedRiskManager extends EventEmitter {
    * Stop advanced risk manager
    */
   stop(): void {
+    // Clear intervals if they exist
+    if (this.riskMetricsInterval) {
+      clearInterval(this.riskMetricsInterval);
+      this.riskMetricsInterval = null;
+    }
+
+    if (this.stressTestInterval) {
+      clearInterval(this.stressTestInterval);
+      this.stressTestInterval = null;
+    }
+
     this.portfolioPositions.clear();
     this.riskAssessments.clear();
     this.activeAlerts.clear();

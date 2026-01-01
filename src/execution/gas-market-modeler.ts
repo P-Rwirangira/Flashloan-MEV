@@ -518,15 +518,38 @@ export class GasMarketModeler extends EventEmitter {
 
   private async updateNetworkCongestion(): Promise<void> {
     try {
-      // Simulate network congestion metrics (would use real data in production)
-      const blockUtilization = 0.6 + Math.random() * 0.3; // 0.6-0.9
-      const pendingTxCount = Math.floor(Math.random() * 2000 + 500); // 500-2500
-      const gasUsedPerSecond = BigInt(Math.floor(Math.random() * 2000000 + 500000)); // 500K-2.5M
+      // Get real network metrics from provider
+      const latestBlock = await this.provider.getBlock('latest');
+      if (!latestBlock) {
+        throw new Error('Failed to get latest block');
+      }
 
-      const congestionScore =
+      // Calculate block utilization
+      const blockUtilization = Number(latestBlock.gasUsed) / Number(latestBlock.gasLimit);
+
+      // Get pending transaction count (if supported by provider)
+      let pendingTxCount = 1000; // Default fallback
+      try {
+        // Some providers support this method
+        const pendingBlock = await this.provider.getBlock('pending');
+        if (pendingBlock?.transactions) {
+          pendingTxCount = pendingBlock.transactions.length;
+        }
+      } catch {
+        // Fallback to estimate based on block utilization
+        pendingTxCount = Math.floor(blockUtilization * 2000);
+      }
+
+      // Calculate gas used per second based on recent blocks
+      const gasUsedPerSecond = await this.calculateGasUsedPerSecond();
+
+      // Calculate congestion score based on real metrics
+      const congestionScore = Math.min(
+        1.0,
         blockUtilization * 0.4 +
-        Math.min(1, pendingTxCount / 2000) * 0.3 +
-        Math.min(1, Number(gasUsedPerSecond) / 2000000) * 0.3;
+          Math.min(1, pendingTxCount / 2000) * 0.3 +
+          Math.min(1, Number(gasUsedPerSecond) / 2000000) * 0.3
+      );
 
       this.currentCongestion = {
         timestamp: Date.now(),
@@ -534,7 +557,7 @@ export class GasMarketModeler extends EventEmitter {
         blockUtilization,
         pendingTxCount,
         averageGasPrice: this.currentGasPrice,
-        medianGasPrice: (this.currentGasPrice * 95n) / 100n,
+        medianGasPrice: await this.calculateMedianGasPrice(),
         gasUsedPerSecond,
         congestionScore,
       };
@@ -728,5 +751,73 @@ export class GasMarketModeler extends EventEmitter {
     }
 
     this.logger.info('Gas market modeler stopped');
+  }
+
+  /**
+   * Calculate gas used per second based on recent blocks
+   */
+  private async calculateGasUsedPerSecond(): Promise<bigint> {
+    try {
+      const latestBlockNumber = await this.provider.getBlockNumber();
+      const blocksToAnalyze = 10;
+
+      let totalGasUsed = 0n;
+      let totalTime = 0;
+
+      // Get recent blocks to calculate average gas usage
+      for (let i = 0; i < blocksToAnalyze; i++) {
+        const blockNumber = latestBlockNumber - i;
+        const block = await this.provider.getBlock(blockNumber);
+
+        if (block) {
+          totalGasUsed += block.gasUsed;
+          if (i === blocksToAnalyze - 1) {
+            // Calculate time span
+            const oldestBlock = block;
+            const newestBlock = await this.provider.getBlock(latestBlockNumber);
+            if (newestBlock) {
+              totalTime = newestBlock.timestamp - oldestBlock.timestamp;
+            }
+          }
+        }
+      }
+
+      if (totalTime > 0) {
+        return totalGasUsed / BigInt(totalTime);
+      }
+
+      // Fallback: assume 2 second block time on Base
+      return totalGasUsed / BigInt(blocksToAnalyze * 2);
+    } catch (error) {
+      this.logger.warn('Failed to calculate gas used per second', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 1000000n; // Default fallback
+    }
+  }
+
+  /**
+   * Calculate median gas price from recent transactions
+   */
+  private async calculateMedianGasPrice(): Promise<bigint> {
+    try {
+      if (this.gasPriceHistory.length < 5) {
+        return (this.currentGasPrice * 95n) / 100n; // 5% below current
+      }
+
+      // Get recent gas prices and calculate median
+      const recentPrices = this.gasPriceHistory
+        .slice(-20)
+        .map(h => h.price)
+        .sort((a, b) => Number(a) - Number(b));
+
+      const midIndex = Math.floor(recentPrices.length / 2);
+      return recentPrices[midIndex] || this.currentGasPrice;
+    } catch (error) {
+      this.logger.warn('Failed to calculate median gas price', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return (this.currentGasPrice * 95n) / 100n;
+    }
   }
 }

@@ -82,6 +82,10 @@ export class DynamicBribeOptimizer extends EventEmitter {
   private readonly activeOpportunities = new Map<string, BribeCalculation>();
   private readonly escalationTimers = new Map<string, NodeJS.Timeout>();
 
+  // Interval tracking for cleanup
+  private networkMonitoringInterval: NodeJS.Timeout | null = null;
+  private bribeTrackingInterval: NodeJS.Timeout | null = null;
+
   constructor(provider: ethers.Provider, config: DynamicBribeOptimizerConfig) {
     super();
     this.provider = provider;
@@ -224,11 +228,12 @@ export class DynamicBribeOptimizer extends EventEmitter {
         return cancelledCalculation;
       }
 
-      // Calculate escalated bribe
-      const escalationMultiplier = Math.pow(this.config.bribeEscalationFactor, newEscalationLevel);
-      const escalatedBribe = BigInt(
-        Math.floor(Number(currentCalculation.recommendedBribe) * escalationMultiplier)
+      // Calculate escalated bribe using bigint-native operations
+      const scale = 1_000_000n; // Fixed-point scale for precision
+      const scaledMultiplier = BigInt(
+        Math.round(this.config.bribeEscalationFactor * Number(scale))
       );
+      const escalatedBribe = (currentCalculation.recommendedBribe * scaledMultiplier) / scale;
 
       // Ensure we don't exceed maximum profitable bribe
       const finalBribe =
@@ -419,13 +424,17 @@ export class DynamicBribeOptimizer extends EventEmitter {
         break;
     }
 
-    // Adjust based on competitor gas prices
-    const avgCompetitorGas =
-      networkConditions.competitorGasPrices.reduce((sum, price) => sum + price, 0n) /
-      BigInt(networkConditions.competitorGasPrices.length);
+    // Adjust based on competitor gas prices - guard against empty array
+    let avgCompetitorGas = 0n;
+    let competitorMultiplier = 1.0;
 
-    const competitorMultiplier =
-      Number(avgCompetitorGas) / Number(networkConditions.currentBaseFee);
+    if (networkConditions.competitorGasPrices.length > 0) {
+      avgCompetitorGas =
+        networkConditions.competitorGasPrices.reduce((sum, price) => sum + price, 0n) /
+        BigInt(networkConditions.competitorGasPrices.length);
+
+      competitorMultiplier = Number(avgCompetitorGas) / Number(networkConditions.currentBaseFee);
+    }
 
     const finalMultiplier = networkMultiplier * Math.min(competitorMultiplier, 2.0);
     const adjustedBribe = BigInt(Math.floor(Number(profitBasedBribe) * finalMultiplier));
@@ -507,13 +516,15 @@ export class DynamicBribeOptimizer extends EventEmitter {
           break;
       }
 
-      // Adjust for competitor activity
-      const avgCompetitorGas =
-        networkConditions.competitorGasPrices.reduce((sum, price) => sum + price, 0n) /
-        BigInt(networkConditions.competitorGasPrices.length);
+      // Adjust for competitor activity - guard against empty array
+      if (networkConditions.competitorGasPrices.length > 0) {
+        const avgCompetitorGas =
+          networkConditions.competitorGasPrices.reduce((sum, price) => sum + price, 0n) /
+          BigInt(networkConditions.competitorGasPrices.length);
 
-      if (bribeAmount < avgCompetitorGas) {
-        baseProbability *= 0.6; // Significantly lower if below competitor average
+        if (bribeAmount < avgCompetitorGas) {
+          baseProbability *= 0.6; // Significantly lower if below competitor average
+        }
       }
 
       // Apply bounds
@@ -588,7 +599,7 @@ export class DynamicBribeOptimizer extends EventEmitter {
    */
   private startNetworkMonitoring(): void {
     // Update network conditions periodically
-    setInterval(async () => {
+    this.networkMonitoringInterval = setInterval(async () => {
       try {
         await this.getCurrentNetworkConditions();
       } catch (error) {
@@ -606,11 +617,42 @@ export class DynamicBribeOptimizer extends EventEmitter {
    */
   private startBribeEffectivenessTracking(): void {
     // Clean up old effectiveness data periodically
-    setInterval(() => {
+    this.bribeTrackingInterval = setInterval(() => {
       this.cleanupOldEffectivenessData();
     }, 300000); // Every 5 minutes
 
     this.logger.info('Bribe effectiveness tracking started');
+  }
+
+  /**
+   * Dispose of resources and cleanup
+   */
+  dispose(): void {
+    // Clear network monitoring interval
+    if (this.networkMonitoringInterval) {
+      clearInterval(this.networkMonitoringInterval);
+      this.networkMonitoringInterval = null;
+    }
+
+    // Clear bribe tracking interval
+    if (this.bribeTrackingInterval) {
+      clearInterval(this.bribeTrackingInterval);
+      this.bribeTrackingInterval = null;
+    }
+
+    // Clear all escalation timers
+    for (const [_opportunityId, timer] of this.escalationTimers) {
+      clearTimeout(timer);
+    }
+    this.escalationTimers.clear();
+
+    // Clear data structures
+    this.activeOpportunities.clear();
+    this.bribeEffectivenessData.length = 0;
+    this.networkConditionHistory.length = 0;
+    this.relayPerformanceMetrics.clear();
+
+    this.logger.info('Dynamic bribe optimizer disposed');
   }
 
   /**
@@ -764,8 +806,8 @@ export class DynamicBribeOptimizer extends EventEmitter {
     totalCalculations: number;
     averageInclusionProbability: number;
     averageBribeAmount: bigint;
-    escalationRate: number;
-    cancellationRate: number;
+    escalationRate?: number;
+    cancellationRate?: number;
   } {
     const totalCalculations = this.bribeEffectivenessData.length;
     const successfulInclusions = this.bribeEffectivenessData.filter(d => d.success).length;
@@ -779,13 +821,34 @@ export class DynamicBribeOptimizer extends EventEmitter {
           BigInt(totalCalculations)
         : 0n;
 
-    return {
+    // Calculate real metrics if we have data, otherwise omit them
+    const stats: {
+      activeOpportunities: number;
+      totalCalculations: number;
+      averageInclusionProbability: number;
+      averageBribeAmount: bigint;
+      escalationRate?: number;
+      cancellationRate?: number;
+    } = {
       activeOpportunities: this.activeOpportunities.size,
       totalCalculations,
       averageInclusionProbability: avgInclusionProbability,
       averageBribeAmount: avgBribeAmount,
-      escalationRate: 0.15, // Placeholder
-      cancellationRate: 0.05, // Placeholder
     };
+
+    // Only include escalation/cancellation rates if we have sufficient data
+    if (totalCalculations > 10) {
+      // Calculate actual escalation rate from historical data
+      const escalations = Array.from(this.activeOpportunities.values()).filter(
+        calc => calc.escalationLevel > 0
+      ).length;
+      stats.escalationRate = escalations / this.activeOpportunities.size;
+
+      // Calculate actual cancellation rate from historical data
+      const cancellations = this.bribeEffectivenessData.filter(d => !d.success).length;
+      stats.cancellationRate = cancellations / totalCalculations;
+    }
+
+    return stats;
   }
 }
