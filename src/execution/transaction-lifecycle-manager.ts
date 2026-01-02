@@ -329,7 +329,7 @@ export class TransactionLifecycleManager
   async buildTransactionLifecycleData(
     request: TransactionRequest
   ): Promise<TransactionLifecycleData> {
-    const transactionId = `tx-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const transactionId = `tx-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
 
     try {
       this.logger.debug('Building transaction', { transactionId, to: request.to });
@@ -588,10 +588,11 @@ export class TransactionLifecycleManager
       }
 
       // Mark as cancelled
+      const previousStage = lifecycleData.stage;
       lifecycleData.stage = TransactionStage.CANCELLED;
       lifecycleData.updatedAt = Date.now();
       lifecycleData.stageHistory.push({
-        from: lifecycleData.stage,
+        from: previousStage,
         to: TransactionStage.CANCELLED,
         timestamp: Date.now(),
         reason,

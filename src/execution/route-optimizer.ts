@@ -489,8 +489,20 @@ export class RouteOptimizer extends EventEmitter {
 
       const netProfit = grossProfit > gasCost ? grossProfit - gasCost : 0n;
 
-      // Convert to USD (simplified - would use price oracle in production)
-      const profitUsd = (Number(netProfit) / 1e18) * 2000; // Assume $2000 ETH
+      // Convert to USD using oracle (fallback to conservative default if unavailable)
+      let profitUsd = 0;
+      try {
+        const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+        const cm = {
+          getProvider: () =>
+            (this as any).transactionManager?.getProvider?.() || (this as any).provider,
+        } as any;
+        const oracle = new ChainlinkPriceOracleImpl(cm);
+        const ethUsd = await oracle.getEthUsdPrice();
+        profitUsd = (Number(netProfit) / 1e18) * ethUsd;
+      } catch {
+        throw new Error('ETH/USD price unavailable from oracle');
+      }
 
       // Calculate execution probability and liquidity score
       const executionProbability = await this.calculateExecutionProbability(pools, inputAmount);
@@ -851,8 +863,13 @@ export class RouteOptimizer extends EventEmitter {
   /**
    * Start cache cleanup
    */
+  private cacheCleanupInterval: NodeJS.Timeout | null = null;
+
   private startCacheCleanup(): void {
-    setInterval(() => {
+    if (this.cacheCleanupInterval) {
+      clearInterval(this.cacheCleanupInterval);
+    }
+    this.cacheCleanupInterval = setInterval(() => {
       this.cleanupExpiredRoutes();
     }, this.config.cacheExpirationMs / 4); // Clean up every quarter of expiration time
 
@@ -932,6 +949,10 @@ export class RouteOptimizer extends EventEmitter {
    * Stop optimizer
    */
   stop(): void {
+    if (this.cacheCleanupInterval) {
+      clearInterval(this.cacheCleanupInterval);
+      this.cacheCleanupInterval = null;
+    }
     this.routeCache.clear();
     this.liquidityCache.clear();
     this.logger.info('Route optimizer stopped');

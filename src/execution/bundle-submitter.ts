@@ -269,11 +269,20 @@ export class BundleSubmitter extends EventEmitter {
   private async optimizeBundleTransactions(
     transactions: BundleTransaction[]
   ): Promise<BundleTransaction[]> {
+    if (transactions.length === 0) return transactions;
+
     // Sort by priority (higher priority first)
     const optimized = [...transactions].sort((a, b) => b.priority - a.priority);
 
+    // Reassign nonces sequentially based on the smallest existing nonce
+    const startNonce = optimized.reduce(
+      (min, tx) => (tx.nonce < min ? tx.nonce : min),
+      optimized[0]!.nonce as number
+    );
+    const reNumbered = optimized.map((tx, idx) => ({ ...tx, nonce: startNonce + idx }));
+
     // Apply gas optimization
-    return this.optimizeGasUsage(optimized);
+    return this.optimizeGasUsage(reNumbered);
   }
 
   /**
@@ -334,9 +343,17 @@ export class BundleSubmitter extends EventEmitter {
       // Use 50% of max bribe for competitive advantage
       const bribeAmount = maxBribeAmount / 2n;
 
+      // Resolve recipient dynamically to current block coinbase/miner
+      const latestBlock = await this.provider.getBlock('latest');
+      const coinbase = (latestBlock as any)?.miner || (latestBlock as any)?.coinbase;
+      if (!coinbase || !/^0x[a-fA-F0-9]{40}$/.test(coinbase)) {
+        this.logger.warn('Unable to resolve coinbase/miner for bribe recipient; skipping bribe');
+        return undefined;
+      }
+
       return {
         amount: bribeAmount,
-        recipient: '0x0000000000000000000000000000000000000000', // Will be set to block coinbase
+        recipient: coinbase,
         gasLimit: 21000n, // Standard ETH transfer
       };
     } catch (error) {
@@ -445,44 +462,56 @@ export class BundleSubmitter extends EventEmitter {
       };
 
       // Submit bundle
-      const response = await fetch(flashbotsEndpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(bundleRequest),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const timeoutMs = Number(process.env['RELAY_REQUEST_TIMEOUT_MS'] ?? 15000);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(flashbotsEndpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(bundleRequest),
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        const result = (await response.json()) as {
+          error?: { message: string };
+          result?: { bundleHash: string };
+        };
+        if (result.error) {
+          throw new Error(`Flashbots error: ${result.error.message}`);
+        }
+        const bundleHash = result.result?.bundleHash;
+        if (!bundleHash) {
+          throw new Error('No bundle hash returned from Flashbots');
+        }
+        this.logger.info('Bundle submitted to Flashbots', {
+          bundleId: bundle.id,
+          bundleHash,
+          targetBlock: bundle.targetBlock,
+          submissionTime: Date.now() - startTime,
+        });
+        return {
+          relay: 'flashbots',
+          success: true,
+          bundleHash,
+          submissionTime: Date.now() - startTime,
+        };
+      } catch (err) {
+        if ((err as any)?.name === 'AbortError') {
+          this.logger.warn('Flashbots submission timed out', { bundleId: bundle.id, timeoutMs });
+          return {
+            relay: 'flashbots',
+            success: false,
+            error: `Timeout after ${timeoutMs}ms`,
+            submissionTime: Date.now() - startTime,
+          };
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeout);
       }
-
-      const result = (await response.json()) as {
-        error?: { message: string };
-        result?: { bundleHash: string };
-      };
-
-      if (result.error) {
-        throw new Error(`Flashbots error: ${result.error.message}`);
-      }
-
-      const bundleHash = result.result?.bundleHash;
-
-      if (!bundleHash) {
-        throw new Error('No bundle hash returned from Flashbots');
-      }
-
-      this.logger.info('Bundle submitted to Flashbots', {
-        bundleId: bundle.id,
-        bundleHash,
-        targetBlock: bundle.targetBlock,
-        submissionTime: Date.now() - startTime,
-      });
-
-      return {
-        relay: 'flashbots',
-        success: true,
-        bundleHash,
-        submissionTime: Date.now() - startTime,
-      };
     } catch (error) {
       this.logger.error('Flashbots submission failed', {
         bundleId: bundle.id,
@@ -513,7 +542,21 @@ export class BundleSubmitter extends EventEmitter {
 
       // Sign all transactions in bundle
       const signedTransactions = await Promise.all(
-        bundle.transactions.map(tx => this.signer.signTransaction(tx))
+        bundle.transactions.map(async tx => {
+          const network = await this.provider.getNetwork();
+          const req: ethers.TransactionRequest = {
+            to: tx.to,
+            data: tx.data,
+            value: tx.value ?? 0n,
+            gasLimit: tx.gasLimit,
+            nonce: tx.nonce,
+            type: tx.maxFeePerGas ? 2 : 0,
+            chainId: network.chainId,
+            maxFeePerGas: tx.maxFeePerGas,
+            maxPriorityFeePerGas: tx.maxPriorityFeePerGas,
+          };
+          return this.signer.signTransaction(req);
+        })
       );
 
       // Prepare bloXroute bundle request
@@ -539,45 +582,57 @@ export class BundleSubmitter extends EventEmitter {
       };
 
       // Submit bundle
-      const response = await fetch(`${bloxrouteEndpoint}/v1/bundle`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(bundleRequest),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      const timeoutMs = Number(process.env['RELAY_REQUEST_TIMEOUT_MS'] ?? 15000);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(`${bloxrouteEndpoint}/v1/bundle`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(bundleRequest),
+          signal: controller.signal,
+        });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        const result = (await response.json()) as {
+          success?: boolean;
+          error?: string;
+          bundle_hash?: string;
+        };
+        if (!result.success) {
+          throw new Error(`bloXroute error: ${result.error || 'Unknown error'}`);
+        }
+        const bundleHash = result.bundle_hash;
+        if (!bundleHash) {
+          throw new Error('No bundle hash returned from bloXroute');
+        }
+        this.logger.info('Bundle submitted to bloXroute', {
+          bundleId: bundle.id,
+          bundleHash,
+          targetBlock: bundle.targetBlock,
+          submissionTime: Date.now() - startTime,
+        });
+        return {
+          relay: 'bloxroute',
+          success: true,
+          bundleHash,
+          submissionTime: Date.now() - startTime,
+        };
+      } catch (err) {
+        if ((err as any)?.name === 'AbortError') {
+          this.logger.warn('bloXroute submission timed out', { bundleId: bundle.id, timeoutMs });
+          return {
+            relay: 'bloxroute',
+            success: false,
+            error: `Timeout after ${timeoutMs}ms`,
+            submissionTime: Date.now() - startTime,
+          };
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeout);
       }
-
-      const result = (await response.json()) as {
-        success?: boolean;
-        error?: string;
-        bundle_hash?: string;
-      };
-
-      if (!result.success) {
-        throw new Error(`bloXroute error: ${result.error || 'Unknown error'}`);
-      }
-
-      const bundleHash = result.bundle_hash;
-
-      if (!bundleHash) {
-        throw new Error('No bundle hash returned from bloXroute');
-      }
-
-      this.logger.info('Bundle submitted to bloXroute', {
-        bundleId: bundle.id,
-        bundleHash,
-        targetBlock: bundle.targetBlock,
-        submissionTime: Date.now() - startTime,
-      });
-
-      return {
-        relay: 'bloxroute',
-        success: true,
-        bundleHash,
-        submissionTime: Date.now() - startTime,
-      };
     } catch (error) {
       this.logger.error('bloXroute submission failed', {
         bundleId: bundle.id,
@@ -597,8 +652,7 @@ export class BundleSubmitter extends EventEmitter {
    * Sign Flashbots request for authentication
    */
   private async signFlashbotsRequest(body: string): Promise<string> {
-    const messageHash = ethers.keccak256(ethers.toUtf8Bytes(body));
-    const signature = await this.signer.signMessage(ethers.getBytes(messageHash));
+    const signature = await this.signer.signMessage(ethers.toUtf8Bytes(body));
     const signerAddress = await this.signer.getAddress();
     return `${signerAddress}:${signature}`;
   }
@@ -815,21 +869,54 @@ export class BundleSubmitter extends EventEmitter {
         });
 
         // Resubmit to relays
-        await this.submitToRelays(updatedBundle);
+        const results = await this.submitToRelays(updatedBundle);
+        const anySuccess = results.some(r => r.success);
 
-        // Update active bundle
-        this.activeBundles.set(bundleId, updatedBundle);
+        if (anySuccess) {
+          // Update active bundle and remove from queue (submission accepted)
+          this.activeBundles.set(bundleId, updatedBundle);
+          this.resubmissionQueue.delete(bundleId);
+        } else {
+          // Increment attempt and keep for next cycle
+          const nextAttempt = attempt + 1;
+          if (nextAttempt >= this.config.maxResubmissions) {
+            // Exhausted retries; mark failed and cleanup
+            const result = this.submissionHistory.get(bundleId);
+            if (result) {
+              result.failureReason = 'Bundle not included after maximum resubmissions';
+            }
+            this.activeBundles.delete(bundleId);
+            this.resubmissionQueue.delete(bundleId);
+            this.emit('bundleFailed', {
+              bundleId,
+              bundle: updatedBundle,
+              reason: 'Maximum resubmissions exceeded',
+            });
+          } else {
+            this.resubmissionQueue.set(bundleId, nextAttempt);
+          }
+        }
       } catch (error) {
         this.logger.error('Failed to resubmit bundle', {
           bundleId,
           attempt,
           error: error instanceof Error ? error.message : String(error),
         });
+        // Keep in queue for future attempts unless max reached
+        const nextAttempt = attempt + 1;
+        if (nextAttempt >= this.config.maxResubmissions) {
+          const result = this.submissionHistory.get(bundleId);
+          if (result) {
+            result.failureReason = 'Bundle not included after maximum resubmissions';
+          }
+          this.activeBundles.delete(bundleId);
+          this.resubmissionQueue.delete(bundleId);
+          this.emit('bundleFailed', { bundleId, bundle, reason: 'Maximum resubmissions exceeded' });
+        } else {
+          this.resubmissionQueue.set(bundleId, nextAttempt);
+        }
       }
     }
-
-    // Clear resubmission queue
-    this.resubmissionQueue.clear();
   }
 
   /**

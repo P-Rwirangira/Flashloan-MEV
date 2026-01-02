@@ -837,7 +837,8 @@ export class BaseMEVPlatform extends EventEmitter {
             enableGracefulShutdown: true,
             shutdownTimeoutMs: 30000,
           },
-          this.opportunityStateMachine
+          this.opportunityStateMachine,
+          this.flashLoanManager
         );
 
         // Register the Flash Loan Arbitrage Engine
@@ -1293,10 +1294,13 @@ export class BaseMEVPlatform extends EventEmitter {
           this.platformLogger.info('Transaction lifecycle manager started');
         }
 
-        // Start flash loan manager
+        // Start flash loan manager (wire transaction manager for auto-submit + metrics)
         if (this.flashLoanManager) {
-          await this.flashLoanManager.start();
-          this.platformLogger.info('Flash loan manager started');
+          await this.flashLoanManager.start(
+            this.transactionLifecycleManager,
+            this.metricsCollector
+          );
+          this.platformLogger.info('Flash loan manager started (auto-submit + metrics enabled)');
         }
 
         // Start execution orchestrator
@@ -1704,13 +1708,13 @@ export class BaseMEVPlatform extends EventEmitter {
         // API call failed, continue to fallback
       }
 
-      // Final fallback to conservative estimate
-      return 3000; // $3000 ETH
+      // No fallback: require price availability from oracle or data sources
+      throw new Error('ETH/USD price unavailable from all sources');
     } catch (error) {
-      this.platformLogger.warn('Failed to get current ETH price, using fallback', {
+      this.platformLogger.warn('Failed to get current ETH price', {
         error: error instanceof Error ? error.message : String(error),
       });
-      return 3000; // $3000 ETH fallback
+      throw error instanceof Error ? error : new Error(String(error));
     }
   }
 

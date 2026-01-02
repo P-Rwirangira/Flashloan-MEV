@@ -261,6 +261,26 @@ export class ProfitabilityOptimizer extends EventEmitter {
       // Get real market metrics
       const realMarketMetrics = await this.getRealMarketMetrics();
 
+      // Compute block time and mempool size from chain data
+      let blockTimeMs = 2000;
+      try {
+        const latest = await this.provider.getBlock('latest');
+        const prev =
+          latest && latest.number > 0 ? await this.provider.getBlock(latest.number - 1) : null;
+        if (latest && prev && latest.timestamp && prev.timestamp) {
+          blockTimeMs = Math.max(0, (Number(latest.timestamp) - Number(prev.timestamp)) * 1000);
+        }
+      } catch (_) {}
+
+      let mempoolSize = 0;
+      try {
+        const pendingTxCountHex = await ((this.provider as any)?.send?.(
+          'eth_getBlockTransactionCountByNumber',
+          ['pending']
+        ) ?? '0x0');
+        mempoolSize = parseInt(pendingTxCountHex as string, 16) || 0;
+      } catch (_) {}
+
       // Update current market condition
       this.currentMarketCondition = {
         timestamp: Date.now(),
@@ -269,8 +289,8 @@ export class ProfitabilityOptimizer extends EventEmitter {
         volatilityIndex: realMarketMetrics.volatilityIndex,
         liquidityIndex: realMarketMetrics.liquidityDepth,
         competitionLevel: realMarketMetrics.competitionLevel,
-        blockTime: 2000, // 2 seconds for Base
-        mempoolSize: 1000, // Placeholder
+        blockTime: blockTimeMs,
+        mempoolSize,
       };
 
       // Add to history
@@ -309,8 +329,25 @@ export class ProfitabilityOptimizer extends EventEmitter {
       ? Math.min(Number(latestBlock.gasUsed) / Number(latestBlock.gasLimit), 1.0)
       : 0.5;
 
-    // Estimate volatility from recent price movements (simplified)
-    const volatilityIndex = Math.random() * 0.6 + 0.2; // 0.2-0.8 (placeholder for real volatility calculation)
+    // Estimate volatility from Uniswap V3 tick changes (ETH/USDC 0.05% pool on Base)
+    let volatilityIndex = 0.3;
+    try {
+      const poolAddress = '0x74cb6260be6f31965c239df6d6ef2ac2b5d4f020';
+      const poolAbi = [
+        'function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16,uint16,uint16,uint8,bool)',
+      ];
+      const pool = new ethers.Contract(poolAddress, poolAbi, provider);
+      const current = await (pool as any)['slot0']?.();
+      const currentTick = current?.tick ?? current?.[1];
+      const latestBlockNumber = await provider.getBlockNumber();
+      const prev = await (pool as any)['slot0']?.({ blockTag: latestBlockNumber - 20 });
+      const prevTick = prev?.tick ?? prev?.[1] ?? currentTick;
+      const tickDelta = Math.abs(Number(currentTick) - Number(prevTick));
+      // Normalize: 0-200 tick change maps roughly to 0-1
+      volatilityIndex = Math.min(tickDelta / 200, 1.0);
+    } catch (_) {
+      // Keep default if anything fails
+    }
 
     // Estimate competition level from mempool analysis
     const competitionLevel = await this.estimateCompetitionLevel();
@@ -392,7 +429,7 @@ export class ProfitabilityOptimizer extends EventEmitter {
   }
 
   /**
-   * Optimize specific opportunity - placeholder implementation
+   * Optimize specific opportunity using real market metrics and risk adjustments
    */
   async optimizeOpportunity(opportunityId: string): Promise<OptimizationResult | null> {
     const opportunity = this.activeOpportunities.get(opportunityId);
@@ -400,18 +437,56 @@ export class ProfitabilityOptimizer extends EventEmitter {
       return null;
     }
 
-    // Simplified optimization for now
+    // Derive metrics using current market conditions and a conservative model
+    const opp = opportunity;
+    const mc = this.currentMarketCondition;
+
+    // Gas cost estimate
+    const gasLimit = 300000n;
+    const gasCost = mc.gasPrice * gasLimit;
+
+    // Baseline gross profit model: 0.1% of notional for arbitrage-like, else 0.05%
+    const baseReturnBps = opp.type === OpportunityType.ARBITRAGE ? 10 : 5;
+    const grossProfit = (opp.originalAmount * BigInt(baseReturnBps)) / 10000n;
+
+    // Net profit after gas
+    const netProfit = grossProfit > gasCost ? grossProfit - gasCost : 0n;
+
+    // Convert to USD using simple ETH price from Chainlink if token resembles WETH, else fallback
+    let profitUsd = 0;
+    try {
+      const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+      const cm = { getProvider: () => this.provider } as any;
+      const oracle = new ChainlinkPriceOracleImpl(cm);
+      const ethUsd = await oracle.getEthUsdPrice();
+      profitUsd = (Number(netProfit) / 1e18) * ethUsd;
+    } catch (_) {
+      // If oracle unavailable, leave profitUsd as 0 and proceed conservatively
+    }
+
+    // Execution probability adjusted by volatility and congestion
+    const volPenalty = Math.min(
+      mc.volatilityIndex * (this.config.volatilityAdjustmentFactor || 1),
+      0.5
+    );
+    const congestionPenalty = Math.min(mc.networkCongestion, 0.5);
+    const executionProbability = Math.max(0.1, 0.9 - volPenalty - congestionPenalty);
+
+    // Risk-adjusted return and expected value
+    const riskAdjustedReturn = profitUsd * (1 - (volPenalty + congestionPenalty));
+    const expectedValue = riskAdjustedReturn * executionProbability;
+
     const metrics: ProfitabilityMetrics = {
       opportunityId,
-      grossProfit: 1000000000000000000n, // 1 ETH
-      netProfit: 500000000000000000n, // 0.5 ETH
-      profitUsd: 1000,
-      gasCost: 500000000000000000n, // 0.5 ETH
-      executionProbability: 0.8,
-      riskAdjustedReturn: 800,
-      sharpeRatio: 1.5,
-      expectedValue: 640,
-      confidenceInterval: { lower: 600, upper: 1000 },
+      grossProfit,
+      netProfit,
+      profitUsd,
+      gasCost,
+      executionProbability,
+      riskAdjustedReturn,
+      sharpeRatio: 1.0 / (1 + mc.volatilityIndex),
+      expectedValue,
+      confidenceInterval: { lower: expectedValue * 0.8, upper: expectedValue * 1.2 },
       calculatedAt: Date.now(),
     };
 

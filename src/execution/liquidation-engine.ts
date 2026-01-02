@@ -28,6 +28,7 @@ export interface LiquidationEngineConfig {
   readonly supportedProtocols: string[];
   readonly healthFactorBuffer: number;
   readonly liquidationBonusThreshold: number;
+  readonly resolveCTokensFromConfig?: boolean; // optionally resolve cTokens if not provided in opportunity
 }
 
 export interface LiquidationRoute {
@@ -258,9 +259,20 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
       }
 
       const expectedProfit = await this.calculateLiquidationProfit(opportunity, optimalSize);
-      const minProfitThreshold = ethers.parseEther(this.config.minProfitThresholdUsd.toString());
-
-      return expectedProfit >= minProfitThreshold;
+      // Convert USD threshold to ETH using Chainlink oracle to avoid ETH-vs-USD mismatch
+      try {
+        const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+        const connectionManager = {
+          getProvider: () => this.transactionManager.getProvider(),
+        } as any;
+        const oracle = new ChainlinkPriceOracleImpl(connectionManager);
+        const ethPriceUsd = await oracle.getEthUsdPrice();
+        const minProfitEth = this.config.minProfitThresholdUsd / Math.max(ethPriceUsd, 1e-6);
+        const minProfitThreshold = ethers.parseEther(minProfitEth.toString());
+        return expectedProfit >= minProfitThreshold;
+      } catch (e) {
+        throw new Error('ETH/USD price unavailable from oracle');
+      }
     } catch (error) {
       this.logger.error('Failed to validate liquidation profitability', {
         opportunityId: opportunity.id,
@@ -461,22 +473,142 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
     opportunity: LiquidationOpportunity,
     route: LiquidationRoute
   ): Promise<TransactionRequest> {
-    // Get flash executor contract address
     const flashExecutorAddress = process.env['FLASH_EXECUTOR_ADDRESS'];
-    if (!flashExecutorAddress) {
-      throw new Error('FLASH_EXECUTOR_ADDRESS not configured');
+    if (!flashExecutorAddress) throw new Error('FLASH_EXECUTOR_ADDRESS not configured');
+
+    const flashPool = process.env['FLASH_POOL_ADDRESS'];
+    if (!flashPool) throw new Error('FLASH_POOL_ADDRESS not configured');
+
+    // Determine which side to borrow (token0 vs token1) for the selected pool
+    const tokenIsToken0Env = process.env['FLASH_POOL_TOKEN_IS_TOKEN0'];
+    const borrowAsToken0 = tokenIsToken0Env ? tokenIsToken0Env.toLowerCase() !== 'false' : true;
+
+    // Build liquidation payload (Solidity LiquidationPayload struct) and route data (RouteData)
+    const abi = new ethers.Interface([
+      'function executeLiquidationFlash(address flashPool,uint256 amount0,uint256 amount1,bytes liquidationData,bytes routeData) external',
+    ]);
+    const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+
+    // ProtocolType enum mapping: AAVE_V3=0, COMPOUND_LIKE=1
+    const protocolType = opportunity.protocol === 'aave-v3' ? 0 : 1;
+
+    // Load protocol addresses from contracts.yaml via ContractManager
+    const { ContractManager } = await import('../contracts/contract-manager');
+    const cm = (await (ContractManager as any).create?.()) as any;
+    const protocols = cm.getProtocolAddresses();
+    const aavePool = protocols?.aaveV3?.poolAddress;
+    const moonwellComptroller = protocols?.compoundLike?.moonwell?.comptroller;
+    const seamlessComptroller = protocols?.compoundLike?.seamless?.comptroller;
+
+    // Protocol addresses from config with sane fallbacks
+    const protocolAddress =
+      opportunity.protocol === 'aave-v3'
+        ? (aavePool as string)
+        : opportunity.protocol === 'moonwell'
+          ? (moonwellComptroller as string)
+          : (seamlessComptroller as string);
+
+    if (!protocolAddress) {
+      throw new Error(`Protocol address not configured for ${opportunity.protocol}`);
     }
 
-    // Encode liquidation data
-    const liquidationData = this.encodeLiquidationData(opportunity, route);
+    let cDebtToken = (opportunity as any).cDebtToken ?? ethers.ZeroAddress;
+    let cCollateralToken = (opportunity as any).cCollateralToken ?? ethers.ZeroAddress;
+
+    // Optionally resolve cTokens via config mapping if omitted
+    if (protocolType === 1 && this.config.resolveCTokensFromConfig) {
+      try {
+        const { ContractManager } = await import('../contracts/contract-manager');
+        const cm = (await (ContractManager as any).create?.()) as any;
+        if (cDebtToken === ethers.ZeroAddress) {
+          const resolved = cm.getCTokenFor(
+            opportunity.protocol as 'moonwell' | 'seamless',
+            opportunity.debtAsset
+          );
+          if (resolved && /^0x[a-fA-F0-9]{40}$/.test(resolved)) {
+            cDebtToken = resolved;
+          }
+        }
+        if (cCollateralToken === ethers.ZeroAddress) {
+          const resolved = cm.getCTokenFor(
+            opportunity.protocol as 'moonwell' | 'seamless',
+            opportunity.collateralAsset
+          );
+          if (resolved && /^0x[a-fA-F0-9]{40}$/.test(resolved)) {
+            cCollateralToken = resolved;
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (
+      protocolType === 1 &&
+      (cDebtToken === ethers.ZeroAddress || cCollateralToken === ethers.ZeroAddress)
+    ) {
+      throw new Error(
+        'Compound-like liquidation requires cDebtToken and cCollateralToken addresses'
+      );
+    }
+    const receiveAToken = false;
+
+    const liquidationPayload = abiCoder.encode(
+      [
+        'uint8', // protocol
+        'address', // borrower
+        'address', // debtAsset
+        'address', // collateralAsset
+        'uint256', // debtToCover
+        'address', // protocolAddress
+        'address', // cDebtToken
+        'address', // cCollateralToken
+        'bool', // receiveAToken
+      ],
+      [
+        protocolType,
+        opportunity.borrower,
+        opportunity.debtAsset,
+        opportunity.collateralAsset,
+        route.flashLoanAmount,
+        protocolAddress,
+        cDebtToken,
+        cCollateralToken,
+        receiveAToken,
+      ]
+    );
+
+    // RouteData encoding: we keep it empty unless provided by a higher-level optimizer
+    const routeData = abiCoder.encode(
+      ['address', 'address', 'uint256', 'uint256', 'address[]', 'uint24[]', 'bool[]', 'uint256'],
+      [
+        opportunity.debtAsset,
+        opportunity.collateralAsset,
+        0n, // amountIn for pre/post swaps determined in contract
+        0n, // minAmountOut
+        [],
+        [],
+        [],
+        0n, // deadline 0 -> ignored by contract
+      ]
+    );
+
+    const amount0 = borrowAsToken0 ? route.flashLoanAmount : 0n;
+    const amount1 = borrowAsToken0 ? 0n : route.flashLoanAmount;
+
+    const data = abi.encodeFunctionData('executeLiquidationFlash', [
+      flashPool,
+      amount0,
+      amount1,
+      liquidationPayload,
+      routeData,
+    ]);
 
     return {
       to: flashExecutorAddress as `0x${string}`,
-      data: liquidationData,
+      data,
       value: 0n,
       gasLimit: route.totalGasEstimate,
-      maxFeePerGas: BigInt(50e9), // 50 gwei
-      maxPriorityFeePerGas: BigInt(2e9), // 2 gwei
+      maxFeePerGas: BigInt(50e9),
+      maxPriorityFeePerGas: BigInt(2e9),
     };
   }
 
@@ -523,26 +655,6 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
   /**
    * Encode liquidation data for flash loan execution
    */
-  private encodeLiquidationData(
-    opportunity: LiquidationOpportunity,
-    route: LiquidationRoute
-  ): string {
-    // This would encode the liquidation parameters for the flash executor contract
-    // For now, return a placeholder
-    const abiCoder = new ethers.AbiCoder();
-
-    return abiCoder.encode(
-      ['address', 'address', 'uint256', 'address', 'bytes'],
-      [
-        opportunity.borrower,
-        opportunity.collateralToken,
-        route.flashLoanAmount,
-        opportunity.debtToken,
-        '0x', // Additional data
-      ]
-    );
-  }
-
   /**
    * Encode direct liquidation data
    */
@@ -757,24 +869,39 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
     // Initialize interfaces for each supported protocol
     for (const protocol of this.config.supportedProtocols) {
       switch (protocol) {
-        case 'moonwell':
+        case 'moonwell': {
+          const addr = process.env['MOONWELL_COMPTROLLER_ADDRESS'];
+          if (!addr || !/^0x[a-fA-F0-9]{40}$/.test(addr)) {
+            throw new Error('MOONWELL_COMPTROLLER_ADDRESS is missing or invalid');
+          }
           this.protocolInterfaces.set(protocol, {
-            comptrollerAddress: '0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180',
+            comptrollerAddress: addr,
             liquidationFunction: 'liquidateBorrow',
           });
           break;
-        case 'aave-v3':
+        }
+        case 'aave-v3': {
+          const addr = process.env['AAVE_V3_POOL_ADDRESS'];
+          if (!addr || !/^0x[a-fA-F0-9]{40}$/.test(addr)) {
+            throw new Error('AAVE_V3_POOL_ADDRESS is missing or invalid');
+          }
           this.protocolInterfaces.set(protocol, {
-            poolAddress: '0xA238Dd80C259a72e81d7e4664a9801593F98d1c5',
+            poolAddress: addr,
             liquidationFunction: 'liquidationCall',
           });
           break;
-        case 'seamless':
+        }
+        case 'seamless': {
+          const addr = process.env['SEAMLESS_COMPTROLLER_ADDRESS'];
+          if (!addr || !/^0x[a-fA-F0-9]{40}$/.test(addr)) {
+            throw new Error('SEAMLESS_COMPTROLLER_ADDRESS is missing or invalid');
+          }
           this.protocolInterfaces.set(protocol, {
-            comptrollerAddress: '0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180',
+            comptrollerAddress: addr,
             liquidationFunction: 'liquidateBorrow',
           });
           break;
+        }
       }
     }
 

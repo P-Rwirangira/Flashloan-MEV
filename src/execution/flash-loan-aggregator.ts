@@ -166,7 +166,15 @@ export class FlashLoanAggregator extends EventEmitter {
    */
   private startCapacityMonitoring(): void {
     this.capacityUpdateTimer = setInterval(async () => {
+      const start = Date.now();
       await this.updateProviderCapacities();
+      // Record a synthetic performance tick for capacity refresh
+      this.recordProviderPerformance('system-capacity-refresh', {
+        totalRequests:
+          (this.providerPerformance.get('system-capacity-refresh')?.totalRequests ?? 0) + 1,
+        averageExecutionTime: Date.now() - start,
+        lastUpdated: Date.now(),
+      });
     }, this.config.capacityRefreshIntervalMs);
 
     this.logger.info('Capacity monitoring started');
@@ -177,33 +185,21 @@ export class FlashLoanAggregator extends EventEmitter {
    */
   private async updateProviderCapacities(): Promise<void> {
     try {
-      const erc20Abi = ['function balanceOf(address) view returns (uint256)'];
-      for (const [_providerName, provider] of this.providers) {
+      for (const [providerName, provider] of this.providers) {
         try {
-          // Approximate capacity as sum of balances of key supported tokens held by provider
-          let capacity = 0n;
-          for (const token of provider.supportedTokens) {
-            try {
-              const tokenContract = new ethers.Contract(
-                token,
-                erc20Abi,
-                (this as any).provider || ethers.getDefaultProvider()
-              );
-              const balanceOf = (tokenContract as any)['balanceOf'] as
-                | ((addr: string) => Promise<any>)
-                | undefined;
-              if (balanceOf) {
-                const bal = await balanceOf(provider.contractAddress);
-                capacity += BigInt(bal?.toString?.() ?? '0');
-              }
-            } catch (_) {
-              continue;
-            }
+          const capacity = await this.fetchCapacityForProvider(providerName, provider);
+          if (capacity > 0n) {
+            provider.availableCapacity = capacity;
+          } else {
+            // Fallback to 80% of max if capacity could not be determined
+            provider.availableCapacity = (provider.maxCapacity * 8n) / 10n;
           }
-          // Fallback to 80% of max if we couldn't query anything
-          provider.availableCapacity = capacity > 0n ? capacity : (provider.maxCapacity * 8n) / 10n;
           provider.lastUpdated = Date.now();
         } catch (innerError) {
+          this.logger.warn('Capacity fetch failed for provider', {
+            provider: providerName,
+            error: innerError instanceof Error ? innerError.message : String(innerError),
+          });
           provider.availableCapacity = (provider.maxCapacity * 8n) / 10n;
           provider.lastUpdated = Date.now();
         }
@@ -212,6 +208,140 @@ export class FlashLoanAggregator extends EventEmitter {
       this.logger.error('Failed to update provider capacities', {
         error: error instanceof Error ? error.message : String(error),
       });
+    }
+  }
+
+  private async fetchCapacityForProvider(
+    providerName: string,
+    provider: FlashLoanProvider
+  ): Promise<bigint> {
+    // Timeout wrapper
+    const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => setTimeout(() => reject(new Error('capacity-timeout')), ms)),
+      ]);
+    };
+
+    const erc20Abi = ['function balanceOf(address) view returns (uint256)'];
+    const aaveAbi = [
+      // Minimal ABI for getReserveData (v2-style). Will be tried and caught if incompatible
+      'function getReserveData(address asset) view returns (uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint40)',
+    ];
+
+    try {
+      switch (provider.protocol) {
+        case 'aave-v3': {
+          // Sum available liquidity across supported tokens using getReserveData
+          let total = 0n;
+          const pool = new ethers.Contract(
+            provider.contractAddress as string,
+            aaveAbi,
+            (this as any).provider || ethers.getDefaultProvider()
+          );
+          for (const token of provider.supportedTokens) {
+            try {
+              const res = await withTimeout(pool['getReserveData']!(token), 8000);
+              // availableLiquidity is first element in v2-style tuple
+              const avail = BigInt(res?.[0]?.toString?.() ?? '0');
+              total += avail;
+            } catch (e) {
+              // If call fails for a token, continue with others
+              this.logger.debug('Aave reserve query failed for token', {
+                provider: providerName,
+                token,
+                error: e instanceof Error ? e.message : String(e),
+              });
+              continue;
+            }
+          }
+          return total;
+        }
+        case 'balancer': {
+          // Approximate capacity as sum of supported token balances held by the pool/vault
+          let total = 0n;
+          for (const token of provider.supportedTokens) {
+            try {
+              const tokenContract = new ethers.Contract(
+                token,
+                erc20Abi,
+                (this as any).provider || ethers.getDefaultProvider()
+              );
+              const bal = await withTimeout(
+                tokenContract['balanceOf']!(provider.contractAddress as string),
+                8000
+              );
+              total += BigInt(bal?.toString?.() ?? '0');
+            } catch (e) {
+              this.logger.debug('Balancer token balance query failed', {
+                provider: providerName,
+                token,
+                error: e instanceof Error ? e.message : String(e),
+              });
+              continue;
+            }
+          }
+          return total;
+        }
+        case 'uniswap-v3': {
+          // No global capacity; approximate by balances of supported tokens at the contract address
+          let total = 0n;
+          for (const token of provider.supportedTokens) {
+            try {
+              const tokenContract = new ethers.Contract(
+                token,
+                erc20Abi,
+                (this as any).provider || ethers.getDefaultProvider()
+              );
+              const bal = await withTimeout(
+                tokenContract['balanceOf']!(provider.contractAddress as string),
+                8000
+              );
+              total += BigInt(bal?.toString?.() ?? '0');
+            } catch (e) {
+              this.logger.debug('Uniswap V3 token balance query failed', {
+                provider: providerName,
+                token,
+                error: e instanceof Error ? e.message : String(e),
+              });
+              continue;
+            }
+          }
+          return total;
+        }
+        default: {
+          // Generic fallback: sum supported token balances
+          let total = 0n;
+          for (const token of provider.supportedTokens) {
+            try {
+              const tokenContract = new ethers.Contract(
+                token,
+                erc20Abi,
+                (this as any).provider || ethers.getDefaultProvider()
+              );
+              const bal = await withTimeout(
+                tokenContract['balanceOf']!(provider.contractAddress as string),
+                8000
+              );
+              total += BigInt(bal?.toString?.() ?? '0');
+            } catch (e) {
+              this.logger.debug('Generic capacity balance query failed', {
+                provider: providerName,
+                token,
+                error: e instanceof Error ? e.message : String(e),
+              });
+              continue;
+            }
+          }
+          return total;
+        }
+      }
+    } catch (err) {
+      this.logger.warn('fetchCapacityForProvider failed', {
+        provider: providerName,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return 0n;
     }
   }
 
@@ -249,6 +379,40 @@ export class FlashLoanAggregator extends EventEmitter {
   /**
    * Record provider performance metrics
    */
+  private recordProviderPerformance(
+    providerName: string,
+    metrics: Partial<ProviderPerformanceMetrics>
+  ): void {
+    const existing = this.providerPerformance.get(providerName);
+    const now = Date.now();
+    if (existing) {
+      const updated: ProviderPerformanceMetrics = {
+        ...existing,
+        totalRequests: metrics.totalRequests ?? existing.totalRequests,
+        successfulRequests: metrics.successfulRequests ?? existing.successfulRequests,
+        failedRequests: metrics.failedRequests ?? existing.failedRequests,
+        averageExecutionTime: metrics.averageExecutionTime ?? existing.averageExecutionTime,
+        averageFee: metrics.averageFee ?? existing.averageFee,
+        reliability: metrics.reliability ?? existing.reliability,
+        lastUpdated: now,
+        provider: existing.provider,
+      };
+      this.providerPerformance.set(providerName, updated);
+    } else {
+      const created: ProviderPerformanceMetrics = {
+        provider: providerName,
+        totalRequests: metrics.totalRequests ?? 0,
+        successfulRequests: metrics.successfulRequests ?? 0,
+        failedRequests: metrics.failedRequests ?? 0,
+        averageExecutionTime: metrics.averageExecutionTime ?? 0,
+        averageFee: metrics.averageFee ?? 0n,
+        reliability: metrics.reliability ?? 0,
+        lastUpdated: now,
+      };
+      this.providerPerformance.set(providerName, created);
+    }
+  }
+
   /**
    * Clean up old performance data
    */

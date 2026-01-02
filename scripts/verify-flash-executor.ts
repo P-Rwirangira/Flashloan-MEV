@@ -50,7 +50,6 @@ function getExplorerUrl(network: string, address: string): string {
     case 'base':
       return `https://basescan.org/address/${address}`;
     case 'basesepolia':
-    case 'base-sepolia':
       return `https://sepolia.basescan.org/address/${address}`;
     default:
       return `https://etherscan.io/address/${address}`;

@@ -749,7 +749,12 @@ export class CompetitiveIntelligenceSystem extends EventEmitter {
     }
 
     // Check for flash loan interactions
-    if (tx.data && tx.data.includes('0x1249c58b')) {
+    if (
+      tx.data &&
+      typeof tx.data === 'string' &&
+      tx.data.length >= 10 &&
+      tx.data.slice(0, 10).toLowerCase() === '0x1249c58b'
+    ) {
       // flashLoan selector
       return true;
     }
@@ -765,35 +770,53 @@ export class CompetitiveIntelligenceSystem extends EventEmitter {
     receipt: ethers.TransactionReceipt
   ): Promise<bigint | null> {
     try {
-      // Look for Transfer events to calculate profit
-      const transferTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+      // ERC-20 Transfer signature topic
+      const ERC20_TRANSFER_TOPIC =
+        '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+      const sender = tx.from.toLowerCase();
 
-      let totalIn = 0n;
-      let totalOut = 0n;
+      // Aggregate token deltas for the sender across all transfers in this receipt
+      const tokenDeltas = new Map<string, bigint>();
+      const addDelta = (token: string, amt: bigint) => {
+        const key = token.toLowerCase();
+        const prev = tokenDeltas.get(key) || 0n;
+        tokenDeltas.set(key, prev + amt);
+      };
 
       for (const log of receipt.logs) {
-        if (log.topics[0] === transferTopic) {
+        if (log.topics[0] === ERC20_TRANSFER_TOPIC) {
+          if (!log.topics || log.topics.length < 3) continue;
+          const from = ('0x' + (log.topics[1] as string).slice(26)).toLowerCase();
+          const to = ('0x' + (log.topics[2] as string).slice(26)).toLowerCase();
           const amount = BigInt(log.data);
 
-          // If transfer to the transaction sender, it's profit
-          if (
-            log.topics[2] &&
-            log.topics[2].toLowerCase().includes(tx.from.toLowerCase().slice(2))
-          ) {
-            totalOut += amount;
-          }
-          // If transfer from the transaction sender, it's cost
-          if (
-            log.topics[1] &&
-            log.topics[1].toLowerCase().includes(tx.from.toLowerCase().slice(2))
-          ) {
-            totalIn += amount;
+          if (to === sender && from !== sender) {
+            // Net inflow of this ERC-20 to the sender
+            addDelta(log.address, amount);
+          } else if (from === sender && to !== sender) {
+            // Net outflow of this ERC-20 from the sender
+            addDelta(log.address, -amount as unknown as bigint);
           }
         }
       }
 
-      const profit = totalOut - totalIn;
-      return profit > 0n ? profit : null;
+      // Convert aggregated token deltas to USD, then to ETH (wei) for a single scalar profit metric
+      const provider = this.provider;
+      const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+      const cm = { getProvider: () => provider } as any;
+      const oracle = new ChainlinkPriceOracleImpl(cm);
+      const { aggregateTokenDeltasToUsd } = await import('../utils/pnl');
+
+      const totalUsd = await aggregateTokenDeltasToUsd(
+        provider as any,
+        (t: string) => oracle.getTokenUsdPrice(t as any),
+        tokenDeltas
+      );
+      if (totalUsd <= 0) return null;
+      // Convert USD to ETH wei using current ETH/USD
+      const ethUsd = await oracle.getEthUsdPrice();
+      const wei = BigInt(Math.floor((totalUsd / Math.max(ethUsd, 1e-9)) * 1e18));
+      return wei > 0n ? wei : null;
     } catch (error) {
       return null;
     }
@@ -927,7 +950,9 @@ export class CompetitiveIntelligenceSystem extends EventEmitter {
     let primaryType = OpportunityType.ARBITRAGE;
     let confidence = 0.5;
 
-    if (arbitrageTxs.length > liquidationTxs.length) {
+    if (recentTxs.length === 0) {
+      confidence = 0;
+    } else if (arbitrageTxs.length > liquidationTxs.length) {
       primaryType = OpportunityType.ARBITRAGE;
       confidence = arbitrageTxs.length / recentTxs.length;
     } else if (liquidationTxs.length > 0) {

@@ -660,15 +660,206 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
     arbOpp: ArbitrageOpportunity
   ): Promise<bigint> {
     try {
-      // In a real implementation, this would:
-      // 1. Parse transaction receipt logs
-      // 2. Calculate token balance changes
-      // 3. Account for gas costs and fees
-      // 4. Return net profit in ETH/USD
+      // Compute net profit using real-time gas pricing and estimated gas cost
+      const feeData = await this.getProvider().getFeeData();
+      const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || 20_000_000_000n;
+      const gasEstimate =
+        opportunity.estimatedGasCost && opportunity.estimatedGasCost > 0n
+          ? opportunity.estimatedGasCost
+          : 300000n; // fallback
+      const estimatedGasCost = gasEstimate * gasPrice;
+      // Try to compute tokenOut delta from Swap events (Uniswap V3 / Aerodrome); fallback to Transfer logs
+      let receiptDeltaTokenOut: bigint | null = null;
+      try {
+        if (arbOpp.tokenOut) {
+          const provider = this.getProvider();
+          const receipt = await provider.getTransactionReceipt(
+            (opportunity as any).lastTxHash || ''
+          );
+          if (receipt && receipt.logs) {
+            const ourAddrs: string[] = [];
+            const execAddr = process.env['EXECUTION_WALLET_ADDRESS'];
+            const flashExec = process.env['FLASH_EXECUTOR_ADDRESS'];
+            if (execAddr) ourAddrs.push(execAddr.toLowerCase());
+            if (flashExec) ourAddrs.push(flashExec.toLowerCase());
+            // Uniswap V3 Swap event
+            const uniIface = new ethers.Interface([
+              'event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)',
+              'function token0() view returns (address)',
+              'function token1() view returns (address)',
+            ]);
+            // Aerodrome (Velodrome) Swap event
+            const aeroIface = new ethers.Interface([
+              'event Swap(address indexed sender,address indexed to,uint256 amount0In,uint256 amount1In,uint256 amount0Out,uint256 amount1Out)',
+              'function token0() view returns (address)',
+              'function token1() view returns (address)',
+            ]);
 
-      // For now, return estimated profit minus a conservative gas cost
-      const estimatedGasCost = BigInt(300000) * BigInt(50e9); // 300k gas * 50 gwei
-      const netProfit = arbOpp.estimatedProfit - estimatedGasCost;
+            const tokenOutAddr = (arbOpp.tokenOut as string).toLowerCase();
+            const tokenDeltas = new Map<string, bigint>();
+            const addDelta = (token: string, amt: bigint) => {
+              const key = token.toLowerCase();
+              const prev = tokenDeltas.get(key) || 0n;
+              tokenDeltas.set(key, prev + amt);
+            };
+
+            for (const log of receipt.logs) {
+              try {
+                // Try Uniswap V3 swap decode
+                const parsed = uniIface.parseLog({
+                  topics: log.topics as string[],
+                  data: log.data,
+                });
+                if (parsed && parsed.name === 'Swap') {
+                  const recipient = (parsed.args['recipient'] as string).toLowerCase();
+                  if (!ourAddrs.includes(recipient)) {
+                    continue;
+                  }
+                  const pool = new ethers.Contract(
+                    log.address,
+                    [
+                      'function token0() view returns (address)',
+                      'function token1() view returns (address)',
+                    ],
+                    provider
+                  );
+                  const token0Fn = pool['token0'];
+                  const token1Fn = pool['token1'];
+                  if (!token0Fn || !token1Fn) continue;
+                  const [t0, t1] = await Promise.all([token0Fn(), token1Fn()]);
+                  const t0l = (t0 as string).toLowerCase();
+                  const t1l = (t1 as string).toLowerCase();
+                  const amount0: bigint = BigInt(parsed.args['amount0'].toString());
+                  const amount1: bigint = BigInt(parsed.args['amount1'].toString());
+                  // In Uniswap V3 event, negative amount means tokens were sent from pool to recipient
+                  if (amount0 < 0n) addDelta(t0l, -amount0);
+                  if (amount1 < 0n) addDelta(t1l, -amount1);
+                  continue;
+                }
+              } catch {}
+              try {
+                // Try Aerodrome swap decode
+                const parsed2 = aeroIface.parseLog({
+                  topics: log.topics as string[],
+                  data: log.data,
+                });
+                if (parsed2 && parsed2.name === 'Swap') {
+                  const to = (parsed2.args['to'] as string).toLowerCase();
+                  if (!ourAddrs.includes(to)) {
+                    continue;
+                  }
+                  const pool = new ethers.Contract(
+                    log.address,
+                    [
+                      'function token0() view returns (address)',
+                      'function token1() view returns (address)',
+                    ],
+                    provider
+                  );
+                  const token0Fn = pool['token0'];
+                  const token1Fn = pool['token1'];
+                  if (!token0Fn || !token1Fn) continue;
+                  const [t0, t1] = await Promise.all([token0Fn(), token1Fn()]);
+                  const t0l = (t0 as string).toLowerCase();
+                  const t1l = (t1 as string).toLowerCase();
+                  const amount0Out: bigint = BigInt(parsed2.args['amount0Out'].toString());
+                  const amount1Out: bigint = BigInt(parsed2.args['amount1Out'].toString());
+                  if (amount0Out > 0n) addDelta(t0l, amount0Out);
+                  if (amount1Out > 0n) addDelta(t1l, amount1Out);
+                  continue;
+                }
+              } catch {}
+            }
+            // Fallback to Transfer logs if no delta found
+            if ((tokenDeltas.get(tokenOutAddr) || 0n) === 0n) {
+              const transferTopic =
+                '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+              for (const log of receipt.logs) {
+                if (
+                  log.address?.toLowerCase() === tokenOutAddr &&
+                  log.topics?.[0] === transferTopic
+                ) {
+                  if (!log.topics || log.topics.length < 3) {
+                    continue;
+                  }
+                  const from = '0x' + (log.topics[1] as string).slice(26).toLowerCase();
+                  const to = '0x' + (log.topics[2] as string).slice(26).toLowerCase();
+                  const value = BigInt(log.data);
+                  if (ourAddrs.includes(to) && !ourAddrs.includes(from))
+                    addDelta(tokenOutAddr, value);
+                  if (ourAddrs.includes(from) && !ourAddrs.includes(to))
+                    addDelta(tokenOutAddr, -value as unknown as bigint);
+                }
+              }
+            }
+            receiptDeltaTokenOut = tokenDeltas.get(tokenOutAddr) || 0n;
+          }
+        }
+      } catch (_) {}
+
+      let netProfit =
+        arbOpp.estimatedProfit > estimatedGasCost ? arbOpp.estimatedProfit - estimatedGasCost : 0n;
+      if (receiptDeltaTokenOut !== null) {
+        try {
+          const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+          const cm = { getProvider: () => this.getProvider() } as any;
+          const oracle = new ChainlinkPriceOracleImpl(cm);
+          const ethUsd = await oracle.getEthUsdPrice();
+          const tokenOutUsd = await oracle.getTokenUsdPrice(arbOpp.tokenOut as Address);
+          const erc20 = new ethers.Contract(
+            arbOpp.tokenOut as string,
+            ['function decimals() view returns (uint8)'],
+            this.getProvider()
+          );
+          const decimals = Number((await (erc20 as any)?.['decimals']?.()) ?? 18);
+
+          // Compute native ETH delta across our addresses at the receipt block
+          let ethDeltaTokenOutUnits = 0n;
+          try {
+            const receipt = await this.getProvider().getTransactionReceipt(
+              (opportunity as any).lastTxHash || ''
+            );
+            if (receipt) {
+              const ourAddrsEth: string[] = [];
+              const execAddrEth = process.env['EXECUTION_WALLET_ADDRESS'];
+              const flashExecEth = process.env['FLASH_EXECUTOR_ADDRESS'];
+              if (execAddrEth) ourAddrsEth.push(execAddrEth.toLowerCase());
+              if (flashExecEth) ourAddrsEth.push(flashExecEth.toLowerCase());
+              let totalPre = 0n;
+              let totalPost = 0n;
+              for (const a of ourAddrsEth) {
+                const pre = await this.getProvider().getBalance(a, receipt.blockNumber - 1);
+                const post = await this.getProvider().getBalance(a, receipt.blockNumber);
+                totalPre += BigInt(pre.toString());
+                totalPost += BigInt(post.toString());
+              }
+              const ethDelta = totalPost - totalPre; // includes gas effects
+              // Convert ETH delta to tokenOut units
+              const ethDeltaUsd = (Number(ethDelta) / 1e18) * ethUsd;
+              const toUnits = BigInt(
+                Math.floor((ethDeltaUsd / Math.max(tokenOutUsd, 1e-9)) * Math.pow(10, decimals))
+              );
+              ethDeltaTokenOutUnits = toUnits;
+            }
+          } catch (_) {}
+
+          // When using receipt deltas, avoid double-counting gas: use token delta + ETH delta
+          netProfit = receiptDeltaTokenOut + ethDeltaTokenOutUnits;
+        } catch (_) {
+          // keep previous netProfit
+        }
+      }
+
+      // Emit PnL metrics if metrics emitter is available
+      try {
+        (this as any).metrics?.emit?.('strategyPnLComputed', {
+          type: 'ARBITRAGE',
+          netProfit: netProfit.toString(),
+          tokenOut: arbOpp.tokenOut,
+          txHash: (opportunity as any).lastTxHash || undefined,
+          ts: Date.now(),
+        });
+      } catch {}
 
       this.logger.debug('Calculated arbitrage profit', {
         opportunityId: opportunity.id,

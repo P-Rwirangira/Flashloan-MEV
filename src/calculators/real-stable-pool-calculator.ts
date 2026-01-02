@@ -579,7 +579,28 @@ export class RealStablePoolRebalancingCalculator {
     }
 
     // Pool size risk (smaller pools = higher risk)
-    const totalLiquidityUsd = (Number(poolState.reserve0 + poolState.reserve1) / 1e18) * 3000; // Assume $3000 ETH
+    let totalLiquidityUsd = 0;
+    try {
+      const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+      const cm = { getProvider: () => this.provider } as any;
+      const oracle = new ChainlinkPriceOracleImpl(cm);
+      // Fetch token USD prices (approximate via known feeds)
+      const price0 = await oracle.getTokenUsdPrice(poolState.token0 as any);
+      const price1 = await oracle.getTokenUsdPrice(poolState.token1 as any);
+      // Fetch decimals for both tokens
+      const erc20Abi = ['function decimals() view returns (uint8)'];
+      const t0 = new ethers.Contract(poolState.token0, erc20Abi, this.provider);
+      const t1 = new ethers.Contract(poolState.token1, erc20Abi, this.provider);
+      const [d0, d1] = await Promise.all([t0['decimals']?.(), t1['decimals']?.()]);
+      const dec0 = Number(d0 ?? 18);
+      const dec1 = Number(d1 ?? 18);
+      const usd0 = (Number(poolState.reserve0) / Math.pow(10, dec0)) * price0;
+      const usd1 = (Number(poolState.reserve1) / Math.pow(10, dec1)) * price1;
+      totalLiquidityUsd = usd0 + usd1;
+    } catch (_) {
+      // If price/decimals unavailable, default to conservative 0 which increases risk
+      totalLiquidityUsd = 0;
+    }
     if (totalLiquidityUsd < 100000) {
       riskScore += 25; // Small pool
     } else if (totalLiquidityUsd < 1000000) {

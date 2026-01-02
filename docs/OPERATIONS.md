@@ -1,5 +1,37 @@
 # Base MEV Platform Operations Guide
 
+## Managing Protocol Addresses
+
+- Edit `config/contracts.yaml` under `protocols` to update Aave V3 pool address and Compound-like comptroller/markets.
+- Run the configuration validation to ensure correctness:
+
+```
+node -e "(async()=>{const {ContractManager}=require('../dist/src/contracts/contract-manager'); const cm=await ContractManager.create(); console.log('valid:', cm.validateConfig());})();"
+```
+
+If invalid, check logs for details (invalid address, missing markets, etc.).
+
+## Liquidation Operations
+
+- For Compound-like liquidations, you can optionally preconfigure `markets` mapping for `moonwell`/`seamless`. If `cDebtToken` or `cCollateralToken` are omitted in the opportunity, your orchestration layer can resolve them using:
+
+```ts
+const cm = await ContractManager.create();
+const cToken = cm.getCTokenFor('moonwell', underlyingAddress);
+```
+
+- For Aave V3, ensure `protocols.aaveV3.poolAddress` is accurate for the network.
+
+## FlashExecutor Runtime
+
+- Ensure the following ENV variables are set:
+  - `FLASH_EXECUTOR_ADDRESS` — deployed contract
+  - `FLASH_POOL_ADDRESS` — Uniswap V3 pool used for flash loan
+  - `FLASH_POOL_TOKEN_IS_TOKEN0` — set to "true" if borrowing token0, "false" to borrow token1
+
+- The contract emits `LiquidationExecuted` and `ArbitrageExecuted` events. Monitor them for profit and gas metrics.
+
+
 ## Table of Contents
 
 1. [Deployment](#deployment)
@@ -54,7 +86,7 @@
 
 3. **Verify Deployment**
    ```bash
-   curl http://localhost:8080/health
+   curl http://localhost:3002/health
    ```
 
 ### Production Deployment Checklist
@@ -132,7 +164,7 @@ gracefulDegradation:
 
 ### Health Checks
 
-**Endpoint:** `http://localhost:8080/health`
+**Endpoint:** `http://localhost:3002/health`
 
 Monitor these key metrics:
 - System status (healthy/degraded/unhealthy)
@@ -168,7 +200,7 @@ Monitor these key metrics:
 Access metrics via `/metrics` endpoint:
 
 ```bash
-curl http://localhost:9090/metrics | jq '.'
+curl http://localhost:3002/metrics | jq '.'
 ```
 
 ### Log Monitoring
@@ -215,7 +247,7 @@ monitoring:
 **Solutions:**
 ```bash
 # Check RPC connection
-curl http://localhost:8080/health | jq '.checks.rpcConnection'
+curl http://localhost:3002/health | jq '.checks.rpcConnection'
 
 # Review configuration
 cat config/default.yaml | grep -A 10 "strategies:"

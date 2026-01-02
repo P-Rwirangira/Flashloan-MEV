@@ -199,9 +199,8 @@ export class ChainlinkPriceOracleImpl extends EventEmitter implements ChainlinkP
     }
 
     if (fallbackPrices.length === 0) {
-      // Ultimate fallback - but log this for monitoring
-      this.emit('fallbackPriceUsed', { token: 'ETH', price: 3000 });
-      return 3000;
+      // No fallback permitted for hardcoded prices
+      throw new Error('ETH/USD price unavailable from multiple sources');
     }
 
     // Return median of available prices

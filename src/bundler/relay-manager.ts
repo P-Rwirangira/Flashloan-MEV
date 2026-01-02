@@ -142,7 +142,9 @@ export class RelayManager extends EventEmitter {
           connectionManager: this.connectionManager,
           wallet: this.wallet,
           authSignerPrivateKey: flashbotsAuthKey,
-          network: currentNetwork,
+          network: ['mainnet', 'goerli', 'sepolia'].includes(currentNetwork as any)
+            ? (currentNetwork as any)
+            : undefined,
         });
 
         await this.flashbotsRelay.initialize();
@@ -603,25 +605,23 @@ export class RelayManager extends EventEmitter {
       try {
         receipt = await Promise.race([
           tx.wait(),
-          new Promise<null>((_, reject) =>
-            setTimeout(() => reject(new Error('Transaction wait timeout')), timeout)
-          ),
+          new Promise<null>(resolve => setTimeout(() => resolve(null), timeout)),
         ]);
       } catch (error) {
-        if ((error as Error).message.includes('timeout')) {
-          // Transaction is still pending, spawn background watcher
-          this.spawnBackgroundWatcher(tx);
+        // Unexpected error while waiting for receipt; rethrow
+        throw error as Error;
+      }
 
-          // Return success: true with pending: true to indicate submission succeeded but is unconfirmed
-          return {
-            success: true,
-            pending: true,
-            relayProvider: relay.provider,
-            transactionHash: tx.hash,
-            latency: Date.now() - startTime,
-          };
-        }
-        throw error;
+      if (receipt === null) {
+        // Transaction likely pending beyond timeout; spawn watcher and return pending
+        this.spawnBackgroundWatcher(tx);
+        return {
+          success: true,
+          pending: true,
+          relayProvider: relay.provider,
+          transactionHash: tx.hash,
+          latency: Date.now() - startTime,
+        };
       }
 
       return {
@@ -634,9 +634,6 @@ export class RelayManager extends EventEmitter {
         latency: Date.now() - startTime,
       };
     } catch (error) {
-      if ((error as Error).message.includes('timeout')) {
-        throw new Error(`Local node submission timed out after ${timeout}ms`);
-      }
       throw new Error(`Local node submission failed: ${(error as Error).message}`);
     }
   }

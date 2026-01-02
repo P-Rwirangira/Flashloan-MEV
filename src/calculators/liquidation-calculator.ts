@@ -101,7 +101,7 @@ export class LiquidationProfitCalculator {
 
       // Step 1: Calculate optimal liquidation amount
       this.logger.markPerformance(operationId, 'liquidation-amount-calc');
-      const liquidationAmount = this.calculateOptimalLiquidationAmount(opportunity);
+      const liquidationAmount = await this.calculateOptimalLiquidationAmount(opportunity);
 
       // Step 2: Calculate collateral received and liquidation bonus
       this.logger.markPerformance(operationId, 'collateral-calc');
@@ -178,7 +178,9 @@ export class LiquidationProfitCalculator {
   /**
    * Calculate optimal liquidation amount
    */
-  private calculateOptimalLiquidationAmount(opportunity: LiquidationOpportunity): bigint {
+  private async calculateOptimalLiquidationAmount(
+    opportunity: LiquidationOpportunity
+  ): Promise<bigint> {
     // Get protocol-specific liquidation rules
     const protocolRules = this.getProtocolLiquidationRules(opportunity.protocol);
 
@@ -207,7 +209,8 @@ export class LiquidationProfitCalculator {
         : maxLiquidationAmount;
 
     // Ensure minimum viable liquidation amount (gas costs consideration)
-    const minViableAmount = ethers.parseUnits('100', 6); // $100 minimum
+    const debtTokenDecimals = await this.getTokenDecimals(opportunity.debtAsset as Address);
+    const minViableAmount = ethers.parseUnits('100', debtTokenDecimals); // $100 minimum in debt token units
     return finalAmount > minViableAmount ? finalAmount : minViableAmount;
   }
 

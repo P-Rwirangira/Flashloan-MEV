@@ -17,6 +17,8 @@ import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownable, ReentrancyGuard, Pausable {
     using SafeERC20 for IERC20;
 
+    enum OperationMode { ARBITRAGE, LIQUIDATION }
+
     struct RouteData {
         address tokenIn;
         address tokenOut;
@@ -29,12 +31,31 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
     }
 
     struct FlashParams {
-        address tokenIn;
-        address tokenOut;
-        uint256 amountIn;
+        // amounts requested in IUniswapV3Pool.flash
+        uint256 amount0;
+        uint256 amount1;
+        // economic params
         uint256 minProfit;
         address recipient;
+        OperationMode mode;
+        bytes liquidationData; // encoded LiquidationPayload when mode=LIQUIDATION
+        // route for post-liquidation swaps if needed
         RouteData route;
+    }
+
+    enum ProtocolType { AAVE_V3, COMPOUND_LIKE }
+
+    struct LiquidationPayload {
+        ProtocolType protocol;
+        address borrower;
+        address debtAsset;        // underlying debt asset (AAVE and Compound)
+        address collateralAsset;  // underlying collateral asset (AAVE), for Compound this is underlying of cTokenCollateral
+        uint256 debtToCover;      // amount of debt to repay (in underlying units)
+        // Protocol specific fields
+        address protocolAddress;  // Aave: Pool address
+        address cDebtToken;       // Compound: cToken of debt market
+        address cCollateralToken; // Compound: cToken of collateral market
+        bool receiveAToken;       // Aave: whether to receive aTokens (we expect false to receive underlying)
     }
 
     mapping(address => bool) public authorizedPools;
@@ -46,6 +67,15 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         address indexed tokenIn,
         address indexed tokenOut,
         uint256 amountIn,
+        uint256 profit,
+        uint256 gasUsed
+    );
+    event LiquidationExecuted(
+        address indexed caller,
+        address indexed debtAsset,
+        address indexed collateralAsset,
+        address borrower,
+        uint256 debtCovered,
         uint256 profit,
         uint256 gasUsed
     );
@@ -65,6 +95,24 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         uint256 actualProfit,
         uint256 minProfit
     );
+
+   // Protocol interfaces
+   interface IAaveV3Pool {
+       function liquidationCall(
+           address collateral,
+           address debt,
+           address user,
+           uint256 debtToCover,
+           bool receiveAToken
+       ) external;
+   }
+
+   interface ICompoundCToken {
+       function liquidateBorrow(address borrower, uint256 repayAmount, address cTokenCollateral) external returns (uint256);
+       function redeem(uint256 redeemTokens) external returns (uint256);
+       function balanceOf(address account) external view returns (uint256);
+       function underlying() external view returns (address);
+   }
     
     event PoolAuthorizationChanged(
         address indexed pool,
@@ -103,13 +151,29 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         require(authorizedPools[flashPool], "Pool not authorized");
         require(amount0 > 0 || amount1 > 0, "Invalid amounts");
         
+        // Decode route to validate basic structure and bind tokens/amounts
+        RouteData memory route = abi.decode(routeData, (RouteData));
+        require(route.pools.length > 0, "Invalid route");
+        
         uint256 gasStart = gasleft();
+        
+        // Build callback payload
+        FlashParams memory params = FlashParams({
+            amount0: amount0,
+            amount1: amount1,
+            minProfit: minProfit,
+            recipient: msg.sender,
+            mode: OperationMode.ARBITRAGE,
+            liquidationData: bytes("") ,
+            route: route
+        });
+        bytes memory data = abi.encode(params);
         
         try IUniswapV3Pool(flashPool).flash(
             address(this),
             amount0,
             amount1,
-            routeData
+            data
         ) {
             // Success handled in callback
         } catch Error(string memory reason) {
@@ -119,62 +183,121 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
     }
 
     /**
+     * @dev Execute liquidation using flash loan. liquidationData encodes LiquidationPayload. routeData may be used
+     *      to swap borrowedToken->debtAsset pre-liquidation and collateral->borrowedToken post-liquidation.
+     */
+    function executeLiquidationFlash(
+        address flashPool,
+        uint256 amount0,
+        uint256 amount1,
+        bytes calldata liquidationData,
+        bytes calldata routeData
+    ) external nonReentrant whenNotPaused onlyAuthorizedCaller {
+        require(authorizedPools[flashPool], "Pool not authorized");
+        require(amount0 > 0 || amount1 > 0, "Invalid amounts");
+        require(liquidationData.length > 0, "Missing liquidation data");
+
+        RouteData memory route = abi.decode(routeData, (RouteData));
+        // route may be empty; we will handle accordingly
+
+        FlashParams memory params = FlashParams({
+            amount0: amount0,
+            amount1: amount1,
+            minProfit: minProfit,
+            recipient: msg.sender,
+            mode: OperationMode.LIQUIDATION,
+            liquidationData: liquidationData,
+            route: route
+        });
+
+        bytes memory data = abi.encode(params);
+        IUniswapV3Pool(flashPool).flash(address(this), amount0, amount1, data);
+    }
+
+    /**
      * @dev Uniswap V3 flash callback
      */
     function uniswapV3FlashCallback(
         uint256 fee0,
         uint256 fee1,
         bytes calldata data
-    ) external override onlyAuthorizedPool {
+    ) external override onlyAuthorizedPool { require(!paused(), "Paused");
         FlashParams memory params = abi.decode(data, (FlashParams));
         
         uint256 gasStart = gasleft();
         
-        // Determine which token was borrowed and compute amountOwed correctly
-        uint256 amount0 = params.amountIn; // This should be set based on which token was borrowed
-        uint256 amount1 = 0; // This should be set based on which token was borrowed
+        // Determine borrowed token and amount owed
+        address pool = params.route.pools[0];
+        address token0 = IUniswapV3Pool(pool).token0();
+        address token1 = IUniswapV3Pool(pool).token1();
         
-        // Check which token was actually borrowed by examining the flash loan amounts
-        // The borrowed token will have a non-zero amount in the flash call
         uint256 amountOwed;
-        if (amount0 > 0) {
-            // Token0 was borrowed
-            amountOwed = params.amountIn + fee0;
+        uint256 borrowedAmount;
+        uint256 fee;
+        address borrowedToken;
+        // Determine borrowed token by non-zero requested amount (fallback to fee indicator for safety)
+        if (params.amount0 > 0 || fee0 > 0) {
+            borrowedToken = token0;
+            borrowedAmount = params.amount0;
+            fee = fee0;
         } else {
-            // Token1 was borrowed  
-            amountOwed = params.amountIn + fee1;
+            borrowedToken = token1;
+            borrowedAmount = params.amount1;
+            fee = fee1;
+        }
+        amountOwed = borrowedAmount + fee;
+        
+        // Record initial balance for borrowed token
+        uint256 initialBalance = IERC20(borrowedToken).balanceOf(address(this));
+        
+        uint256 finalBalance;
+        uint256 profit;
+        
+        if (params.mode == OperationMode.ARBITRAGE) {
+            // Execute arbitrage route
+            _executeRoute(params.route);
+            // Calculate profit from actual balance change and ensure repayable
+            finalBalance = IERC20(borrowedToken).balanceOf(address(this));
+            require(finalBalance >= initialBalance + fee, "Insufficient funds to repay");
+            profit = finalBalance - initialBalance - fee;
+        } else {
+            // Execute liquidation path
+            profit = _executeLiquidationAndComputeProfit(borrowedToken, amountOwed, params);
+            finalBalance = IERC20(borrowedToken).balanceOf(address(this));
         }
         
-        // Record initial balance
-        uint256 initialBalance = IERC20(params.tokenIn).balanceOf(address(this));
-        
-        // Execute arbitrage route
-        uint256 amountOut = _executeRoute(params.route);
-        
-        // Calculate profit
-        uint256 finalBalance = IERC20(params.tokenIn).balanceOf(address(this));
-        require(finalBalance >= initialBalance + amountOwed, "Insufficient funds to repay");
-        
-        uint256 profit = (amountOut > amountOwed) ? amountOut - amountOwed : 0;
         require(profit >= params.minProfit, "Insufficient profit");
         
-        // Repay flash loan with the borrowed token
-        IERC20(params.tokenIn).safeTransfer(msg.sender, amountOwed);
+        // Repay flash loan
+        IERC20(borrowedToken).safeTransfer(msg.sender, amountOwed);
         
-        // Transfer profit to validated recipient
+        // Transfer profit to recipient
         require(params.recipient != address(0), "Invalid recipient");
         if (profit > 0) {
-            IERC20(params.tokenIn).safeTransfer(params.recipient, profit);
+            IERC20(borrowedToken).safeTransfer(params.recipient, profit);
         }
         
-        emit ArbitrageExecuted(
-            params.recipient,
-            params.tokenIn,
-            params.tokenOut,
-            params.amountIn,
-            profit,
-            gasStart - gasleft()
-        );
+        if (params.mode == OperationMode.ARBITRAGE) {
+            emit ArbitrageExecuted(
+                params.recipient,
+                params.route.tokenIn,
+                params.route.tokenOut,
+                params.route.amountIn,
+                profit,
+                gasStart - gasleft()
+            );
+        } else {
+            LiquidationPayload memory lq2 = abi.decode(params.liquidationData, (LiquidationPayload));
+            emit LiquidationExecuted(
+                params.recipient,
+                lq2.debtAsset,
+                lq2.collateralAsset,
+                lq2.borrower,
+                lq2.debtToCover,
+                profit,
+                gasStart - gasleft()
+            );
+        }
     }
 
     /**
@@ -185,6 +308,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         int256 amount1Delta,
         bytes calldata data
     ) external override onlyAuthorizedPool {
+        require(!paused(), "Paused");
         require(amount0Delta > 0 || amount1Delta > 0, "Invalid swap");
         
         // Compute the actual owed amount from deltas (positive delta is what we owe)
@@ -215,8 +339,10 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
      * @dev Execute arbitrage route through multiple pools
      */
     function _executeRoute(RouteData memory route) internal returns (uint256 amountOut) {
-        require(route.deadline >= block.timestamp, "Transaction expired");
-        require(route.pools.length > 0, "Empty route");
+        require(route.deadline == 0 || route.deadline >= block.timestamp, "Transaction expired");
+        if (route.pools.length == 0) {
+            return route.amountIn; // no-op route
+        }
         
         uint256 currentAmount = route.amountIn;
         address currentToken = route.tokenIn;
@@ -237,7 +363,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
             currentToken = _getOtherToken(pool, currentToken);
         }
         
-        require(currentAmount >= route.minAmountOut, "Insufficient output amount");
+        require(route.minAmountOut == 0 || currentAmount >= route.minAmountOut, "Insufficient output amount");
         return currentAmount;
     }
 
@@ -268,6 +394,72 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
     /**
      * @dev Get the other token in a pool
      */
+    function _getOtherToken(address pool, address token) internal view returns (address) {}
+
+    // Execute liquidation and compute profit in borrowed token units
+    function _executeLiquidationAndComputeProfit(
+        address borrowedToken,
+        uint256 amountOwed,
+        FlashParams memory params
+    ) internal returns (uint256) {
+        LiquidationPayload memory lq = abi.decode(params.liquidationData, (LiquidationPayload));
+        require(lq.debtAsset != address(0) && lq.borrower != address(0), "Invalid liquidation payload");
+
+        // If borrowed token != debt asset, swap via route (pre-liquidation)
+        if (borrowedToken != lq.debtAsset && params.route.pools.length > 0) {
+            // adjust route to swap borrowedToken->debtAsset
+            RouteData memory preRoute = params.route;
+            preRoute.tokenIn = borrowedToken;
+            preRoute.tokenOut = lq.debtAsset;
+            preRoute.amountIn = IERC20(borrowedToken).balanceOf(address(this));
+            _executeRoute(preRoute);
+        }
+
+        uint256 balBefore = IERC20(borrowedToken).balanceOf(address(this));
+        uint256 debtBefore = IERC20(lq.debtAsset).balanceOf(address(this));
+        uint256 collBefore = IERC20(lq.collateralAsset).balanceOf(address(this));
+
+        if (lq.protocol == ProtocolType.AAVE_V3) {
+            // Approve debt to pool
+            IERC20(lq.debtAsset).safeApprove(lq.protocolAddress, lq.debtToCover);
+            IAaveV3Pool(lq.protocolAddress).liquidationCall(
+                lq.collateralAsset,
+                lq.debtAsset,
+                lq.borrower,
+                lq.debtToCover,
+                lq.receiveAToken
+            );
+        } else if (lq.protocol == ProtocolType.COMPOUND_LIKE) {
+            // Approve debt asset to cToken of debt if needed (for some implementations repay via debt underlying)
+            IERC20(lq.debtAsset).safeApprove(lq.cDebtToken, lq.debtToCover);
+            uint256 res = ICompoundCToken(lq.cDebtToken).liquidateBorrow(lq.borrower, lq.debtToCover, lq.cCollateralToken);
+            require(res == 0, "Compound liquidation failed");
+            // Redeem seized cTokens to underlying collateral
+            uint256 cBal = ICompoundCToken(lq.cCollateralToken).balanceOf(address(this));
+            if (cBal > 0) {
+                ICompoundCToken(lq.cCollateralToken).redeem(cBal);
+            }
+        } else {
+            revert("Unsupported protocol");
+        }
+
+        uint256 debtAfter = IERC20(lq.debtAsset).balanceOf(address(this));
+        uint256 collAfter = IERC20(lq.collateralAsset).balanceOf(address(this));
+
+        // Post-liquidation: swap collateral to borrowed token to repay and realize profit
+        if (collAfter > collBefore && params.route.pools.length > 0) {
+            RouteData memory postRoute = params.route;
+            postRoute.tokenIn = lq.collateralAsset;
+            postRoute.tokenOut = borrowedToken;
+            postRoute.amountIn = collAfter - collBefore;
+            _executeRoute(postRoute);
+        }
+
+        uint256 balAfter = IERC20(borrowedToken).balanceOf(address(this));
+        require(balAfter >= amountOwed, "Insufficient post-liquidation balance");
+        return balAfter - amountOwed;
+    }
+
     function _getOtherToken(address pool, address token) internal view returns (address) {
         address token0 = IUniswapV3Pool(pool).token0();
         address token1 = IUniswapV3Pool(pool).token1();

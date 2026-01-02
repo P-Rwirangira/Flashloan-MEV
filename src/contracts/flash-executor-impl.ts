@@ -644,7 +644,7 @@ export class FlashExecutorFactory {
       // Deploy the contract using ethers ContractFactory
       const contractFactory = new ethers.ContractFactory(
         FLASH_EXECUTOR_ABI,
-        this.getBytecode(),
+        await this.getBytecode(),
         this.signer
       );
 
@@ -679,7 +679,7 @@ export class FlashExecutorFactory {
   /**
    * Get contract bytecode (loaded from compiled artifacts)
    */
-  getBytecode(): string {
+  async getBytecode(): Promise<string> {
     // Use provided bytecode first
     if (this.bytecode) {
       return this.bytecode;
@@ -689,8 +689,8 @@ export class FlashExecutorFactory {
       // Try environment variable path first
       const artifactPath = process.env['FLASH_EXECUTOR_ARTIFACT_PATH'];
       if (artifactPath) {
-        const fs = require('fs');
-        const path = require('path');
+        const fs = await import('fs');
+        const path = await import('path');
         const fullPath = path.resolve(artifactPath);
         const artifactContent = fs.readFileSync(fullPath, 'utf8');
         const artifact = JSON.parse(artifactContent);
@@ -698,8 +698,8 @@ export class FlashExecutorFactory {
       }
 
       // Fallback to default path
-      const path = require('path');
-      const fs = require('fs');
+      const path = await import('path');
+      const fs = await import('fs');
       const defaultPath = path.join(
         process.cwd(),
         'artifacts/contracts/FlashExecutor.sol/FlashExecutor.json'
@@ -709,7 +709,7 @@ export class FlashExecutorFactory {
       return artifact.bytecode;
     } catch (error) {
       throw new Error(
-        'Contract bytecode not available - run "npm run build:contracts" first or provide bytecode via constructor'
+        `Contract bytecode not available - run \"npm run build:contracts\" first or provide bytecode via constructor. Root cause: ${error instanceof Error ? error.message : String(error)}`
       );
     }
   }

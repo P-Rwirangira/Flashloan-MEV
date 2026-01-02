@@ -27,6 +27,9 @@ import {
 /**
  * Flash Loan Manager Implementation
  */
+import { TransactionLifecycleManager } from './transaction-lifecycle-manager';
+import { TransactionRequest } from '../types/execution';
+
 export class FlashLoanManager extends EventEmitter implements IFlashLoanManager {
   private readonly logger = createComponentLogger('flash-loan-manager');
   private readonly config: FlashLoanManagerConfig;
@@ -39,6 +42,9 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
     string,
     { sources: FlashLoanSource[]; timestamp: number }
   >();
+
+  // Optional transaction lifecycle manager for auto-submission
+  private transactionManager?: TransactionLifecycleManager;
 
   private capacityRefreshInterval?: NodeJS.Timeout | undefined;
   private isRunning = false;
@@ -104,13 +110,69 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
   /**
    * Start flash loan manager
    */
-  async start(): Promise<void> {
+  async start(
+    transactionManager?: TransactionLifecycleManager,
+    metrics?: EventEmitter
+  ): Promise<void> {
     if (this.isRunning) {
       this.logger.warn('Flash loan manager is already running');
       return;
     }
 
     this.isRunning = true;
+
+    // Configure optional transaction manager for auto-submission
+    if (transactionManager) {
+      this.transactionManager = transactionManager;
+    }
+
+    if (metrics) {
+      (this as any).metrics = metrics;
+      // Auto-submit prepared flash calldata via transaction manager
+      this.on(
+        'flashCalldataPrepared',
+        async (evt: {
+          provider: FlashLoanProvider;
+          poolAddress: Address;
+          token: Address;
+          amount0: bigint;
+          amount1: bigint;
+          calldata: string;
+          recipient: Address;
+        }) => {
+          try {
+            if (!this.transactionManager) return;
+            const tx: TransactionRequest = {
+              to: evt.poolAddress,
+              data: evt.calldata,
+              value: 0n,
+              gasLimit: 500000n,
+              maxFeePerGas: 20_000_000_000n,
+              maxPriorityFeePerGas: 2_000_000_000n,
+            };
+
+            const result = await this.transactionManager.processTransaction(
+              `flashloan-${Date.now()}`,
+              async () => tx
+            );
+
+            if (!result.success) {
+              this.logger.warn('Auto-submitted flash loan transaction failed', {
+                reason: result.failureReason,
+              });
+            } else {
+              this.logger.info('Auto-submitted flash loan transaction succeeded', {
+                txHash: result.receipt?.transactionHash,
+              });
+            }
+          } catch (error) {
+            this.logger.error('Failed to auto-submit flash loan transaction', {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      );
+    }
 
     // Start capacity refresh interval
     this.capacityRefreshInterval = setInterval(() => {
@@ -159,12 +221,23 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
         const capacity = await this.getProviderCapacity(providerType as FlashLoanProvider, token);
 
         if (capacity.availableCapacity >= amount) {
+          // Prefer the first capacity source's address if available (provider-specific target)
+          const targetAddress =
+            capacity.sources[0]?.poolAddress ||
+            ((providerType === FlashLoanProvider.BALANCER
+              ? (this.config.providers[FlashLoanProvider.BALANCER] as any)?.vaultAddress
+              : providerType === FlashLoanProvider.AAVE
+                ? (this.config.providers[FlashLoanProvider.AAVE] as any)?.poolAddress
+                : (this.config.providers[FlashLoanProvider.UNISWAP_V3] as any)
+                    ?.factoryAddress) as Address);
+
           sources.push({
             provider: providerType as FlashLoanProvider,
-            poolAddress: '0x0000000000000000000000000000000000000000' as Address, // Mock address
+            poolAddress: (targetAddress ||
+              ('0x0000000000000000000000000000000000000000' as Address)) as Address,
             token,
             fee: (amount * BigInt(Math.floor(config.feeRate * 1e18))) / BigInt(1e18),
-            gasOverhead: BigInt(50000), // Mock gas overhead
+            gasOverhead: BigInt(200000), // Approximate overhead for flash operations
             maxAmount: capacity.availableCapacity,
             available: true,
             lastUpdated: Date.now(),
@@ -245,12 +318,26 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
         );
       }
 
-      // Convert requested amount to USD value for comparison
-      // TODO: In production, fetch token decimals and price from oracle
-      const tokenDecimals = 18; // Assume 18 decimals for now
-      const tokenPriceUsd = 1; // Assume $1 per token for now - should fetch from price oracle
+      // Convert requested amount to USD value for comparison using on-chain data and Chainlink
+      let tokenDecimals = 18;
+      try {
+        const erc20 = new ethers.Contract(
+          request.token,
+          ['function decimals() view returns (uint8)'],
+          (ethers as any).getDefaultProvider?.() || ({} as any)
+        );
+        const dec = await (erc20 as any)?.['decimals']?.();
+        if (dec !== undefined) tokenDecimals = Number(dec);
+      } catch (_) {}
 
-      // Convert amount to normalized decimal value
+      let tokenPriceUsd = 1;
+      try {
+        const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+        const cm = { getProvider: () => (ethers as any).getDefaultProvider?.() } as any;
+        const oracle = new ChainlinkPriceOracleImpl(cm);
+        tokenPriceUsd = await oracle.getTokenUsdPrice(request.token as Address);
+      } catch (_) {}
+
       const tokenAmount = Number(request.amount) / Math.pow(10, tokenDecimals);
       const usdValue = tokenAmount * tokenPriceUsd;
 
@@ -376,42 +463,267 @@ export class FlashLoanManager extends EventEmitter implements IFlashLoanManager 
       return cached.capacity;
     }
 
-    // For now, return mock capacity data
-    // In production, this would query actual provider contracts
-    const mockCapacity: FlashLoanCapacity = {
+    const erc20Abi = ['function balanceOf(address) view returns (uint256)'];
+    const sources: FlashLoanSource[] = [];
+    let totalCapacity = 0n;
+    let availableCapacity = 0n;
+
+    try {
+      // Choose an address to probe per provider
+      let probeAddress: Address | null = null;
+      const cfg = this.config.providers[provider];
+      if (provider === FlashLoanProvider.BALANCER && (cfg as any)?.vaultAddress) {
+        probeAddress = (cfg as any).vaultAddress as Address;
+      } else if (provider === FlashLoanProvider.AAVE && (cfg as any)?.poolAddress) {
+        probeAddress = (cfg as any).poolAddress as Address;
+      } else if (provider === FlashLoanProvider.UNISWAP_V3) {
+        // For Uniswap V3, no central vault; fall back to quoter or factory
+        probeAddress = ((cfg as any)?.quoterAddress || (cfg as any)?.factoryAddress) as Address;
+      }
+
+      if (probeAddress) {
+        const providerObj = (ethers as any).getDefaultProvider?.() || (undefined as any);
+        const tokenContract = new ethers.Contract(token, erc20Abi, providerObj || ({} as any));
+        const balanceOf = (tokenContract as any)['balanceOf'] as
+          | ((addr: string) => Promise<any>)
+          | undefined;
+        if (balanceOf) {
+          const bal = await balanceOf(probeAddress);
+          availableCapacity = BigInt(bal?.toString?.() ?? '0');
+          totalCapacity = availableCapacity * 2n > 0n ? availableCapacity * 2n : availableCapacity; // heuristic
+          sources.push({
+            provider,
+            poolAddress: probeAddress,
+            token,
+            fee: BigInt(Math.floor((this.config.providers[provider].feeRate || 0) * 1e9)),
+            gasOverhead: 200000n,
+            maxAmount: availableCapacity,
+            available: availableCapacity > 0n,
+            lastUpdated: Date.now(),
+          });
+        }
+      }
+    } catch (error) {
+      this.logger.warn('Provider capacity query failed, using fallback', {
+        provider,
+        token,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    if (totalCapacity === 0n && availableCapacity === 0n) {
+      // Fallback to conservative defaults if query failed
+      totalCapacity = BigInt(100000) * BigInt(1e18);
+      availableCapacity = (totalCapacity * 7n) / 10n;
+    }
+
+    const result: FlashLoanCapacity = {
       token,
-      totalCapacity: BigInt(1000000) * BigInt(1e18), // 1M tokens
-      availableCapacity: BigInt(800000) * BigInt(1e18), // 800K available
-      utilizationRate: 0.2, // 20% utilized
-      sources: [],
+      totalCapacity,
+      availableCapacity,
+      utilizationRate:
+        totalCapacity > 0n ? Number(totalCapacity - availableCapacity) / Number(totalCapacity) : 0,
+      sources,
     };
 
     this.capacityCache.set(cacheKey, {
-      capacity: mockCapacity,
+      capacity: result,
       timestamp: Date.now(),
     });
 
-    return mockCapacity;
+    return result;
   }
 
   /**
    * Execute single flash loan
    */
   private async executeSingleFlashLoan(
-    _request: FlashLoanRequest,
+    request: FlashLoanRequest,
     source: FlashLoanSource
   ): Promise<FlashLoanResult> {
     const startTime = Date.now();
 
     try {
-      // For now, return success result
-      // In production, this would interact with actual flash loan contracts
+      // Attempt provider-specific flash action when possible
+      if (
+        source.provider === FlashLoanProvider.UNISWAP_V3 &&
+        source.poolAddress !== ('0x0000000000000000000000000000000000000000' as Address)
+      ) {
+        // Build a flash call to the pool contract
+        const pool = new ethers.Contract(
+          source.poolAddress,
+          [
+            'function token0() view returns (address)',
+            'function token1() view returns (address)',
+            'function flash(address recipient,uint256 amount0,uint256 amount1,bytes data)',
+          ],
+          (ethers as any).getDefaultProvider?.() || ({} as any)
+        );
+        const token0 = (pool as any)?.['token0']
+          ? await (pool as any)['token0']()
+          : ethers.ZeroAddress;
+        const token1 = (pool as any)?.['token1']
+          ? await (pool as any)['token1']()
+          : ethers.ZeroAddress;
+        const amount0 =
+          request.token.toLowerCase() === (token0 as string).toLowerCase() ? request.amount : 0n;
+        const amount1 =
+          request.token.toLowerCase() === (token1 as string).toLowerCase() ? request.amount : 0n;
+
+        // Encode calldata and include downstream callback parameters if needed
+        // Prepare flash loan call data (to be used by a transaction builder elsewhere)
+        // Prepare flash call encoding for downstream submitter and emit an event
+        const iface = new ethers.Interface(['function flash(address,uint256,uint256,bytes)']);
+        const preparedCalldata = iface.encodeFunctionData('flash', [
+          request.recipient,
+          amount0,
+          amount1,
+          '0x',
+        ]);
+        this.emit('flashCalldataPrepared', {
+          provider: source.provider,
+          poolAddress: source.poolAddress,
+          token: request.token,
+          amount0,
+          amount1,
+          calldata: preparedCalldata,
+          recipient: request.recipient,
+        });
+
+        // We don't have a signer here; return a result indicating submission is required elsewhere
+        return {
+          success: false,
+          feesPaid: source.fee,
+          failureReason:
+            'Flash loan transaction prepared; submission requires signer/lifecycle manager',
+          executionTime: Date.now() - startTime,
+        };
+      }
+
+      // Balancer: prepare Vault flashLoan
+      if (source.provider === FlashLoanProvider.BALANCER) {
+        const cfg = this.config.providers[FlashLoanProvider.BALANCER] as any;
+        const vault = cfg?.vaultAddress as Address | undefined;
+        if (vault) {
+          const iface = new ethers.Interface([
+            'function flashLoan(address recipient, address[] tokens, uint256[] amounts, bytes userData)',
+          ]);
+          const tokens = [request.token];
+          const amounts = [request.amount];
+          const userData = ethers.AbiCoder.defaultAbiCoder().encode(
+            ['address', 'address', 'uint256', 'address', 'bytes'],
+            [request.recipient, request.token, request.amount, vault, '0x']
+          );
+          const preparedCalldata = iface.encodeFunctionData('flashLoan', [
+            request.recipient,
+            tokens,
+            amounts,
+            userData,
+          ]);
+
+          // Estimate Balancer flash fee from ProtocolFeesCollector
+          let feePaid: bigint = 0n;
+          try {
+            const provider = (this as any).provider || ethers.getDefaultProvider();
+            const vaultCtr = new ethers.Contract(
+              vault,
+              ['function getProtocolFeesCollector() view returns (address)'],
+              provider
+            );
+            const pfcAddr = await (vaultCtr as any)['getProtocolFeesCollector']?.();
+            if (pfcAddr) {
+              const pfc = new ethers.Contract(
+                pfcAddr,
+                ['function getFlashLoanFeePercentage() view returns (uint256)'],
+                provider
+              );
+              const perc = await (pfc as any)['getFlashLoanFeePercentage']?.();
+              if (perc !== undefined) {
+                // perc is 18-decimal fixed-point
+                const rate = BigInt(perc.toString());
+                feePaid = (request.amount * rate) / 10n ** 18n;
+              }
+            }
+          } catch (_) {}
+
+          this.emit('flashCalldataPrepared', {
+            provider: source.provider,
+            poolAddress: vault,
+            token: request.token,
+            amount0: request.amount,
+            amount1: 0n,
+            calldata: preparedCalldata,
+            recipient: request.recipient,
+          });
+          return {
+            success: false,
+            feesPaid: feePaid || source.fee,
+            failureReason:
+              'Balancer flash loan prepared; submission requires signer/lifecycle manager',
+            executionTime: Date.now() - startTime,
+          };
+        }
+      }
+
+      // Aave V3: prepare Pool flashLoanSimple
+      if (source.provider === FlashLoanProvider.AAVE) {
+        const cfg = this.config.providers[FlashLoanProvider.AAVE] as any;
+        const poolAddr = cfg?.poolAddress as Address | undefined;
+        if (poolAddr) {
+          const iface = new ethers.Interface([
+            'function flashLoanSimple(address receiver,address asset,uint256 amount,bytes params,uint16 referralCode)',
+            'function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)',
+          ]);
+          const params = ethers.AbiCoder.defaultAbiCoder().encode(
+            ['address', 'address', 'uint256', 'bytes'],
+            [request.recipient, request.token, request.amount, '0x']
+          );
+          const preparedCalldata = iface.encodeFunctionData('flashLoanSimple', [
+            request.recipient,
+            request.token,
+            request.amount,
+            params,
+            0,
+          ]);
+
+          // Estimate Aave flash loan fee via pool constant (bps)
+          let feePaid: bigint = 0n;
+          try {
+            const provider = (this as any).provider || ethers.getDefaultProvider();
+            const pool = new ethers.Contract(
+              poolAddr,
+              ['function FLASHLOAN_PREMIUM_TOTAL() view returns (uint128)'],
+              provider
+            );
+            const bps = await (pool as any)['FLASHLOAN_PREMIUM_TOTAL']?.();
+            if (bps !== undefined) {
+              feePaid = (request.amount * BigInt(bps.toString())) / 10_000n;
+            }
+          } catch (_) {}
+
+          this.emit('flashCalldataPrepared', {
+            provider: source.provider,
+            poolAddress: poolAddr,
+            token: request.token,
+            amount0: request.amount,
+            amount1: 0n,
+            calldata: preparedCalldata,
+            recipient: request.recipient,
+          });
+          return {
+            success: false,
+            feesPaid: feePaid || source.fee,
+            failureReason: 'Aave flash loan prepared; submission requires signer/lifecycle manager',
+            executionTime: Date.now() - startTime,
+          };
+        }
+      }
+
+      // Fallback: indicate no executable path available
       return {
-        success: true,
-        transactionHash: ethers.hexlify(ethers.randomBytes(32)),
-        gasUsed: BigInt(200000),
-        feesPaid: source.fee,
-        profit: BigInt(0),
+        success: false,
+        feesPaid: 0n,
+        failureReason: 'No executable flash loan path available in manager without signer',
         executionTime: Date.now() - startTime,
       };
     } catch (error) {

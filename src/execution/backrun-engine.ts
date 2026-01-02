@@ -259,8 +259,21 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
         protectionLevel = 'advanced';
       }
 
-      // Check for private mempool submission patterns
-      if (tx.maxPriorityFeePerGas && tx.maxPriorityFeePerGas === 0n) {
+      // Check for private mempool submission patterns with explicit signal
+      const zeroTip =
+        tx.maxPriorityFeePerGas != null &&
+        ((): boolean => {
+          try {
+            return BigInt(tx.maxPriorityFeePerGas as any) === 0n;
+          } catch {
+            return false;
+          }
+        })();
+      const explicitPrivate =
+        (tx as any).isPrivate === true ||
+        (tx as any).mempoolSource === 'private' ||
+        !!(tx as any).bundleSignature;
+      if (zeroTip && explicitPrivate) {
         hasProtection = true;
         protectionService = protectionService || 'Private Mempool';
         protectionLevel = 'basic';
@@ -412,20 +425,24 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
       // Check if still profitable - convert USD threshold to ETH properly
       const currentProfit = await this.calculateCurrentProfit(opportunity);
 
-      // Convert USD threshold to ETH amount first, then to wei
-      // Note: In production, fetch ETH/USD price from oracle
-      const ethPriceUsd = 2500; // Placeholder - should be fetched from price oracle
-      const minProfitEth = this.config.minProfitThresholdUsd / ethPriceUsd;
-      const minProfitThreshold = ethers.parseEther(minProfitEth.toString());
-
-      if (currentProfit < minProfitThreshold) {
-        this.logger.debug('Backrun no longer profitable', {
-          opportunityId: opportunity.id,
-          currentProfit: currentProfit.toString(),
-          minThreshold: minProfitThreshold.toString(),
-          minProfitUsd: this.config.minProfitThresholdUsd,
-          ethPriceUsd,
-        });
+      // Convert USD threshold to ETH amount first, then to wei using Chainlink
+      try {
+        const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+        const cm = { getProvider: () => this.transactionManager.getProvider() } as any;
+        const oracle = new ChainlinkPriceOracleImpl(cm);
+        const ethPriceUsd = await oracle.getEthUsdPrice();
+        const minProfitEth = this.config.minProfitThresholdUsd / Math.max(ethPriceUsd, 1e-9);
+        const minProfitThreshold = ethers.parseEther(minProfitEth.toString());
+        if (currentProfit < minProfitThreshold) {
+          this.logger.warn('Backrun not profitable enough', {
+            opportunityId: opportunity.id,
+            currentProfit: currentProfit.toString(),
+            minProfitThreshold: minProfitThreshold.toString(),
+          });
+          return false;
+        }
+      } catch (e) {
+        // No fallback: require oracle availability for accurate thresholding
         return false;
       }
 
@@ -899,25 +916,214 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
     route: BackrunRoute,
     transactionHash: string
   ): Promise<bigint> {
-    // In production, this would:
-    // 1. Wait for transaction confirmation
-    // 2. Get transaction receipt and logs
-    // 3. Calculate token balance changes
-    // 4. Account for gas costs
-    // 5. Return net profit
+    try {
+      // Try to get actual gas usage from receipt
+      const receipt = await this.transactionManager
+        .getProvider()
+        .getTransactionReceipt(transactionHash);
+      let gasCost: bigint;
+      if (receipt && receipt.gasUsed) {
+        const effectiveGasPrice =
+          (receipt as any).effectiveGasPrice ||
+          receipt.gasPrice ||
+          (await this.transactionManager.getProvider().getFeeData()).maxFeePerGas ||
+          20_000_000_000n;
+        gasCost = BigInt(receipt.gasUsed.toString()) * BigInt(effectiveGasPrice.toString());
+      } else {
+        // Fallback to current network fee data with route estimate
+        const feeData = await this.transactionManager.getProvider().getFeeData();
+        const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || 20_000_000_000n;
+        gasCost = route.gasEstimate * gasPrice;
+      }
 
-    // For now, return estimated profit minus gas costs
-    const gasCost = route.gasEstimate * BigInt(100e9); // 100 gwei gas price
-    const estimatedProfit = route.estimatedProfit;
+      // Try to compute tokenOut delta from Swap events (Uniswap V3 / Aerodrome); fallback to Transfer logs
+      let netProfit = route.estimatedProfit > gasCost ? route.estimatedProfit - gasCost : 0n;
+      let tokenOutForMetrics: string | undefined;
+      try {
+        const tokenOut = (opportunity as any).tokenOut as Address | undefined;
+        tokenOutForMetrics = tokenOut;
+        if (tokenOut) {
+          const provider = this.transactionManager.getProvider();
+          const receipt = await provider.getTransactionReceipt(transactionHash);
+          if (receipt && receipt.logs) {
+            const ourAddrs: string[] = [];
+            const execAddr = process.env['EXECUTION_WALLET_ADDRESS'];
+            const flashExec = process.env['FLASH_EXECUTOR_ADDRESS'];
+            if (execAddr) ourAddrs.push(execAddr.toLowerCase());
+            if (flashExec) ourAddrs.push(flashExec.toLowerCase());
+            // Uniswap V3
+            const uniIface = new ethers.Interface([
+              'event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)',
+              'function token0() view returns (address)',
+              'function token1() view returns (address)',
+            ]);
+            // Aerodrome
+            const aeroIface = new ethers.Interface([
+              'event Swap(address indexed sender,address indexed to,uint256 amount0In,uint256 amount1In,uint256 amount0Out,uint256 amount1Out)',
+              'function token0() view returns (address)',
+              'function token1() view returns (address)',
+            ]);
+            const tokenOutAddr = (tokenOut as string).toLowerCase();
+            const tokenDeltas = new Map<string, bigint>();
+            const addDelta = (token: string, amt: bigint) => {
+              const key = token.toLowerCase();
+              const prev = tokenDeltas.get(key) || 0n;
+              tokenDeltas.set(key, prev + amt);
+            };
 
-    this.logger.debug('Calculating backrun profit', {
-      opportunity: opportunity.id,
-      transactionHash,
-      estimatedProfit: estimatedProfit.toString(),
-      gasCost: gasCost.toString(),
-    });
+            for (const log of receipt.logs) {
+              try {
+                const parsed = uniIface.parseLog({
+                  topics: log.topics as string[],
+                  data: log.data,
+                });
+                if (parsed && parsed.name === 'Swap') {
+                  const recipient = (parsed.args['recipient'] as string).toLowerCase();
+                  if (!ourAddrs.includes(recipient)) {
+                    continue;
+                  }
+                  const pool = new ethers.Contract(
+                    log.address,
+                    [
+                      'function token0() view returns (address)',
+                      'function token1() view returns (address)',
+                    ],
+                    provider
+                  );
+                  const token0Fn = pool['token0'];
+                  const token1Fn = pool['token1'];
+                  if (!token0Fn || !token1Fn) continue;
+                  const [t0, t1] = await Promise.all([token0Fn(), token1Fn()]);
+                  const t0l = (t0 as string).toLowerCase();
+                  const t1l = (t1 as string).toLowerCase();
+                  const amount0: bigint = BigInt(parsed.args['amount0'].toString());
+                  const amount1: bigint = BigInt(parsed.args['amount1'].toString());
+                  if (amount0 < 0n) addDelta(t0l, -amount0);
+                  if (amount1 < 0n) addDelta(t1l, -amount1);
+                  continue;
+                }
+              } catch {}
+              try {
+                const parsed2 = aeroIface.parseLog({
+                  topics: log.topics as string[],
+                  data: log.data,
+                });
+                if (parsed2 && parsed2.name === 'Swap') {
+                  const to = (parsed2.args['to'] as string).toLowerCase();
+                  if (!ourAddrs.includes(to)) {
+                    continue;
+                  }
+                  const pool = new ethers.Contract(
+                    log.address,
+                    [
+                      'function token0() view returns (address)',
+                      'function token1() view returns (address)',
+                    ],
+                    provider
+                  );
+                  const token0Fn = pool['token0'];
+                  const token1Fn = pool['token1'];
+                  if (!token0Fn || !token1Fn) continue;
+                  const [t0, t1] = await Promise.all([token0Fn(), token1Fn()]);
+                  const t0l = (t0 as string).toLowerCase();
+                  const t1l = (t1 as string).toLowerCase();
+                  const amount0Out: bigint = BigInt(parsed2.args['amount0Out'].toString());
+                  const amount1Out: bigint = BigInt(parsed2.args['amount1Out'].toString());
+                  if (amount0Out > 0n) addDelta(t0l, amount0Out);
+                  if (amount1Out > 0n) addDelta(t1l, amount1Out);
+                  continue;
+                }
+              } catch {}
+            }
 
-    return estimatedProfit > gasCost ? estimatedProfit - gasCost : 0n;
+            // If no swap-based delta, fallback to Transfer logs
+            if ((tokenDeltas.get(tokenOutAddr) || 0n) === 0n) {
+              const erc20TransferSig =
+                '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+              for (const log of receipt.logs) {
+                if (
+                  log.address?.toLowerCase() === tokenOutAddr &&
+                  log.topics?.[0] === erc20TransferSig
+                ) {
+                  if (!log.topics || log.topics.length < 3) {
+                    continue;
+                  }
+                  const from = '0x' + (log.topics[1] as string).slice(26).toLowerCase();
+                  const to = '0x' + (log.topics[2] as string).slice(26).toLowerCase();
+                  const value = BigInt(log.data);
+                  if (ourAddrs.includes(to) && !ourAddrs.includes(from))
+                    addDelta(tokenOutAddr, value);
+                  if (ourAddrs.includes(from) && !ourAddrs.includes(to))
+                    addDelta(tokenOutAddr, -value as unknown as bigint);
+                }
+              }
+            }
+
+            // Convert ETH delta + token delta to net tokenOut units
+            const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+            const cm = { getProvider: () => provider } as any;
+            const oracle = new ChainlinkPriceOracleImpl(cm);
+            const ethUsd = await oracle.getEthUsdPrice();
+            const tokenOutUsd = await oracle.getTokenUsdPrice(tokenOut);
+            const erc20 = new ethers.Contract(
+              tokenOut as string,
+              ['function decimals() view returns (uint8)'],
+              provider
+            );
+            const decimals = Number((await (erc20 as any)?.['decimals']?.()) ?? 18);
+
+            let totalPre = 0n;
+            let totalPost = 0n;
+            const ourAddrsEth: string[] = [];
+            const execAddrEth = process.env['EXECUTION_WALLET_ADDRESS'];
+            const flashExecEth = process.env['FLASH_EXECUTOR_ADDRESS'];
+            if (execAddrEth) ourAddrsEth.push(execAddrEth.toLowerCase());
+            if (flashExecEth) ourAddrsEth.push(flashExecEth.toLowerCase());
+            for (const a of ourAddrsEth) {
+              const pre = await provider.getBalance(a, receipt.blockNumber - 1);
+              const post = await provider.getBalance(a, receipt.blockNumber);
+              totalPre += BigInt(pre.toString());
+              totalPost += BigInt(post.toString());
+            }
+            const ethDelta = totalPost - totalPre; // includes gas effects
+            const ethDeltaUsd = (Number(ethDelta) / 1e18) * ethUsd;
+            const ethDeltaTokenOutUnits = BigInt(
+              Math.floor((ethDeltaUsd / Math.max(tokenOutUsd, 1e-9)) * Math.pow(10, decimals))
+            );
+
+            // Combine token delta + ETH delta
+            netProfit = (tokenDeltas.get(tokenOutAddr) || 0n) + ethDeltaTokenOutUnits;
+          }
+        }
+      } catch (_) {}
+
+      // Emit PnL metrics if metrics emitter is available
+      try {
+        (this as any).metrics?.emit?.('strategyPnLComputed', {
+          type: 'BACKRUN',
+          netProfit: netProfit.toString(),
+          tokenOut: tokenOutForMetrics || 'unknown',
+          txHash: transactionHash,
+          ts: Date.now(),
+        });
+      } catch {}
+
+      this.logger.debug('Calculating backrun profit', {
+        opportunity: opportunity.id,
+        transactionHash,
+        estimatedProfit: route.estimatedProfit.toString(),
+        gasCost: gasCost.toString(),
+        netProfit: netProfit.toString(),
+      });
+
+      return netProfit;
+    } catch (error) {
+      // Conservative fallback
+      const feeData = await this.transactionManager.getProvider().getFeeData();
+      const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || 20_000_000_000n;
+      const gasCost = route.gasEstimate * gasPrice;
+      return route.estimatedProfit > gasCost ? route.estimatedProfit - gasCost : 0n;
+    }
   }
 
   /**
@@ -979,17 +1185,37 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
 
   private detectRefundTransfers(transactions: any[]): boolean {
     // Look for transfers that reimburse frontrunners or relayers
-    const knownRelayerAddresses = [
-      '0x0000000000000000000000000000000000000000', // Placeholder
-    ];
+    // Addresses configurable via env RELAYER_REFUND_ADDRESSES (comma-separated)
+    let knownRelayerAddresses: string[] = [];
+    try {
+      const fromEnv = process.env['RELAYER_REFUND_ADDRESSES'];
+      if (fromEnv) {
+        knownRelayerAddresses = fromEnv
+          .split(',')
+          .map(a => a.trim().toLowerCase())
+          .filter(a => /^0x[a-f0-9]{40}$/.test(a));
+      }
+    } catch (_) {}
 
-    return transactions.some(
-      tx =>
-        tx.to &&
-        knownRelayerAddresses.includes(tx.to.toLowerCase()) &&
-        tx.value &&
-        BigInt(tx.value) > 0n
-    );
+    // Fallback to built-in known relayer/builder addresses if none provided (can be extended via config)
+    if (knownRelayerAddresses.length === 0) {
+      knownRelayerAddresses = [
+        // Flashbots Protect relayer (example; replace with up-to-date addresses in config)
+        '0xc89ce4735882c9f0f0fe26686c53074e09b0d550',
+      ];
+    }
+
+    return transactions.some(tx => {
+      try {
+        const to = (tx.to || '').toLowerCase();
+        if (!to || !knownRelayerAddresses.includes(to)) return false;
+        if (!tx.value) return false;
+        const val = BigInt(tx.value);
+        return val > 0n;
+      } catch (_) {
+        return false;
+      }
+    });
   }
 
   private detectBundleOrdering(transactions: any[]): boolean {
@@ -1013,7 +1239,11 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
     // Look for MEV-Share style refund patterns or metadata
     return transactions.some(tx => {
       // Check for unusual gas patterns typical of MEV-Share
-      if (tx.maxPriorityFeePerGas === '0x0' && tx.maxFeePerGas) {
+      if (
+        tx.maxPriorityFeePerGas != null &&
+        BigInt(tx.maxPriorityFeePerGas as any) === 0n &&
+        tx.maxFeePerGas
+      ) {
         return true;
       }
 

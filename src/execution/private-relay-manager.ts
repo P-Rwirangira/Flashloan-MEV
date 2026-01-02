@@ -137,7 +137,7 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
     options: SubmissionOptions = {}
   ): Promise<RelaySubmissionResult> {
     const startTime = Date.now();
-    const submissionId = `tx-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    const submissionId = `tx-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
 
     try {
       // Check if we're at submission limit
@@ -508,9 +508,19 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
     relays: RelayProviderConfig[],
     _criteria: RelaySelectionCriteria
   ): RelayProvider {
-    // For now, return the first available relay
-    // In production, this would consider gas costs, fees, etc.
-    return relays[0]?.provider || RelayProvider.FLASHBOTS_PROTECT;
+    // Compute an estimated cost score: baseFee + (priorityFeeMultiplier * 1e9)
+    let best: RelayProvider = relays[0]?.provider || RelayProvider.FLASHBOTS_PROTECT;
+    let bestCost = Number.MAX_SAFE_INTEGER;
+    for (const r of relays) {
+      const costs = r.costs;
+      const score =
+        Number((costs.baseFee || 0n) / 1_000_000_000n) + (costs.priorityFeeMultiplier || 1) * 1; // coarse units
+      if (score < bestCost) {
+        bestCost = score;
+        best = r.provider;
+      }
+    }
+    return best;
   }
 
   /**

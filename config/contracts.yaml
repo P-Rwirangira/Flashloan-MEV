@@ -37,6 +37,25 @@ deployment:
   gasPrice: "auto" # Use network suggested gas price
   
 # Network configurations
+protocols:
+  aaveV3:
+    poolAddress: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5" # Base Aave V3 Pool
+  compoundLike:
+    moonwell:
+      comptroller: "0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180"
+      markets:
+        - underlying: "0x4200000000000000000000000000000000000006" # WETH
+          cToken: "0x0000000000000000000000000000000000000000" # TODO update
+        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" # USDC
+          cToken: "0x0000000000000000000000000000000000000000" # TODO update
+    seamless:
+      comptroller: "0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180"
+      markets:
+        - underlying: "0x4200000000000000000000000000000000000006" # WETH
+          cToken: "0x0000000000000000000000000000000000000000" # TODO update
+        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" # USDC
+          cToken: "0x0000000000000000000000000000000000000000" # TODO update
+
 networks:
   base:
     rpcUrl: "https://mainnet.base.org"

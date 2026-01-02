@@ -17,16 +17,16 @@ import {
 } from '../types/mempool';
 import { DexType } from '../types/dex';
 
-// Uniswap V3 method signatures
+// Uniswap V3 method signatures (router)
 const UNISWAP_V3_SIGNATURES = {
-  exactInputSingle: '0x414bf389',
-  exactInput: '0xc04b8d59',
-  exactOutputSingle: '0xdb3e2198',
-  exactOutput: '0xf28c0498',
-  multicall: '0xac9650d8',
+  exactInputSingle: '0x04e45aaf',
+  exactInput: '0x472b43f3',
+  exactOutputSingle: '0x5023b4df',
+  exactOutput: '0x09b81346',
+  multicall: '0x5ae401dc',
 };
 
-// Aerodrome method signatures
+// Aerodrome router method signatures (Velodrome v2 style)
 const AERODROME_SIGNATURES = {
   swapExactTokensForTokens: '0x38ed1739',
   swapTokensForExactTokens: '0x8803dbee',
@@ -34,12 +34,26 @@ const AERODROME_SIGNATURES = {
   swapTokensForExactETH: '0x4a25d94a',
   swapExactTokensForETH: '0x18cbafe5',
   swapETHForExactTokens: '0xfb3bdb41',
+  swapExactTokensForTokensSupportingFeeOnTransferTokens: '0x5c11d795',
+  swapExactETHForTokensSupportingFeeOnTransferTokens: '0xb6f9de95',
+  swapExactTokensForETHSupportingFeeOnTransferTokens: '0x791ac947',
 };
+
+// Common multicall signatures (Uniswap V3 periphery)
+const MULTICALL_SIGNATURES = new Set<string>([
+  '0x5ae401dc', // multicall(bytes[] data)
+  '0xac9650d8', // multicall(uint256 deadline, bytes[] data)
+]);
 
 export class MempoolMonitor extends EventEmitter {
   private readonly logger = createComponentLogger('mempool-monitor');
   private readonly connectionManager: RpcConnectionManager;
   private readonly options: Required<Omit<MempoolMonitorOptions, 'connectionManager'>>;
+  private readonly uniswapV3FactoryAddress?: string | undefined;
+  private readonly aerodromeFactoryAddress?: string | undefined;
+  private readonly uniswapV3QuoterAddress?: string | undefined;
+  private readonly aerodromeRouterAddress?: string | undefined;
+  private readonly backrunRecipient?: string | undefined;
 
   private isMonitoring = false;
   private pendingTxs: Map<string, PendingTxOpportunity> = new Map();
@@ -68,7 +82,21 @@ export class MempoolMonitor extends EventEmitter {
       enableBackrun: options.enableBackrun ?? true,
       enableFrontrun: options.enableFrontrun ?? false, // Disabled by default (ethical concerns)
       enableSandwich: options.enableSandwich ?? false, // Disabled by default (ethical concerns)
-    };
+      uniswapV3FactoryAddress:
+        options.uniswapV3FactoryAddress ?? '0x33128a8fC17869897dcE68Ed026d694621f6FDfD',
+      aerodromeFactoryAddress:
+        options.aerodromeFactoryAddress ?? '0xBE1a33519B2b1E3540D92724E2Ab84f0D9E8b872',
+      uniswapV3QuoterAddress:
+        options.uniswapV3QuoterAddress ?? '0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a',
+      aerodromeRouterAddress:
+        options.aerodromeRouterAddress ?? '0xE34b803C5274F4170Dc57cf021A37F16C6425a3F',
+    } as Required<Omit<MempoolMonitorOptions, 'connectionManager'>>;
+    this.uniswapV3FactoryAddress = this.options.uniswapV3FactoryAddress;
+    this.aerodromeFactoryAddress = this.options.aerodromeFactoryAddress;
+    this.uniswapV3QuoterAddress = this.options.uniswapV3QuoterAddress;
+    this.aerodromeRouterAddress = this.options.aerodromeRouterAddress;
+    this.backrunRecipient =
+      options.backrunRecipient || (process.env['EXECUTION_WALLET_ADDRESS'] as string | undefined);
 
     this.logger.info('Mempool monitor created', {
       enabledProtocols: this.options.enabledProtocols,
@@ -269,7 +297,7 @@ export class MempoolMonitor extends EventEmitter {
       const methodSig = tx.data.slice(0, 10);
 
       // Try to decode as DEX swap
-      const swapDetails = this.decodeSwap(methodSig, tx.data, tx.to ?? '');
+      const swapDetails = await this.decodeSwap(methodSig, tx.data, tx.to ?? '');
 
       if (!swapDetails) {
         return null;
@@ -331,16 +359,26 @@ export class MempoolMonitor extends EventEmitter {
   /**
    * Decode swap transaction data
    */
-  private decodeSwap(methodSig: string, data: string, to: string): SwapDetails | null {
+  private async decodeSwap(
+    methodSig: string,
+    data: string,
+    to: string
+  ): Promise<SwapDetails | null> {
     try {
+      // Handle multicall by unpacking inner calls and finding the first swap
+      if (MULTICALL_SIGNATURES.has(methodSig)) {
+        const swaps = await this.decodeFromMulticall(data);
+        return swaps[0] || null;
+      }
+
       // Check Uniswap V3 signatures
       if (Object.values(UNISWAP_V3_SIGNATURES).includes(methodSig)) {
-        return this.decodeUniswapV3Swap(methodSig, data, to);
+        return await this.decodeUniswapV3Swap(methodSig, data, to);
       }
 
       // Check Aerodrome signatures
       if (Object.values(AERODROME_SIGNATURES).includes(methodSig)) {
-        return this.decodeAerodromeSwap(methodSig, data, to);
+        return await this.decodeAerodromeSwap(methodSig, data, to);
       }
 
       return null;
@@ -352,54 +390,272 @@ export class MempoolMonitor extends EventEmitter {
   /**
    * Decode Uniswap V3 swap
    */
-  private decodeUniswapV3Swap(methodSig: string, data: string, to: string): SwapDetails | null {
+  private async decodeUniswapV3Swap(
+    methodSig: string,
+    data: string,
+    _to: string
+  ): Promise<SwapDetails | null> {
     try {
-      // Simplified decoding - in production, use proper ABI decoding
-      // Log the data for debugging purposes
-      this.logger.debug('Decoding Uniswap V3 swap', {
-        methodSig,
-        dataLength: data.length,
-        to,
-      });
+      // Router interfaces for exactInputSingle/exactOutputSingle and exactInput/exactOutput
+      const routerIface = new ethers.Interface([
+        'function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)',
+        'function exactOutputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountOut,uint256 amountInMaximum,uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountIn)',
+        'function exactInput(bytes path,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum) external payable returns (uint256 amountOut)',
+        'function exactOutput(bytes path,address recipient,uint256 deadline,uint256 amountOut,uint256 amountInMaximum) external payable returns (uint256 amountIn)',
+      ]);
 
-      // For now, return placeholder data
-      return {
-        protocol: DexType.UNISWAP_V3,
-        methodSignature: methodSig,
-        tokenIn: ethers.ZeroAddress,
-        tokenOut: ethers.ZeroAddress,
-        amountIn: 0n,
-        amountOut: 0n,
-        recipient: to,
-        deadline: Math.floor(Date.now() / 1000) + 300,
-      };
+      const factory = new ethers.Contract(
+        this.uniswapV3FactoryAddress as string,
+        ['function getPool(address,address,uint24) view returns (address)'],
+        this.connectionManager.getProvider()
+      );
+
+      if (methodSig === UNISWAP_V3_SIGNATURES.exactInputSingle) {
+        const decoded = routerIface.decodeFunctionData('exactInputSingle', data);
+        const params = decoded[0] as any;
+        const tokenIn = params.tokenIn as string;
+        const tokenOut = params.tokenOut as string;
+        const fee = Number(params.fee);
+        const amountIn = BigInt(params.amountIn.toString());
+        const poolAddr = await (factory as any).getPool(tokenIn, tokenOut, fee);
+        return {
+          protocol: DexType.UNISWAP_V3,
+          methodSignature: methodSig,
+          tokenIn,
+          tokenOut,
+          amountIn,
+          amountOut: 0n,
+          recipient: params.recipient,
+          deadline: Number(params.deadline),
+          poolAddress: poolAddr,
+          fee,
+        };
+      }
+
+      if (methodSig === UNISWAP_V3_SIGNATURES.exactOutputSingle) {
+        const decoded = routerIface.decodeFunctionData('exactOutputSingle', data);
+        const params = decoded[0] as any;
+        const tokenIn = params.tokenIn as string;
+        const tokenOut = params.tokenOut as string;
+        const fee = Number(params.fee);
+        const amountOut = BigInt(params.amountOut.toString());
+        const poolAddr = await (factory as any).getPool(tokenIn, tokenOut, fee);
+        return {
+          protocol: DexType.UNISWAP_V3,
+          methodSignature: methodSig,
+          tokenIn,
+          tokenOut,
+          amountIn: 0n,
+          amountOut,
+          recipient: params.recipient,
+          deadline: Number(params.deadline),
+          poolAddress: poolAddr,
+          fee,
+        };
+      }
+
+      if (
+        methodSig === UNISWAP_V3_SIGNATURES.exactInput ||
+        methodSig === UNISWAP_V3_SIGNATURES.exactOutput
+      ) {
+        // For path-based, parse first hop to extract tokenIn/tokenOut/fee of first pool
+        const fn = methodSig === UNISWAP_V3_SIGNATURES.exactInput ? 'exactInput' : 'exactOutput';
+        const decoded = routerIface.decodeFunctionData(fn, data);
+        const path: string = decoded[0];
+        if (!path || path.length < 2 + (20 + 3 + 20) * 2) {
+          return null;
+        }
+        // Decode first hop: tokenIn(20) | fee(3) | tokenOut(20) (packed)
+        const tokenIn = '0x' + path.slice(2, 42);
+        const feeHex = path.slice(42, 48);
+        const fee = parseInt(feeHex, 16);
+        const tokenOut = '0x' + path.slice(48, 88);
+        const poolAddr = await (factory as any).getPool(tokenIn, tokenOut, fee);
+        const amountIn =
+          methodSig === UNISWAP_V3_SIGNATURES.exactInput ? BigInt(decoded[3].toString()) : 0n;
+        const amountOut =
+          methodSig === UNISWAP_V3_SIGNATURES.exactOutput ? BigInt(decoded[3].toString()) : 0n;
+        const recipient = decoded[1] as string;
+        const deadline = Number(decoded[2]);
+        return {
+          protocol: DexType.UNISWAP_V3,
+          methodSignature: methodSig,
+          tokenIn,
+          tokenOut,
+          amountIn,
+          amountOut,
+          recipient,
+          deadline,
+          poolAddress: poolAddr,
+          fee,
+        };
+      }
+
+      return null;
     } catch (error) {
       return null;
     }
   }
 
   /**
+   * Decode multicall and extract inner swaps
+   */
+  private async decodeFromMulticall(data: string): Promise<SwapDetails[]> {
+    try {
+      // Try both multicall variants
+      const iface1 = new ethers.Interface(['function multicall(bytes[] data)']);
+      const iface2 = new ethers.Interface(['function multicall(uint256 deadline, bytes[] data)']);
+      let inner: string[] | null = null;
+      try {
+        const d = iface1.decodeFunctionData('multicall', data);
+        inner = d?.[0] as string[];
+      } catch {}
+      if (!inner) {
+        try {
+          const d2 = iface2.decodeFunctionData('multicall', data);
+          inner = d2?.[1] as string[];
+        } catch {}
+      }
+      if (!inner || inner.length === 0) return [];
+
+      const swaps: SwapDetails[] = [];
+      for (const callData of inner) {
+        const sig = callData.slice(0, 10);
+        // Attempt Uniswap V3 decode first
+        if (Object.values(UNISWAP_V3_SIGNATURES).includes(sig)) {
+          const s = await this.decodeUniswapV3Swap(sig, callData, '');
+          if (s) swaps.push(s);
+          continue;
+        }
+        // Then Aerodrome
+        if (Object.values(AERODROME_SIGNATURES).includes(sig)) {
+          const s = await this.decodeAerodromeSwap(sig, callData, '');
+          if (s) swaps.push(s);
+          continue;
+        }
+        // Nested multicall (rare): recurse defensively
+        if (MULTICALL_SIGNATURES.has(sig)) {
+          const nested = await this.decodeFromMulticall(callData);
+          swaps.push(...nested);
+        }
+      }
+      return swaps;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
    * Decode Aerodrome swap
    */
-  private decodeAerodromeSwap(methodSig: string, data: string, to: string): SwapDetails | null {
+  private async decodeAerodromeSwap(
+    methodSig: string,
+    data: string,
+    _to: string
+  ): Promise<SwapDetails | null> {
     try {
-      // Simplified decoding - in production, use proper ABI decoding
-      // Log the data for debugging purposes
-      this.logger.debug('Decoding Aerodrome swap', {
-        methodSig,
-        dataLength: data.length,
-        to,
-      });
+      // Aerodrome/Velodrome v2 routers vary: routes can be address[] or struct Route[] {address from; address to; bool stable}
+      const routerIfaceAddr = new ethers.Interface([
+        'function swapExactTokensForTokens(uint256 amountIn,uint256 amountOutMin,address[] calldata routes,address to,uint256 deadline) external returns (uint256[] memory amounts)',
+        'function swapTokensForExactTokens(uint256 amountOut,uint256 amountInMax,address[] calldata routes,address to,uint256 deadline) external returns (uint256[] memory amounts)',
+        'function swapExactTokensForETH(uint256 amountIn,uint256 amountOutMin,address[] calldata routes,address to,uint256 deadline) external returns (uint256[] memory amounts)',
+        'function swapTokensForExactETH(uint256 amountOut,uint256 amountInMax,address[] calldata routes,address to,uint256 deadline) external returns (uint256[] memory amounts)',
+        'function swapExactETHForTokens(uint256 amountOutMin,address[] calldata routes,address to,uint256 deadline) external payable returns (uint256[] memory amounts)',
+        'function swapETHForExactTokens(uint256 amountOut,address[] calldata routes,address to,uint256 deadline) external payable returns (uint256[] memory amounts)',
+      ]);
+      const routerIfaceStruct = new ethers.Interface([
+        'function swapExactTokensForTokens(uint256 amountIn,uint256 amountOutMin,(address from,address to,bool stable)[] calldata routes,address to,uint256 deadline) external returns (uint256[] memory amounts)',
+        'function swapTokensForExactTokens(uint256 amountOut,uint256 amountInMax,(address from,address to,bool stable)[] calldata routes,address to,uint256 deadline) external returns (uint256[] memory amounts)',
+        'function swapExactTokensForETH(uint256 amountIn,uint256 amountOutMin,(address from,address to,bool stable)[] calldata routes,address to,uint256 deadline) external returns (uint256[] memory amounts)',
+        'function swapTokensForExactETH(uint256 amountOut,uint256 amountInMax,(address from,address to,bool stable)[] calldata routes,address to,uint256 deadline) external returns (uint256[] memory amounts)',
+        'function swapExactETHForTokens(uint256 amountOutMin,(address from,address to,bool stable)[] calldata routes,address to,uint256 deadline) external payable returns (uint256[] memory amounts)',
+        'function swapETHForExactTokens(uint256 amountOut,(address from,address to,bool stable)[] calldata routes,address to,uint256 deadline) external payable returns (uint256[] memory amounts)',
+      ]);
+
+      // Aerodrome factory for pair resolution
+      const factory = new ethers.Contract(
+        this.aerodromeFactoryAddress as string,
+        [
+          'function getPair(address tokenA,address tokenB,bool stable) external view returns (address pair)',
+        ],
+        this.connectionManager.getProvider()
+      );
+
+      const decodeAddr = (fn: string) => {
+        try {
+          return routerIfaceAddr.decodeFunctionData(fn, data);
+        } catch {
+          return null;
+        }
+      };
+      const decodeStruct = (fn: string) => {
+        try {
+          return routerIfaceStruct.decodeFunctionData(fn, data);
+        } catch {
+          return null;
+        }
+      };
+
+      // Try each router function signature against both ABI variants
+      const exactIn =
+        decodeAddr('swapExactTokensForTokens') ||
+        decodeStruct('swapExactTokensForTokens') ||
+        decodeAddr('swapExactTokensForETH') ||
+        decodeStruct('swapExactTokensForETH') ||
+        decodeAddr('swapExactETHForTokens') ||
+        decodeStruct('swapExactETHForTokens');
+      const exactOut =
+        decodeAddr('swapTokensForExactTokens') ||
+        decodeStruct('swapTokensForExactTokens') ||
+        decodeAddr('swapTokensForExactETH') ||
+        decodeStruct('swapTokensForExactETH') ||
+        decodeAddr('swapETHForExactTokens') ||
+        decodeStruct('swapETHForExactTokens');
+
+      if (!exactIn && !exactOut) {
+        return null;
+      }
+
+      // Extract routes parameter (address[] or struct[])
+      const params = (exactIn || exactOut) as any[];
+      let routes: any[] | undefined;
+      for (const p of params) {
+        if (Array.isArray(p) && p.length > 0) {
+          routes = p;
+          break;
+        }
+      }
+      if (!routes || routes.length === 0) {
+        return null;
+      }
+      const first = routes[0];
+      const tokenIn = (first.from || first.tokenIn || first[0]) as string;
+      const tokenOut = (first.to || first.tokenOut || first[1]) as string;
+      const stable = Boolean(first.stable ?? first[2]);
+      const poolAddr = await (factory as any).getPair(tokenIn, tokenOut, stable);
+
+      // Amounts/recipient/deadline extraction tolerant to param order differences
+      const amountIn = exactIn ? BigInt((params[0] ?? params[3])?.toString?.() || '0') : 0n;
+      const amountOut = exactOut ? BigInt(params[0]?.toString?.() || '0') : 0n;
+      let recipient: string = '';
+      let deadline: number = Math.floor(Date.now() / 1000) + 300;
+      for (const p of params) {
+        if (typeof p === 'string' && p.length === 42) recipient = p;
+        if (typeof p === 'bigint' || typeof p === 'number') deadline = Number(p);
+      }
 
       return {
         protocol: DexType.AERODROME,
         methodSignature: methodSig,
-        tokenIn: ethers.ZeroAddress,
-        tokenOut: ethers.ZeroAddress,
-        amountIn: 0n,
-        amountOut: 0n,
-        recipient: to,
-        deadline: Math.floor(Date.now() / 1000) + 300,
+        tokenIn,
+        tokenOut,
+        amountIn,
+        amountOut,
+        recipient,
+        deadline,
+        poolAddress: poolAddr,
+        stable,
+        routeStructPreferred: typeof first === 'object' && ('from' in first || 'tokenIn' in first),
       };
     } catch (error) {
       return null;
@@ -411,61 +667,154 @@ export class MempoolMonitor extends EventEmitter {
    */
   private async calculateBackrunProfit(swap: SwapDetails): Promise<bigint | undefined> {
     try {
-      // Calculate backrun profit using real pool state and gas estimation
-      const poolContract = new ethers.Contract(
-        swap.poolAddress || '0x0000000000000000000000000000000000000000',
-        [
-          'function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
-          'function liquidity() external view returns (uint128)',
-        ],
-        this.connectionManager.getProvider()
-      );
+      // Calculate backrun profit using on-chain quotes and realistic gas estimation
+      const provider = this.connectionManager.getProvider();
+      const feeData = await provider.getFeeData();
+      const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || 20_000_000_000n;
 
-      try {
-        const [, liquidity] = await Promise.all([
-          poolContract?.['slot0']?.(),
-          poolContract?.['liquidity']?.(),
-        ]);
+      // Attempt protocol-specific quote for backrun leg
+      let expectedOut: bigint = 0n;
 
-        // Calculate potential profit based on price impact
-        const swapSize = swap.amountIn;
-        const liquidityAmount = liquidity;
-
-        if (liquidityAmount > 0n) {
-          // Estimate price impact: larger swaps relative to liquidity = higher impact
-          const impactRatio = Number(swapSize) / Number(liquidityAmount);
-          const estimatedProfitBps = Math.min(impactRatio * 10000, 500); // Cap at 5%
-
-          const estimatedProfit = (swapSize * BigInt(Math.floor(estimatedProfitBps))) / 10000n;
-
-          // Subtract gas costs
-          const gasEstimate = 200000n; // Backrun gas estimate
-          const gasPrice = 20000000000n; // 20 gwei
-          const gasCost = gasEstimate * gasPrice;
-
-          const netProfit = estimatedProfit > gasCost ? estimatedProfit - gasCost : 0n;
-
-          this.logger.debug('Calculated backrun profit', {
-            swapSize: swapSize.toString(),
-            liquidity: liquidityAmount.toString(),
-            impactRatio,
-            estimatedProfit: estimatedProfit.toString(),
-            gasCost: gasCost.toString(),
-            netProfit: netProfit.toString(),
-          });
-
-          return netProfit;
+      if (swap.protocol === DexType.UNISWAP_V3) {
+        // Use QuoterV2 exactInputSingle for a small backrun in opposite direction
+        const quoter = new ethers.Contract(
+          this.uniswapV3QuoterAddress as string,
+          [
+            'function quoteExactInputSingle((address tokenIn,address tokenOut,uint256 amountIn,uint24 fee,uint160 sqrtPriceLimitX96)) external returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)',
+          ],
+          provider
+        );
+        const tokenIn = swap.tokenOut;
+        const tokenOut = swap.tokenIn;
+        const fee = BigInt((swap as any).fee ?? 3000);
+        const amountIn = (swap.amountIn > 0n ? swap.amountIn : swap.amountOut) / 100n || 0n; // 1% of observed size
+        if (amountIn > 0n) {
+          try {
+            const res = await (quoter as any).quoteExactInputSingle({
+              tokenIn,
+              tokenOut,
+              amountIn,
+              fee,
+              sqrtPriceLimitX96: 0,
+            });
+            expectedOut = BigInt(res[0].toString());
+          } catch {}
         }
-      } catch (error) {
-        this.logger.debug('Failed to calculate backrun profit from pool state', {
-          poolAddress: swap.poolAddress,
-          error: error instanceof Error ? error.message : String(error),
-        });
+      } else if (swap.protocol === DexType.AERODROME) {
+        // Use router getAmountsOut for a small backrun in opposite direction
+        const router = new ethers.Contract(
+          this.aerodromeRouterAddress as string,
+          [
+            'function getAmountsOut(uint amountIn, address[] memory routes) public view returns (uint[] memory amounts)',
+          ],
+          provider
+        );
+        const amountIn = (swap.amountIn > 0n ? swap.amountIn : swap.amountOut) / 100n || 0n; // 1% of observed size
+        if (amountIn > 0n) {
+          try {
+            // routes param varies by router; for simplicity use [tokenIn, tokenOut] linear path
+            const res = await (router as any).getAmountsOut(amountIn, [
+              swap.tokenOut,
+              swap.tokenIn,
+            ]);
+            if (Array.isArray(res) && res.length > 1) {
+              expectedOut = BigInt(res[res.length - 1].toString());
+            }
+          } catch {}
+        }
       }
 
-      // Fallback calculation based on swap amount
-      const fallbackProfit = swap.amountIn / 1000n; // 0.1% of swap amount
-      return fallbackProfit;
+      if (expectedOut === 0n) {
+        return undefined; // Unable to quote
+      }
+
+      // Build actual calldata for a minimal backrun and estimate gas precisely
+      let gasEstimate = 200000n;
+      try {
+        let txData: string | null = null;
+        let toAddr: string | undefined;
+        if (swap.protocol === DexType.UNISWAP_V3) {
+          const iface = new ethers.Interface([
+            'function exactInputSingle((address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)',
+          ]);
+          const params = {
+            tokenIn: swap.tokenOut,
+            tokenOut: swap.tokenIn,
+            fee: BigInt((swap as any).fee ?? 3000),
+            recipient: (this as any).backrunRecipient || ethers.ZeroAddress,
+            deadline: BigInt(Math.floor(Date.now() / 1000) + 60),
+            amountIn: (swap.amountIn > 0n ? swap.amountIn : swap.amountOut) / 100n || 0n,
+            amountOutMinimum: 0n,
+            sqrtPriceLimitX96: 0n,
+          };
+          txData = iface.encodeFunctionData('exactInputSingle', [params]);
+          toAddr =
+            (this as any).uniswapV3RouterAddress || '0xE592427A0AEce92De3Edee1F18E0157C05861564';
+        } else if (swap.protocol === DexType.AERODROME) {
+          const toAddrResolved = this.aerodromeRouterAddress as string;
+          const amountIn = (swap.amountIn > 0n ? swap.amountIn : swap.amountOut) / 100n || 0n;
+          const to = (this as any).backrunRecipient || ethers.ZeroAddress;
+          const deadline = BigInt(Math.floor(Date.now() / 1000) + 60);
+          // Prefer encoding matching the observed route type
+          const tryStructFirst = !!(swap as any).routeStructPreferred;
+          const stable = (swap as any).stable ?? false;
+          const encodeAddrVariant = () => {
+            const iface = new ethers.Interface([
+              'function swapExactTokensForTokens(uint256 amountIn,uint256 amountOutMin,address[] calldata routes,address to,uint256 deadline)',
+            ]);
+            const routes = [swap.tokenOut, swap.tokenIn];
+            return iface.encodeFunctionData('swapExactTokensForTokens', [
+              amountIn,
+              0n,
+              routes,
+              to,
+              deadline,
+            ]);
+          };
+          const encodeStructVariant = () => {
+            const iface = new ethers.Interface([
+              'function swapExactTokensForTokens(uint256 amountIn,uint256 amountOutMin,(address from,address to,bool stable)[] calldata routes,address to,uint256 deadline)',
+            ]);
+            const routes = [{ from: swap.tokenOut, to: swap.tokenIn, stable }];
+            return iface.encodeFunctionData('swapExactTokensForTokens', [
+              amountIn,
+              0n,
+              routes,
+              to,
+              deadline,
+            ]);
+          };
+          toAddr = toAddrResolved;
+          // Attempt preferred variant then fallback
+          const variants = tryStructFirst
+            ? [encodeStructVariant, encodeAddrVariant]
+            : [encodeAddrVariant, encodeStructVariant];
+          for (const enc of variants) {
+            try {
+              txData = enc();
+              const gasReq: any = { to: toAddrResolved, data: txData };
+              if (this.backrunRecipient) gasReq.from = this.backrunRecipient;
+              const est = await provider.estimateGas(gasReq);
+              gasEstimate = BigInt(est.toString());
+              break;
+            } catch {
+              txData = null;
+              continue;
+            }
+          }
+        }
+        if (txData && toAddr) {
+          const gasReq2: any = { to: toAddr, data: txData };
+          if (this.backrunRecipient) gasReq2.from = this.backrunRecipient;
+          const est = await provider.estimateGas(gasReq2);
+          gasEstimate = BigInt(est.toString());
+        }
+      } catch {}
+
+      const gasCost = gasEstimate * gasPrice;
+      const profit = expectedOut > gasCost ? expectedOut - gasCost : 0n;
+
+      return profit;
     } catch (error) {
       this.logger.debug('Failed to calculate backrun profit', {
         protocol: swap.protocol,

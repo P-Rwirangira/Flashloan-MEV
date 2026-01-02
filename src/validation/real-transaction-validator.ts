@@ -86,6 +86,7 @@ export class RealTransactionValidator extends EventEmitter {
     super();
 
     this.connectionManager = options.connectionManager;
+    this.contractManager = options.contractManager;
     // Validate contract manager is available for advanced validation
     if (this.contractManager) {
       this.logger.debug('Contract manager available for validation');
@@ -588,7 +589,7 @@ export class RealTransactionValidator extends EventEmitter {
           );
 
           const isStable = await poolContract['stable']!();
-          const feeRate = isStable ? 500 : 3000; // 0.05% or 0.3%
+          const feeRate = isStable ? 500 : 300; // 0.05% or 0.3% expressed in bps
           const swapFee = (currentAmount * BigInt(feeRate)) / 1000000n;
           totalFees += swapFee;
 
@@ -600,7 +601,7 @@ export class RealTransactionValidator extends EventEmitter {
     } catch (error) {
       // Fallback calculation
       const routeLength = opportunity.route.pools?.length || 1;
-      const avgFee = 3000; // 0.3% average
+      const avgFee = 300; // 0.3% average in bps
       const totalAmount = BigInt(opportunity.amountIn.toString());
       return (totalAmount * BigInt(avgFee * routeLength)) / 1000000n;
     }

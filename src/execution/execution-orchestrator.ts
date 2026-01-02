@@ -8,6 +8,8 @@
 import { EventEmitter } from 'events';
 import { createComponentLogger } from '../utils/logger';
 import { OpportunityStateMachine } from './opportunity-state-machine';
+import { FlashLoanManager } from './flash-loan-manager';
+import { Address } from '../types/common';
 import { OpportunityState } from '../types/execution-state';
 import {
   BaseOpportunity,
@@ -111,7 +113,8 @@ export class ExecutionOrchestrator extends EventEmitter {
 
   constructor(
     config: Partial<ExecutionOrchestratorConfig> = {},
-    stateMachine?: OpportunityStateMachine
+    stateMachine?: OpportunityStateMachine,
+    private readonly flashLoanManager?: FlashLoanManager
   ) {
     super();
 
@@ -557,16 +560,60 @@ export class ExecutionOrchestrator extends EventEmitter {
     const estimatedDuration = await engine.estimateExecutionTime(opportunity);
     const gasLimit = await engine.estimateGas(opportunity);
 
-    return {
+    // Determine flash loan capacity using FlashLoanManager when possible
+    let flashLoanCapacity: bigint = 0n;
+    try {
+      if (this.flashLoanManager) {
+        let token: Address | undefined;
+        switch (opportunity.type) {
+          case OpportunityType.ARBITRAGE:
+            token = (opportunity as any).tokenIn as Address;
+            break;
+          case OpportunityType.LIQUIDATION:
+            token = (opportunity as any).debtAsset as Address;
+            break;
+          case OpportunityType.STABLE_POOL_REBALANCING:
+            // Choose tokenIn based on swapDirection if present; default to token0
+            const swapDir = (opportunity as any).swapDirection;
+            token =
+              swapDir === 'token0_to_token1'
+                ? (opportunity as any).token0
+                : (opportunity as any).token1;
+            break;
+          default:
+            token = undefined;
+        }
+        if (token && typeof token === 'string') {
+          const capacity = await this.flashLoanManager.getTotalCapacity(token);
+          flashLoanCapacity = capacity.availableCapacity;
+        }
+      }
+    } catch (e) {
+      // Keep capacity at 0n on failure
+    }
+
+    const allocation: ResourceAllocation = {
       opportunityId: opportunity.id,
       allocatedAt: Date.now(),
       estimatedDuration,
       resources: {
         gasLimit,
-        flashLoanCapacity: opportunity.estimatedProfit, // Simplified for now
+        flashLoanCapacity,
         relayCapacity: 1,
       },
     };
+
+    // Emit resource allocation metrics if metrics emitter is available
+    try {
+      (this as any).metrics?.emit?.('resourceAllocation', {
+        opportunityId: opportunity.id,
+        gasLimit,
+        flashLoanCapacity,
+        ts: Date.now(),
+      });
+    } catch {}
+
+    return allocation;
   }
 
   /**

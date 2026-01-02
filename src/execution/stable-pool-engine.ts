@@ -238,6 +238,10 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
       const baseIncentive = opportunity.expectedIncentives;
 
       // Scale incentive based on trade size
+      if (opportunity.rebalanceAmount === 0n) {
+        this.logger.warn('Rebalance amount is zero; incentive rewards set to 0');
+        return 0n;
+      }
       const incentiveRate = baseIncentive / opportunity.rebalanceAmount;
       const scaledIncentive =
         (tradeAmount * incentiveRate * BigInt(Math.floor(this.config.incentiveMultiplier * 100))) /
@@ -308,6 +312,7 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
         'function fee() external view returns (uint256)',
         'function stable() external view returns (bool)',
         'function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256)',
+        'function A() external view returns (uint256)',
       ];
 
       const pool = new ethers.Contract(poolAddress, poolAbi, provider);
@@ -335,16 +340,44 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
         throw new Error('Pool is not a stable pool');
       }
 
+      // Try to read amplification parameter if exposed
+      let amp: bigint = 100n;
+      try {
+        const getA = (pool as any)['A'] as (() => Promise<any>) | undefined;
+        if (getA) {
+          const AVal = await getA();
+          amp = BigInt(AVal?.toString?.() ?? '100');
+        }
+      } catch {}
+
       // Calculate imbalance
       const totalReserves = reserve0 + reserve1;
       const expectedBalance = totalReserves / 2n;
       const imbalance0 =
-        Number(
-          reserve0 > expectedBalance ? reserve0 - expectedBalance : expectedBalance - reserve0
-        ) / Number(totalReserves);
+        totalReserves > 0n
+          ? Number(
+              reserve0 > expectedBalance ? reserve0 - expectedBalance : expectedBalance - reserve0
+            ) / Number(totalReserves)
+          : 0;
 
-      // Calculate virtual price (simplified)
-      const virtualPrice = ethers.parseEther('1.0'); // Would calculate based on pool invariant
+      // Approximate virtual price from tiny swap quotes in both directions
+      let virtualPrice = ethers.parseEther('1.0');
+      try {
+        const tiny = 10_000n;
+        const getAmountOut = (pool as any)['getAmountOut'] as
+          | ((amountIn: bigint, tokenIn: string) => Promise<any>)
+          | undefined;
+        if (getAmountOut) {
+          const out0 = await getAmountOut(tiny, token0);
+          const out1 = await getAmountOut(tiny, token1);
+          if (out0 && out1 && BigInt(out0.toString()) > 0n && BigInt(out1.toString()) > 0n) {
+            const px01 = Number(out0) / Number(tiny);
+            const px10 = Number(out1) / Number(tiny);
+            const vp = Math.sqrt(px01 * px10);
+            virtualPrice = ethers.parseEther(vp.toString());
+          }
+        }
+      } catch {}
 
       return {
         reserve0,
@@ -354,7 +387,7 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
         fee: Number(fee),
         imbalance: imbalance0,
         virtualPrice,
-        amplificationParameter: 100n, // Would get from pool contract
+        amplificationParameter: amp,
       };
     } catch (error) {
       this.logger.error('Failed to get stable pool state', {
@@ -395,7 +428,7 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
         opportunity.token1,
         optimalSize
       );
-      const mockTrade: RebalancingTrade = {
+      const candidateTrade: RebalancingTrade = {
         poolAddress: opportunity.poolAddress,
         tokenIn: opportunity.token0,
         tokenOut: opportunity.token1,
@@ -407,7 +440,7 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
         gasEstimate: 300000n,
       };
 
-      const expectedProfit = await this.calculateRebalancingProfit(mockTrade);
+      const expectedProfit = await this.calculateRebalancingProfit(candidateTrade);
       const minProfitThreshold = ethers.parseEther(this.config.minProfitThresholdUsd.toString());
 
       if (expectedProfit < minProfitThreshold) {
@@ -415,7 +448,7 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
         const sizes = [optimalSize / 2n, optimalSize / 4n, optimalSize / 8n];
 
         for (const size of sizes) {
-          const testTrade = { ...mockTrade, amountIn: size };
+          const testTrade = { ...candidateTrade, amountIn: size };
           const profit = await this.calculateRebalancingProfit(testTrade);
           if (profit >= minProfitThreshold) {
             optimalSize = size;
@@ -489,9 +522,40 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
     amountOut: bigint
   ): Promise<number> {
     try {
-      // Calculate price impact as percentage
-      const spotPrice = Number(poolState.reserve1) / Number(poolState.reserve0);
-      const executionPrice = Number(amountOut) / Number(amountIn);
+      // Guard against division by zero
+      if (amountIn === 0n || poolState.reserve0 === 0n || poolState.reserve1 === 0n) {
+        return 1.0;
+      }
+
+      // Estimate spot price using a tiny quote via getAmountOut if possible for better accuracy
+      let spotPrice: number;
+      try {
+        const tinyIn = 1000n; // small amount for quote
+        const tokenIn = poolState.token0; // approximate using token0->token1
+        const provider = this.transactionManager.getProvider();
+        const poolAbi = [
+          'function getAmountOut(uint256 amountIn, address tokenIn) view returns (uint256)',
+        ];
+        const poolContract = new ethers.Contract(
+          (this as any).currentPoolAddress || '',
+          poolAbi,
+          provider
+        );
+        const getAmountOut = (poolContract as any)['getAmountOut'] as
+          | ((amountIn: bigint, tokenIn: string) => Promise<any>)
+          | undefined;
+        if (getAmountOut) {
+          const quotedOut = await getAmountOut(tinyIn, tokenIn);
+          spotPrice = Number(quotedOut) / Number(tinyIn);
+        } else {
+          throw new Error('no quote');
+        }
+      } catch {
+        // Fallback to reserve ratio
+        spotPrice = Number(poolState.reserve1) / Math.max(1, Number(poolState.reserve0));
+      }
+
+      const executionPrice = Number(amountOut) / Math.max(1, Number(amountIn));
       const priceImpact = Math.abs(1 - executionPrice / spotPrice);
 
       return priceImpact;

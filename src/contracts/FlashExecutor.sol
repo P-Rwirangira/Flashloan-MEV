@@ -6,6 +6,12 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+
+interface IPriceOracle {
+    function getPriceInETH(address token) external view returns (uint256);
+    function oracleDecimals() external view returns (uint8);
+}
 
 /**
  * @title FlashExecutor
@@ -64,6 +70,14 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
     uint256 public minProfit;
     uint256 public totalExecutions;
     uint256 public totalProfit;
+
+    // Slippage and fee configuration
+    uint256 public maxSlippageBps = 50; // 0.5% default
+    uint256 public aerodromeFeeBpsVolatile = 30; // 0.3% default
+    uint256 public aerodromeFeeBpsStable = 4; // 0.04% default
+
+    // External price oracle (settable by owner)
+    IPriceOracle private priceOracle;
 
     // Route data structure
     struct RouteData {
@@ -339,6 +353,17 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         address token0,
         address token1
     ) internal {
+        // Fetch current sqrtPriceX96 and compute slippage-bound limit
+        (uint160 sqrtPriceX96,,,,,,) = IUniswapV3Pool(pool).slot0();
+        uint160 limit;
+        if (maxSlippageBps > 0) {
+            // Adjust price limit by slippage: price ~ (sqrtPrice)^2, but we use linear approx on sqrtPrice
+            uint256 adj = uint256(sqrtPriceX96) * (10_000 - maxSlippageBps) / 10_000;
+            uint256 adjUp = uint256(sqrtPriceX96) * (10_000 + maxSlippageBps) / 10_000;
+            limit = zeroForOne ? uint160(adj) : uint160(adjUp);
+        } else {
+            limit = zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341;
+        }
         // Get current balance to determine swap amount
         address tokenIn = zeroForOne ? token0 : token1;
         uint256 amountIn = IERC20(tokenIn).balanceOf(address(this));
@@ -396,21 +421,36 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         address tokenIn,
         uint256 amountIn
     ) internal view returns (uint256) {
-        // This is a simplified calculation
-        // In production, you'd implement the full Aerodrome formula
+        require(address(priceOracle) != address(0), "Oracle not set");
+        if (amountIn == 0) return 0;
+
         (uint256 reserve0, uint256 reserve1,) = IAerodromePair(pool).getReserves();
-        address token0 = IAerodromePair(pool).token0();
-        
-        (uint256 reserveIn, uint256 reserveOut) = tokenIn == token0 
-            ? (reserve0, reserve1) 
-            : (reserve1, reserve0);
-            
-        // Simplified constant product formula (would need stable pool logic too)
-        uint256 amountInWithFee = amountIn * 997;
-        uint256 numerator = amountInWithFee * reserveOut;
-        uint256 denominator = reserveIn * 1000 + amountInWithFee;
-        
-        return numerator / denominator;
+        address t0 = IAerodromePair(pool).token0();
+        bool isStable = IAerodromePair(pool).stable();
+
+        (uint256 reserveIn, uint256 reserveOut) = tokenIn == t0 ? (reserve0, reserve1) : (reserve1, reserve0);
+        if (reserveIn == 0 || reserveOut == 0) return 0;
+
+        uint256 feeBps = isStable ? aerodromeFeeBpsStable : aerodromeFeeBpsVolatile;
+        if (!isStable) {
+            // Constant product with fee
+            uint256 amountInWithFee = amountIn * (10_000 - feeBps) / 10_000;
+            uint256 numerator = amountInWithFee * reserveOut;
+            uint256 denominator = reserveIn + amountInWithFee;
+            return numerator / denominator;
+        }
+        // Stable invariant approximate using iterative method
+        // Based on Curve-like invariant: x^3*y + y^3*x
+        uint256 x = reserveIn;
+        uint256 y = reserveOut;
+        // Apply fee
+        uint256 dx = amountIn * (10_000 - feeBps) / 10_000;
+        x += dx;
+        // Solve for new y s.t. x^3*y + y^3*x = K
+        uint256 K = _stableInvariant(reserveIn, reserveOut);
+        uint256 yNew = _solveY(x, K);
+        if (yNew >= y) return 0;
+        return y - yNew;
     }
 
     /**
@@ -466,6 +506,18 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         emit MinProfitUpdated(oldMinProfit, _minProfit);
     }
 
+    function setMaxSlippageBps(uint256 bps) external onlyOwner {
+        require(bps <= 1000, "too high"); // <=10%
+        maxSlippageBps = bps;
+    }
+
+    function setAerodromeFees(uint256 volatileBps, uint256 stableBps) external onlyOwner {
+        require(volatileBps <= 100, "volatile too high");
+        require(stableBps <= 50, "stable too high");
+        aerodromeFeeBpsVolatile = volatileBps;
+        aerodromeFeeBpsStable = stableBps;
+    }
+
     /**
      * @dev Pause contract
      */
@@ -494,6 +546,14 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
      */
     function emergencyWithdrawETH() external onlyOwner {
         payable(owner()).transfer(address(this).balance);
+    }
+
+    /**
+     * @dev Set external price oracle
+     */
+    function setOracle(address newOracle) external onlyOwner {
+        require(newOracle != address(0), "Invalid oracle");
+        priceOracle = IPriceOracle(newOracle);
     }
 
     // View functions
@@ -537,17 +597,89 @@ contract FlashExecutor is ReentrancyGuard, Ownable, Pausable {
         address token1,
         uint256 profit0,
         uint256 profit1
-    ) internal pure returns (uint256) {
-        // Simplified profit calculation
-        // In production, this would use a price oracle to convert to USD/ETH
-        
-        // For now, assume both tokens have similar value (1:1 ratio)
-        // This is obviously incorrect but serves as a placeholder
-        return profit0 + profit1;
+    ) internal view returns (uint256) {
+        require(address(priceOracle) != address(0), "Oracle not set");
+        // Fetch oracle price decimals with fallback to 18 if not provided
+        uint8 priceDec;
+        try priceOracle.oracleDecimals() returns (uint8 d) {
+            priceDec = d;
+        } catch {
+            priceDec = 18;
+        }
+        // Normalize token profits to 18 decimals
+        uint8 dec0 = _safeTokenDecimals(token0);
+        uint8 dec1 = _safeTokenDecimals(token1);
+        uint256 p0_18 = _normalizeTo18(profit0, dec0);
+        uint256 p1_18 = _normalizeTo18(profit1, dec1);
+        // Fetch prices (ETH-denominated) and scale by oracle decimals
+        uint256 price0 = _getPriceInETH(token0);
+        uint256 price1 = _getPriceInETH(token1);
+        uint256 denom = _pow10(priceDec);
+        uint256 value0 = (p0_18 * price0) / denom;
+        uint256 value1 = (p1_18 * price1) / denom;
+        return value0 + value1;
     }
 
-    // Receive ETH
-    receive() external payable {}
+    // Oracle helper
+   function _getPriceInETH(address token) internal view returns (uint256) {
+       return priceOracle.getPriceInETH(token);
+   }
+
+   function _stableInvariant(uint256 x, uint256 y) internal pure returns (uint256) {
+       // Scale down to prevent overflow
+       uint256 xs = x / 1e6;
+       uint256 ys = y / 1e6;
+       uint256 x3y = xs * xs * xs * ys;
+       uint256 y3x = ys * ys * ys * xs;
+       return (x3y + y3x) * 1e6;
+   }
+
+   function _solveY(uint256 xNew, uint256 K) internal pure returns (uint256) {
+       // Newton-Raphson approximation for y in xNew^3*y + y^3*xNew = K
+       // Initial guess: K / (xNew^3)
+       uint256 xScaled = xNew / 1e6;
+       if (xScaled == 0) return 0;
+       uint256 y = K / (xScaled * xScaled * xScaled + 1);
+       for (uint8 i = 0; i < 3; i++) {
+           // f(y) = x^3*y + y^3*x - K
+           uint256 x3 = xScaled * xScaled * xScaled;
+           uint256 y2 = y * y;
+           uint256 f = x3 * y + y2 * y * xScaled;
+           if (f > K) {
+               // y = y - (f-K) / f'(y), f'(y)= x^3 + 3*y^2*x
+               uint256 df = x3 + 3 * y2 * xScaled + 1;
+               y = y - (f - K) / df;
+           } else {
+               uint256 df = x3 + 3 * y2 * xScaled + 1;
+               y = y + (K - f) / df;
+           }
+       }
+       return y * 1e6;
+   }
+
+   function _safeTokenDecimals(address token) internal view returns (uint8) {
+       try IERC20Metadata(token).decimals() returns (uint8 d) {
+           return d;
+       } catch {
+           return 18; // default
+       }
+   }
+
+   function _normalizeTo18(uint256 amount, uint8 decimals_) internal pure returns (uint256) {
+       if (decimals_ == 18) return amount;
+       if (decimals_ < 18) {
+           return amount * _pow10(uint8(18 - decimals_));
+       } else {
+           return amount / _pow10(uint8(decimals_ - 18));
+       }
+   }
+
+   function _pow10(uint8 d) internal pure returns (uint256) {
+       return 10 ** uint256(d);
+   }
+
+   // Receive ETH
+   receive() external payable {}
 }
 
 /**
@@ -571,7 +703,12 @@ interface IUniswapV3Pool {
 
     function token0() external view returns (address);
     function token1() external view returns (address);
+    function slot0() external view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, uint8, bool);
 }
+
+/**
+ * @dev Price oracle helper (modifiable via owner)
+ */
 
 /**
  * @dev Minimal Aerodrome Pair interface for swaps

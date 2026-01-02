@@ -252,6 +252,7 @@ class ConsecutiveLossCheck implements IRiskCheck {
  * Risk Execution Controller Implementation
  */
 export class RiskExecutionController extends EventEmitter implements IRiskController {
+  private periodicTaskTimer: NodeJS.Timeout | null = null;
   private readonly logger = createComponentLogger('risk-controller');
   private readonly config: RiskControllerConfig;
   private readonly riskChecks = new Map<string, IRiskCheck>();
@@ -415,6 +416,7 @@ export class RiskExecutionController extends EventEmitter implements IRiskContro
 
       // Determine overall risk level
       const overallRisk = this.calculateRiskLevel(normalizedRiskScore);
+      const previousRiskLevel = this.currentRiskLevel;
       this.currentRiskLevel = overallRisk;
 
       // Check if execution should be allowed
@@ -471,9 +473,9 @@ export class RiskExecutionController extends EventEmitter implements IRiskContro
       }
 
       // Emit risk level change if applicable
-      if (overallRisk !== this.currentRiskLevel) {
+      if (overallRisk !== previousRiskLevel) {
         this.emit('riskLevelChanged', {
-          previousLevel: this.currentRiskLevel,
+          previousLevel: previousRiskLevel,
           newLevel: overallRisk,
           riskScore: normalizedRiskScore,
           timestamp: Date.now(),
@@ -736,7 +738,8 @@ export class RiskExecutionController extends EventEmitter implements IRiskContro
       this.executionHistory.dailyStats.profit - this.executionHistory.dailyStats.loss;
     this.executionHistory.dailyStats.successRate =
       this.executionHistory.dailyStats.executions > 0
-        ? this.executionHistory.successfulExecutions / this.executionHistory.totalExecutions
+        ? (this.executionHistory.dailyStats.successfulExecutions ?? 0) /
+          this.executionHistory.dailyStats.executions
         : 0;
   }
 
@@ -823,7 +826,10 @@ export class RiskExecutionController extends EventEmitter implements IRiskContro
    */
   private startPeriodicTasks(): void {
     // Check for circuit breaker recovery every minute
-    setInterval(() => {
+    if (this.periodicTaskTimer) {
+      clearInterval(this.periodicTaskTimer);
+    }
+    this.periodicTaskTimer = setInterval(() => {
       if (
         this.circuitBreakerActive &&
         this.circuitBreakerActivatedAt &&
@@ -835,5 +841,15 @@ export class RiskExecutionController extends EventEmitter implements IRiskContro
         }
       }
     }, 60000); // Every minute
+  }
+
+  /**
+   * Shutdown controller and cleanup timers
+   */
+  public shutdown(): void {
+    if (this.periodicTaskTimer) {
+      clearInterval(this.periodicTaskTimer);
+      this.periodicTaskTimer = null;
+    }
   }
 }

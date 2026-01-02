@@ -66,8 +66,8 @@ export class EnhancedPriceOracle implements IPriceOracle {
       }
 
       // Ultimate fallback with warning
-      console.warn('Failed to get ETH price from all sources, using emergency fallback');
-      return 3000; // Emergency fallback
+      console.warn('Failed to get ETH price from all sources');
+      throw new Error('ETH/USD price unavailable from all sources');
     }
   }
 

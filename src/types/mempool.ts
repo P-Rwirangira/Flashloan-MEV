@@ -36,6 +36,8 @@ export interface SwapDetails {
   readonly deadline: number;
   readonly poolAddress?: string | undefined;
   readonly fee?: number | undefined;
+  readonly stable?: boolean | undefined; // Aerodrome stable/volatile
+  readonly routeStructPreferred?: boolean | undefined; // Aerodrome: struct[] vs address[]
 }
 
 export interface MempoolMonitorOptions {
@@ -49,6 +51,11 @@ export interface MempoolMonitorOptions {
   readonly enableBackrun?: boolean | undefined;
   readonly enableFrontrun?: boolean | undefined;
   readonly enableSandwich?: boolean | undefined;
+  readonly uniswapV3FactoryAddress?: string | undefined;
+  readonly aerodromeFactoryAddress?: string | undefined;
+  readonly uniswapV3QuoterAddress?: string | undefined;
+  readonly aerodromeRouterAddress?: string | undefined;
+  readonly backrunRecipient?: string | undefined;
 }
 
 export interface MempoolStats {

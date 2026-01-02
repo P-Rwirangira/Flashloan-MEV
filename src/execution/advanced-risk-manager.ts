@@ -461,7 +461,8 @@ export class AdvancedRiskManager extends EventEmitter {
       if (this.currentRiskMetrics.currentDrawdown > this.config.maxDrawdown) {
         return {
           shouldExecute: false,
-          reason: `Portfolio drawdown (${this.currentRiskMetrics.currentDrawdown.toFixed(2)}%) exceeds limit (${this.config.maxDrawdown * 100}%)`,
+          // Note: maxDrawdown in config is expected as a decimal (e.g., 0.2 for 20%).
+          reason: `Portfolio drawdown (${(this.currentRiskMetrics.currentDrawdown * 100).toFixed(2)}%) exceeds limit (${(this.config.maxDrawdown * 100).toFixed(2)}%)`,
         };
       }
 
@@ -772,7 +773,12 @@ export class AdvancedRiskManager extends EventEmitter {
       const stdDev = Math.sqrt(variance);
 
       if (stdDev === 0) {
-        return meanReturn > 0 ? Infinity : 0;
+        const epsilon = 1e-8;
+        const denominator = Math.max(stdDev, epsilon);
+        const sharpe = (meanReturn - this.config.riskFreeRate) / denominator;
+        // Cap sharpe to avoid Infinity propagating
+        const MAX_CAP = 1e6;
+        return Math.max(Math.min(sharpe, MAX_CAP), -MAX_CAP);
       }
 
       // Sharpe ratio = (mean return - risk-free rate) / standard deviation

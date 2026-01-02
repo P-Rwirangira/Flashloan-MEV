@@ -174,6 +174,8 @@ export interface ExecutionHistory {
 export interface DailyExecutionStats {
   date: string; // YYYY-MM-DD
   executions: number;
+  successfulExecutions?: number; // optional until fully tracked
+  failedExecutions?: number; // optional until fully tracked
   profit: bigint;
   loss: bigint;
   netProfit: bigint;

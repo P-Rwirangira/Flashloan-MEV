@@ -1,5 +1,53 @@
 # Base MEV Platform Deployment Guide
 
+## Protocol Addresses Configuration
+
+Add protocol addresses to `config/contracts.yaml` under the new `protocols` section. This decouples runtime logic from hard-coded addresses.
+
+Example:
+
+```
+protocols:
+  aaveV3:
+    poolAddress: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
+  compoundLike:
+    moonwell:
+      comptroller: "0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180"
+      markets:
+        - underlying: "0x4200000000000000000000000000000000000006" # WETH
+          cToken: "0x..." # cWETH address
+        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" # USDC
+          cToken: "0x..." # cUSDC address
+    seamless:
+      comptroller: "0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180"
+      markets:
+        - underlying: "0x4200000000000000000000000000000000000006" # WETH
+          cToken: "0x..."
+        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" # USDC
+          cToken: "0x..."
+```
+
+Validation:
+- `ContractManager.validateConfig()` now validates these addresses. Deployment will fail early if they are missing or invalid.
+
+Usage in code:
+- LiquidationEngine reads protocol addresses via `ContractManager.getProtocolAddresses()` and encodes them into the liquidation payload passed to FlashExecutor.
+
+## Flash Executor Liquidation Entry Point
+
+FlashExecutor now supports a dedicated liquidation entry point with robust callbacks:
+
+- `executeLiquidationFlash(address flashPool, uint256 amount0, uint256 amount1, bytes liquidationData, bytes routeData)`
+- Operation mode is set internally to LIQUIDATION and handled in `uniswapV3FlashCallback`.
+- `LiquidationPayload` encodes protocol-specific data and is validated before use.
+
+Rollout checklist:
+- [ ] Update `config/contracts.yaml` with protocol addresses and optional compound-like market mappings
+- [ ] Ensure `contracts.yaml` is baked into deployment artifacts or mounted in runtime
+- [ ] Re-deploy/verify FlashExecutor as needed (ABI unchanged for arbitrage path)
+- [ ] Update ENV: `FLASH_EXECUTOR_ADDRESS`, `FLASH_POOL_ADDRESS`, `FLASH_POOL_TOKEN_IS_TOKEN0`
+
+
 ## Overview
 
 This guide covers deploying the Base MEV Platform in various environments, from local development to production.

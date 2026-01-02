@@ -14,7 +14,7 @@ export interface FlashbotsRelayOptions {
   wallet: ethers.Wallet;
   authSignerPrivateKey?: string | undefined;
   flashbotsRpcUrl?: string | undefined;
-  network?: 'mainnet' | 'goerli' | 'sepolia' | 'base' | undefined;
+  network?: 'mainnet' | 'goerli' | 'sepolia' | undefined;
 }
 
 export interface FlashbotsSubmissionResult {
@@ -45,9 +45,9 @@ export class FlashbotsRelay {
   constructor(options: FlashbotsRelayOptions) {
     this.connectionManager = options.connectionManager;
     this.wallet = options.wallet;
-    this.network = options.network || 'base';
+    this.network = options.network || 'mainnet';
 
-    // Flashbots RPC URLs by network (Base is not supported by Flashbots)
+    // Flashbots RPC URLs by network
     const flashbotsUrls: Record<string, string> = {
       mainnet: 'https://relay.flashbots.net',
       goerli: 'https://relay-goerli.flashbots.net',

@@ -729,11 +729,11 @@ export class MEVProtectionDetector extends EventEmitter {
     score -= slippageAnalysis.priceImpact * 2;
 
     // Reduce score based on protection strength
-    const maxProtectionLevel = Math.max(
-      ...protectionSignals.map(s =>
-        s.protectionLevel === 'premium' ? 0.9 : s.protectionLevel === 'advanced' ? 0.7 : 0.5
-      )
+    // Determine maximum protection level with empty-array guard
+    const levels = protectionSignals.map(s =>
+      s.protectionLevel === 'premium' ? 0.9 : s.protectionLevel === 'advanced' ? 0.7 : 0.5
     );
+    const maxProtectionLevel = levels.length > 0 ? Math.max(...levels) : 0;
     score -= maxProtectionLevel * 0.3;
 
     return Math.max(0, Math.min(1, score));

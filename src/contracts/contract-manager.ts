@@ -41,6 +41,18 @@ export interface NetworkConfig {
   blockExplorer: string;
 }
 
+export interface CompoundMarket {
+  underlying: string;
+  cToken: string;
+}
+export interface ProtocolAddresses {
+  aaveV3: { poolAddress: string };
+  compoundLike: {
+    moonwell: { comptroller: string; markets?: CompoundMarket[] };
+    seamless: { comptroller: string; markets?: CompoundMarket[] };
+  };
+}
+
 export interface ContractsYaml {
   contracts: {
     flashExecutor: ContractConfig;
@@ -50,6 +62,7 @@ export interface ContractsYaml {
     };
   };
   deployment: DeploymentConfig;
+  protocols: ProtocolAddresses;
   networks: {
     [key: string]: NetworkConfig;
   };
@@ -196,6 +209,13 @@ export class ContractManager {
   }
 
   /**
+   * Get protocol addresses
+   */
+  getProtocolAddresses(): ProtocolAddresses {
+    return this.config.protocols;
+  }
+
+  /**
    * Get network configuration
    */
   getNetworkConfig(network: string): NetworkConfig {
@@ -233,6 +253,16 @@ export class ContractManager {
   }
 
   /**
+   * Resolve cToken for underlying for a compound-like protocol
+   */
+  getCTokenFor(protocol: 'moonwell' | 'seamless', underlying: string): string | undefined {
+    const list = this.config.protocols.compoundLike[protocol]?.markets || [];
+    const key = underlying.toLowerCase();
+    const found = list.find(m => m.underlying.toLowerCase() === key);
+    return found?.cToken;
+  }
+
+  /**
    * Validate contract configuration
    */
   validateConfig(): boolean {
@@ -264,6 +294,29 @@ export class ContractManager {
       } catch (error) {
         logger.error('Invalid minimum profit format');
         return false;
+      }
+
+      // Validate protocol addresses
+      const protocols = this.config.protocols;
+      if (!protocols || !protocols.aaveV3 || !ethers.isAddress(protocols.aaveV3.poolAddress)) {
+        logger.error('Invalid Aave V3 pool address in protocols config');
+        return false;
+      }
+      const moonwell = protocols.compoundLike?.moonwell;
+      const seamless = protocols.compoundLike?.seamless;
+      for (const entry of [moonwell, seamless]) {
+        if (!entry || !ethers.isAddress(entry.comptroller)) {
+          logger.error('Invalid Compound-like comptroller address in protocols config');
+          return false;
+        }
+        if (entry.markets) {
+          for (const m of entry.markets) {
+            if (!ethers.isAddress(m.underlying) || !ethers.isAddress(m.cToken)) {
+              logger.error('Invalid market mapping (underlying/cToken) in protocols config');
+              return false;
+            }
+          }
+        }
       }
 
       logger.info('Contract configuration validation passed');

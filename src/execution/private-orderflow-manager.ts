@@ -119,6 +119,8 @@ export interface ComplianceValidation {
 }
 
 export class PrivateOrderflowManager extends EventEmitter {
+  private signer: ethers.Wallet | null = null;
+  private monitoringInterval: NodeJS.Timeout | null = null;
   private readonly logger = createComponentLogger('private-orderflow-manager');
   private readonly config: PrivateOrderflowManagerConfig;
   private readonly provider: ethers.Provider;
@@ -145,6 +147,13 @@ export class PrivateOrderflowManager extends EventEmitter {
     this.config = config;
 
     if (this.config.enabled) {
+      // Initialize signer once from environment
+      const pk = process.env['EXECUTION_PRIVATE_KEY'];
+      if (!pk || pk.trim() === '') {
+        throw new Error('EXECUTION_PRIVATE_KEY not configured');
+      }
+      this.signer = new ethers.Wallet(pk, this.provider);
+
       this.initializeOrderflowSources();
       this.startOrderflowMonitoring();
     }
@@ -679,7 +688,10 @@ export class PrivateOrderflowManager extends EventEmitter {
 
   private startOrderflowMonitoring(): void {
     // Monitor for flow separation violations
-    setInterval(async () => {
+    if (this.monitoringInterval) {
+      clearInterval(this.monitoringInterval);
+    }
+    this.monitoringInterval = setInterval(async () => {
       await this.maintainFlowSeparation();
     }, 30000); // Every 30 seconds
 
@@ -761,6 +773,10 @@ export class PrivateOrderflowManager extends EventEmitter {
    * Stop private orderflow manager
    */
   stop(): void {
+    if (this.monitoringInterval) {
+      clearInterval(this.monitoringInterval);
+      this.monitoringInterval = null;
+    }
     this.privateOrders.clear();
     this.publicOrders.clear();
     this.complianceValidations.clear();
@@ -841,13 +857,10 @@ export class PrivateOrderflowManager extends EventEmitter {
     gasLimit: bigint;
   }): Promise<string> {
     try {
-      // Get signer from private key
-      const privateKey = process.env['EXECUTION_PRIVATE_KEY'];
-      if (!privateKey) {
-        throw new Error('EXECUTION_PRIVATE_KEY not configured');
+      // Use pre-initialized signer
+      if (!this.signer) {
+        throw new Error('Signer not initialized');
       }
-
-      const wallet = new ethers.Wallet(privateKey, this.provider);
 
       // Get current gas price
       const feeData = await this.provider.getFeeData();
@@ -859,7 +872,7 @@ export class PrivateOrderflowManager extends EventEmitter {
         type: 2,
       };
 
-      const txResponse = await wallet.sendTransaction(tx);
+      const txResponse = await this.signer.sendTransaction(tx);
       return txResponse.hash;
     } catch (error) {
       this.logger.error('Transaction submission failed', {
@@ -920,11 +933,6 @@ export class PrivateOrderflowManager extends EventEmitter {
       const profit = estimatedOutput > order.amountIn ? estimatedOutput - order.amountIn : 0n;
 
       return profit;
-      const slippageRate = 0.001 + Math.random() * 0.004; // 0.1% to 0.5% slippage
-      const actualAmountOut =
-        (order.minAmountOut * BigInt(Math.floor((1 + slippageRate) * 1000))) / 1000n;
-
-      return actualAmountOut;
     } catch (error) {
       this.logger.warn('Failed to get actual amount out', {
         orderId: order.id,
