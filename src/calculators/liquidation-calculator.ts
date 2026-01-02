@@ -5,8 +5,12 @@
  * different lending protocols on Base.
  */
 
+import { ethers } from 'ethers';
 import { createComponentLogger } from '../utils/logger';
 import { LiquidationOpportunity, LendingProtocol } from '../scanner/lending-monitor';
+import { RpcConnectionManager } from '../rpc/connection-manager';
+import { ChainlinkPriceOracle } from '../oracles/chainlink-oracle';
+import { Address } from '../types/common';
 
 // Liquidation calculation result
 export interface LiquidationCalculationResult {
@@ -52,6 +56,8 @@ export interface LiquidationCalculatorOptions {
   flashLoanFeeRate: number; // Flash loan fee rate (e.g., 0.0009 = 0.09%)
   minProfitMargin: number; // Minimum profit margin required (e.g., 0.1 = 10%)
   riskToleranceScore: number; // Maximum acceptable risk score (0-100)
+  connectionManager: RpcConnectionManager;
+  priceOracle: ChainlinkPriceOracle;
 }
 
 /**
@@ -60,9 +66,13 @@ export interface LiquidationCalculatorOptions {
 export class LiquidationProfitCalculator {
   private readonly logger = createComponentLogger('liquidation-calculator');
   private readonly options: LiquidationCalculatorOptions;
+  private readonly connectionManager: RpcConnectionManager;
+  private readonly priceOracle: ChainlinkPriceOracle;
 
   constructor(options: LiquidationCalculatorOptions) {
     this.options = options;
+    this.connectionManager = options.connectionManager;
+    this.priceOracle = options.priceOracle;
 
     this.logger.info('Liquidation calculator initialized', {
       maxSlippage: `${(options.maxSlippage * 100).toFixed(2)}%`,
@@ -169,18 +179,72 @@ export class LiquidationProfitCalculator {
    * Calculate optimal liquidation amount
    */
   private calculateOptimalLiquidationAmount(opportunity: LiquidationOpportunity): bigint {
-    // For most protocols, we can liquidate up to 50% of the debt when health factor < 1
-    // This is a simplified calculation - in practice, each protocol has specific rules
+    // Get protocol-specific liquidation rules
+    const protocolRules = this.getProtocolLiquidationRules(opportunity.protocol);
 
-    const maxLiquidationPercentage = 0.5; // 50%
-    const optimalAmount = BigInt(
-      Math.floor(Number(opportunity.debtAmount) * maxLiquidationPercentage)
-    );
+    // Calculate maximum liquidatable amount based on protocol rules
+    let maxLiquidationAmount: bigint;
+
+    if (opportunity.healthFactor < 0.95) {
+      // Very unhealthy position - can liquidate more
+      maxLiquidationAmount = BigInt(
+        Math.floor(Number(opportunity.debtAmount) * protocolRules.maxLiquidationRatio)
+      );
+    } else if (opportunity.healthFactor < 1.0) {
+      // Slightly unhealthy - standard liquidation
+      maxLiquidationAmount = BigInt(
+        Math.floor(Number(opportunity.debtAmount) * protocolRules.standardLiquidationRatio)
+      );
+    } else {
+      // Edge case - minimal liquidation
+      maxLiquidationAmount = BigInt(Math.floor(Number(opportunity.debtAmount) * 0.1));
+    }
 
     // Don't exceed the maximum liquidation amount specified by the protocol
-    return optimalAmount > opportunity.maxLiquidationAmount
-      ? opportunity.maxLiquidationAmount
-      : optimalAmount;
+    const finalAmount =
+      maxLiquidationAmount > opportunity.maxLiquidationAmount
+        ? opportunity.maxLiquidationAmount
+        : maxLiquidationAmount;
+
+    // Ensure minimum viable liquidation amount (gas costs consideration)
+    const minViableAmount = ethers.parseUnits('100', 6); // $100 minimum
+    return finalAmount > minViableAmount ? finalAmount : minViableAmount;
+  }
+
+  /**
+   * Get protocol-specific liquidation rules
+   */
+  private getProtocolLiquidationRules(protocol: string): {
+    maxLiquidationRatio: number;
+    standardLiquidationRatio: number;
+    liquidationBonus: number;
+  } {
+    switch (protocol.toLowerCase()) {
+      case 'moonwell':
+        return {
+          maxLiquidationRatio: 0.5, // 50% max
+          standardLiquidationRatio: 0.5,
+          liquidationBonus: 0.08, // 8% bonus
+        };
+      case 'aave_v3':
+        return {
+          maxLiquidationRatio: 0.5, // 50% max
+          standardLiquidationRatio: 0.5,
+          liquidationBonus: 0.05, // 5% bonus
+        };
+      case 'seamless':
+        return {
+          maxLiquidationRatio: 0.5, // 50% max
+          standardLiquidationRatio: 0.5,
+          liquidationBonus: 0.05, // 5% bonus
+        };
+      default:
+        return {
+          maxLiquidationRatio: 0.5, // 50% max (conservative default)
+          standardLiquidationRatio: 0.5,
+          liquidationBonus: 0.05, // 5% bonus
+        };
+    }
   }
 
   /**
@@ -190,18 +254,88 @@ export class LiquidationProfitCalculator {
     opportunity: LiquidationOpportunity,
     liquidationAmount: bigint
   ): Promise<{ collateralReceived: bigint; liquidationBonus: bigint }> {
-    // Simplified calculation - in practice, this would query price oracles
-    // and use protocol-specific liquidation formulas
+    try {
+      // Get real prices from price oracle
+      const collateralPriceUsd = await this.priceOracle.getTokenUsdPrice(
+        opportunity.collateralAsset as Address
+      );
+      const debtPriceUsd = await this.priceOracle.getTokenUsdPrice(
+        opportunity.debtAsset as Address
+      );
 
-    // Assume 1:1 USD value for simplification (would use real price feeds in production)
-    const collateralValue = liquidationAmount;
+      if (collateralPriceUsd <= 0 || debtPriceUsd <= 0) {
+        throw new Error('Invalid token prices from oracle');
+      }
 
-    // Apply liquidation bonus (e.g., 5% bonus means liquidator gets 105% of debt value in collateral)
-    const bonusMultiplier = 1 + opportunity.liquidationBonus;
-    const collateralReceived = BigInt(Math.floor(Number(collateralValue) * bonusMultiplier));
-    const liquidationBonus = collateralReceived - liquidationAmount;
+      // Calculate USD value of debt being liquidated
+      const debtTokenDecimals = await this.getTokenDecimals(opportunity.debtAsset as Address);
+      const liquidationAmountUsd =
+        (Number(liquidationAmount) / Math.pow(10, debtTokenDecimals)) * debtPriceUsd;
 
-    return { collateralReceived, liquidationBonus };
+      // Apply liquidation bonus
+      const protocolRules = this.getProtocolLiquidationRules(opportunity.protocol);
+      const bonusMultiplier = 1 + protocolRules.liquidationBonus;
+      const collateralValueUsd = liquidationAmountUsd * bonusMultiplier;
+
+      // Convert to collateral token amount
+      const collateralTokenDecimals = await this.getTokenDecimals(
+        opportunity.collateralAsset as Address
+      );
+      const collateralAmount = collateralValueUsd / collateralPriceUsd;
+      const collateralReceived = BigInt(
+        Math.floor(collateralAmount * Math.pow(10, collateralTokenDecimals))
+      );
+
+      // Calculate liquidation bonus in collateral tokens
+      const bonusUsd = liquidationAmountUsd * protocolRules.liquidationBonus;
+      const bonusAmount = bonusUsd / collateralPriceUsd;
+      const liquidationBonus = BigInt(
+        Math.floor(bonusAmount * Math.pow(10, collateralTokenDecimals))
+      );
+
+      this.logger.debug('Calculated collateral received', {
+        liquidationAmount: liquidationAmount.toString(),
+        liquidationAmountUsd,
+        collateralValueUsd,
+        collateralReceived: collateralReceived.toString(),
+        liquidationBonus: liquidationBonus.toString(),
+        collateralPrice: collateralPriceUsd,
+        debtPrice: debtPriceUsd,
+        bonusMultiplier,
+      });
+
+      return { collateralReceived, liquidationBonus };
+    } catch (error) {
+      this.logger.warn('Failed to calculate real collateral received, using fallback', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      // Fallback to simplified calculation
+      const bonusMultiplier = 1 + opportunity.liquidationBonus;
+      const collateralReceived = BigInt(Math.floor(Number(liquidationAmount) * bonusMultiplier));
+      const liquidationBonus = collateralReceived - liquidationAmount;
+
+      return { collateralReceived, liquidationBonus };
+    }
+  }
+
+  /**
+   * Get token decimals from contract
+   */
+  private async getTokenDecimals(tokenAddress: Address): Promise<number> {
+    try {
+      const provider = this.connectionManager.getProvider();
+      const tokenContract = new ethers.Contract(
+        tokenAddress,
+        ['function decimals() view returns (uint8)'],
+        provider
+      );
+
+      return await tokenContract['decimals']!();
+    } catch (error) {
+      // Fallback to 18 decimals for most tokens
+      return 18;
+    }
   }
 
   /**

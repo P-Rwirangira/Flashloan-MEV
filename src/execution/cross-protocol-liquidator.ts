@@ -853,17 +853,17 @@ export class CrossProtocolLiquidator extends EventEmitter {
   /**
    * Get token price in USD (simplified implementation)
    */
+  private priceOracle?: import('../oracles/chainlink-oracle').ChainlinkPriceOracleImpl;
+
   private async getTokenPriceUsd(tokenAddress: Address): Promise<number> {
     try {
-      // In production, this would use a price oracle like Chainlink
-      // For now, return mock prices based on common Base tokens
-      const mockPrices: Record<string, number> = {
-        '0x4200000000000000000000000000000000000006': 2500, // WETH
-        '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913': 1, // USDC
-        '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb': 25000, // DAI (mock high price)
-      };
-
-      return mockPrices[tokenAddress.toLowerCase()] || 1; // Default to $1
+      if (!this.priceOracle) {
+        // Lazily initialize oracle using this.provider via a minimal connection manager
+        const connectionManager = { getProvider: () => this.provider } as any;
+        const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+        this.priceOracle = new ChainlinkPriceOracleImpl(connectionManager);
+      }
+      return await this.priceOracle.getTokenUsdPrice(tokenAddress);
     } catch (error) {
       this.logger.error('Failed to get token price', {
         tokenAddress,

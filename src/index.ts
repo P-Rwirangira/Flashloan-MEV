@@ -20,9 +20,9 @@ import { RelayProvider } from './bundler/private-relay';
 import { LendingProtocolMonitor } from './scanner/lending-monitor';
 import { StablePoolMonitor } from './scanner/stable-pool-monitor';
 import { MempoolMonitor } from './scanner/mempool-monitor';
-import { RealTransactionValidator } from './simulator/real-transaction-validator';
-import { RealStablePoolRebalancingCalculator } from './simulator/real-stable-pool-calculator';
-import { LiquidationProfitCalculator } from './simulator/liquidation-calculator';
+import { RealTransactionValidator } from './validation/real-transaction-validator';
+import { RealStablePoolRebalancingCalculator } from './calculators/real-stable-pool-calculator';
+import { LiquidationProfitCalculator } from './calculators/liquidation-calculator';
 import { ExecutionOrchestrator } from './execution/execution-orchestrator';
 import { FlashLoanArbitrageEngine } from './execution/flash-loan-arbitrage-engine';
 import { LiquidationEngine } from './execution/liquidation-engine';
@@ -504,6 +504,8 @@ export class BaseMEVPlatform extends EventEmitter {
         flashLoanFeeRate: 0.0009,
         minProfitMargin: 0.1,
         riskToleranceScore: 70,
+        connectionManager: this.connectionManager,
+        priceOracle: this.chainlinkOracle,
       });
 
       // Set up liquidation event handlers

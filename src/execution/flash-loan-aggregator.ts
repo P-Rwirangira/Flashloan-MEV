@@ -177,11 +177,36 @@ export class FlashLoanAggregator extends EventEmitter {
    */
   private async updateProviderCapacities(): Promise<void> {
     try {
+      const erc20Abi = ['function balanceOf(address) view returns (uint256)'];
       for (const [_providerName, provider] of this.providers) {
-        // In production, query actual protocol contracts for capacity
-        const mockCapacityUpdate = (provider.maxCapacity * 8n) / 10n;
-        provider.availableCapacity = mockCapacityUpdate;
-        provider.lastUpdated = Date.now();
+        try {
+          // Approximate capacity as sum of balances of key supported tokens held by provider
+          let capacity = 0n;
+          for (const token of provider.supportedTokens) {
+            try {
+              const tokenContract = new ethers.Contract(
+                token,
+                erc20Abi,
+                (this as any).provider || ethers.getDefaultProvider()
+              );
+              const balanceOf = (tokenContract as any)['balanceOf'] as
+                | ((addr: string) => Promise<any>)
+                | undefined;
+              if (balanceOf) {
+                const bal = await balanceOf(provider.contractAddress);
+                capacity += BigInt(bal?.toString?.() ?? '0');
+              }
+            } catch (_) {
+              continue;
+            }
+          }
+          // Fallback to 80% of max if we couldn't query anything
+          provider.availableCapacity = capacity > 0n ? capacity : (provider.maxCapacity * 8n) / 10n;
+          provider.lastUpdated = Date.now();
+        } catch (innerError) {
+          provider.availableCapacity = (provider.maxCapacity * 8n) / 10n;
+          provider.lastUpdated = Date.now();
+        }
       }
     } catch (error) {
       this.logger.error('Failed to update provider capacities', {

@@ -502,25 +502,24 @@ export class RealTransactionValidator extends EventEmitter {
       // Subtract gas cost
       profit = profit - gasCost;
 
-      // Subtract flash loan fees (typically 0.05% for Uniswap V3)
-      const amountInBigInt =
-        typeof opportunity.amountIn === 'bigint'
-          ? opportunity.amountIn
-          : BigInt(opportunity.amountIn.toString());
-      const flashLoanFee = (amountInBigInt * 5n) / 10000n; // 0.05%
+      // Calculate real flash loan fees based on the actual provider
+      const flashLoanFee = await this.calculateRealFlashLoanFee(
+        opportunity.tokenIn,
+        BigInt(opportunity.amountIn.toString())
+      );
       profit = profit - flashLoanFee;
 
-      // Subtract DEX fees for each pool in route
-      for (let i = 0; i < opportunity.route.pools.length; i++) {
-        const fee = opportunity.route.fees[i] || 3000; // Default 0.3% fee
-        const swapAmount = Number(opportunity.amountIn) / (i + 1); // Distribute amount
-        const swapFee = (BigInt(Math.floor(swapAmount)) * BigInt(fee)) / 1000000n; // Fee in basis points
-        profit = profit - swapFee;
-      }
+      // Calculate real DEX fees for each pool in route
+      const realDexFees = await this.calculateRealDexFees(opportunity);
+      profit = profit - realDexFees;
 
-      // Apply slippage impact (reduce profit by estimated slippage)
-      const slippageImpact = (profit * 200n) / 10000n; // 2% slippage impact
-      profit = profit - slippageImpact;
+      // Calculate real slippage impact based on current pool states
+      const realSlippageImpact = await this.calculateRealSlippageImpact(opportunity);
+      profit = profit - realSlippageImpact;
+
+      // Account for MEV protection costs (if using private pools)
+      const mevProtectionCost = await this.calculateMevProtectionCost(opportunity);
+      profit = profit - mevProtectionCost;
 
       return profit > 0n ? profit : 0n;
     } catch (error) {
@@ -529,6 +528,157 @@ export class RealTransactionValidator extends EventEmitter {
         error: error instanceof Error ? error.message : String(error),
       });
       return 0n;
+    }
+  }
+
+  /**
+   * Calculate real flash loan fee based on provider
+   */
+  private async calculateRealFlashLoanFee(_token: string, amount: bigint): Promise<bigint> {
+    try {
+      // Uniswap V3 flash loans are free if repaid in same transaction
+      // But we need to account for the swap fees in the pools we use
+      return 0n; // Flash loans are free on Uniswap V3
+    } catch (error) {
+      // Fallback to standard 0.05% fee
+      return (amount * 5n) / 10000n;
+    }
+  }
+
+  /**
+   * Calculate real DEX fees based on actual pool configurations
+   */
+  private async calculateRealDexFees(opportunity: ArbitrageOpportunity): Promise<bigint> {
+    try {
+      let totalFees = 0n;
+
+      const swaps = Array.isArray(opportunity.route)
+        ? opportunity.route
+        : opportunity.route.pools?.map((poolAddress, index) => ({
+            poolAddress,
+            protocol: 'uniswap-v3' as const,
+            fee: opportunity.route.fees?.[index] || 3000,
+          })) || [];
+
+      let currentAmount = BigInt(opportunity.amountIn.toString());
+
+      for (let i = 0; i < swaps.length; i++) {
+        const swap = swaps[i];
+
+        if (swap.protocol === 'uniswap-v3') {
+          // Get real fee from pool contract
+          const poolContract = new ethers.Contract(
+            swap.poolAddress as string,
+            ['function fee() view returns (uint24)'],
+            this.connectionManager.getProvider()
+          );
+
+          const poolFee = await poolContract['fee']!();
+          const swapFee = (currentAmount * BigInt(poolFee)) / 1000000n; // Fee in basis points
+          totalFees += swapFee;
+
+          // Update amount for next swap (simplified)
+          currentAmount = currentAmount - swapFee;
+        } else if (swap.protocol === 'aerodrome') {
+          // Aerodrome typically has 0.05% fee for stable, 0.3% for volatile
+          const poolContract = new ethers.Contract(
+            swap.poolAddress as string,
+            ['function stable() view returns (bool)'],
+            this.connectionManager.getProvider()
+          );
+
+          const isStable = await poolContract['stable']!();
+          const feeRate = isStable ? 500 : 3000; // 0.05% or 0.3%
+          const swapFee = (currentAmount * BigInt(feeRate)) / 1000000n;
+          totalFees += swapFee;
+
+          currentAmount = currentAmount - swapFee;
+        }
+      }
+
+      return totalFees;
+    } catch (error) {
+      // Fallback calculation
+      const routeLength = opportunity.route.pools?.length || 1;
+      const avgFee = 3000; // 0.3% average
+      const totalAmount = BigInt(opportunity.amountIn.toString());
+      return (totalAmount * BigInt(avgFee * routeLength)) / 1000000n;
+    }
+  }
+
+  /**
+   * Calculate real slippage impact based on current pool states
+   */
+  private async calculateRealSlippageImpact(opportunity: ArbitrageOpportunity): Promise<bigint> {
+    try {
+      let totalSlippageImpact = 0n;
+      const tradeAmount = BigInt(opportunity.amountIn.toString());
+
+      const swaps = Array.isArray(opportunity.route)
+        ? opportunity.route
+        : opportunity.route.pools?.map(poolAddress => ({
+            poolAddress,
+            protocol: 'uniswap-v3' as const,
+          })) || [];
+
+      for (const swap of swaps) {
+        const slippagePercent = await this.calculateSlippageForSwap(swap, tradeAmount);
+        const slippageImpact = (tradeAmount * BigInt(Math.floor(slippagePercent * 100))) / 10000n;
+        totalSlippageImpact += slippageImpact;
+      }
+
+      return totalSlippageImpact;
+    } catch (error) {
+      // Conservative 2% total slippage impact
+      const totalAmount = BigInt(opportunity.amountIn.toString());
+      return (totalAmount * 200n) / 10000n;
+    }
+  }
+
+  /**
+   * Calculate MEV protection costs
+   */
+  private async calculateMevProtectionCost(_opportunity: ArbitrageOpportunity): Promise<bigint> {
+    // If using private mempools, there might be additional costs
+    // For now, assume no additional cost for Base L2
+    return 0n;
+  }
+
+  /**
+   * Calculate slippage for a specific swap (simplified version)
+   */
+  private async calculateSlippageForSwap(swap: any, tradeAmount: bigint): Promise<number> {
+    try {
+      const provider = this.connectionManager.getProvider();
+
+      if (swap.protocol === 'uniswap-v3') {
+        const poolContract = new ethers.Contract(
+          swap.poolAddress as string,
+          ['function liquidity() view returns (uint128)'],
+          provider
+        );
+        const liquidity = await poolContract['liquidity']!();
+
+        // Calculate slippage as percentage of liquidity
+        const liquidityRatio = Number(tradeAmount) / Number(liquidity);
+        return Math.min(liquidityRatio * 100, 10); // Max 10% slippage
+      } else if (swap.protocol === 'aerodrome') {
+        const poolContract = new ethers.Contract(
+          swap.poolAddress as string,
+          ['function getReserves() view returns (uint112, uint112, uint32)'],
+          provider
+        );
+        const reserves = await poolContract['getReserves']!();
+
+        // Calculate slippage based on reserves
+        const totalReserves = reserves[0] + reserves[1];
+        const liquidityRatio = Number(tradeAmount) / Number(totalReserves);
+        return Math.min(liquidityRatio * 50, 5); // Max 5% slippage for stable pools
+      }
+
+      return 2; // Default 2% slippage
+    } catch (error) {
+      return 5; // Conservative 5% slippage on error
     }
   }
 

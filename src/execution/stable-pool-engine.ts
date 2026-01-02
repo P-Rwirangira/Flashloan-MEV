@@ -172,8 +172,9 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
         return null;
       }
 
-      // Calculate expected output using stable swap formula
+      // Calculate expected output using pool getAmountOut for real pricing
       const expectedAmountOut = await this.calculateStableSwapOutput(
+        opportunity.poolAddress,
         poolState,
         tokenIn,
         tokenOut,
@@ -387,13 +388,20 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
       }
 
       // Validate profitability at this size
+      const expectedAmountOut = await this.calculateStableSwapOutput(
+        opportunity.poolAddress,
+        poolState,
+        opportunity.token0,
+        opportunity.token1,
+        optimalSize
+      );
       const mockTrade: RebalancingTrade = {
         poolAddress: opportunity.poolAddress,
         tokenIn: opportunity.token0,
         tokenOut: opportunity.token1,
         amountIn: optimalSize,
-        expectedAmountOut: optimalSize, // Simplified
-        priceImpact: 0.01,
+        expectedAmountOut,
+        priceImpact: await this.calculatePriceImpact(poolState, optimalSize, expectedAmountOut),
         tradingFee: (optimalSize * BigInt(poolState.fee)) / 10000n,
         expectedIncentives: await this.estimateIncentiveRewards(opportunity, optimalSize),
         gasEstimate: 300000n,
@@ -429,43 +437,46 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
    * Calculate stable swap output using curve formula
    */
   private async calculateStableSwapOutput(
+    poolAddress: Address,
     poolState: StablePoolState,
     tokenIn: Address,
-    tokenOut: Address,
+    _tokenOut: Address,
     amountIn: bigint
   ): Promise<bigint> {
     try {
-      // Simplified stable swap calculation
-      // In production, this would use the actual StableSwap invariant formula
-
-      const isToken0In = tokenIn === poolState.token0;
-      const reserveIn = isToken0In ? poolState.reserve0 : poolState.reserve1;
-      const reserveOut = isToken0In ? poolState.reserve1 : poolState.reserve0;
-
-      // Apply stable swap formula (simplified)
-      const k = reserveIn * reserveOut;
-      const newReserveIn = reserveIn + amountIn;
-      const newReserveOut = k / newReserveIn;
-      const amountOut = reserveOut - newReserveOut;
-
-      // Apply trading fee
-      const feeAmount = (amountOut * BigInt(poolState.fee)) / 10000n;
-      const amountOutAfterFee = amountOut - feeAmount;
-
-      this.logger.debug('Stable swap calculation', {
-        tokenIn,
-        tokenOut,
-        amountIn: amountIn.toString(),
-        amountOut: amountOutAfterFee.toString(),
-        feeAmount: feeAmount.toString(),
-      });
-
-      return amountOutAfterFee;
+      // Use Aerodrome pool's getAmountOut to compute expected output
+      const provider = this.transactionManager.getProvider();
+      const poolAbi = [
+        'function getAmountOut(uint256 amountIn, address tokenIn) external view returns (uint256)',
+      ];
+      const poolContract = new ethers.Contract(poolAddress as string, poolAbi, provider);
+      const getAmountOut = (poolContract as any)['getAmountOut'] as
+        | ((amountIn: bigint, tokenIn: string) => Promise<any>)
+        | undefined;
+      if (!getAmountOut) {
+        throw new Error('getAmountOut not available');
+      }
+      const amountOut = await getAmountOut(amountIn, tokenIn);
+      return BigInt(amountOut?.toString?.() ?? '0');
     } catch (error) {
-      this.logger.error('Failed to calculate stable swap output', {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      return 0n;
+      // Fallback to constant product approximation if getAmountOut is unavailable
+      try {
+        const isToken0In = tokenIn === poolState.token0;
+        const reserveIn = isToken0In ? poolState.reserve0 : poolState.reserve1;
+        const reserveOut = isToken0In ? poolState.reserve1 : poolState.reserve0;
+        const k = reserveIn * reserveOut;
+        const newReserveIn = reserveIn + amountIn;
+        const newReserveOut = k / newReserveIn;
+        const amountOut = reserveOut - newReserveOut;
+        const feeAmount = (amountOut * BigInt(poolState.fee)) / 10000n;
+        const amountOutAfterFee = amountOut - feeAmount;
+        return amountOutAfterFee > 0n ? amountOutAfterFee : 0n;
+      } catch (_) {
+        this.logger.error('Failed to calculate stable swap output', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return 0n;
+      }
     }
   }
 

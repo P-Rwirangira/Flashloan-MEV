@@ -12,7 +12,7 @@ import { Address } from '../types/common';
 import { OpportunityStateMachine } from './opportunity-state-machine';
 import { FlashLoanManager } from './flash-loan-manager';
 import { TransactionLifecycleManager } from './transaction-lifecycle-manager';
-import { RealTransactionValidator } from '../simulator/real-transaction-validator';
+import { RealTransactionValidator } from '../validation/real-transaction-validator';
 import { OpportunityState } from '../types/execution-state';
 import {
   BaseOpportunity,

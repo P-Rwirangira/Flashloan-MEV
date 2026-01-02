@@ -154,10 +154,12 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
       // Calculate maximum profitable liquidation based on liquidation bonus
       const liquidationBonusRate = opportunity.liquidationBonus;
 
-      // Convert USD threshold to ETH amount properly
-      // TODO: In production, fetch current ETH/USD price from price oracle
-      const ethPriceUsd = 2500; // Placeholder - should be fetched from price oracle
-      const minProfitEth = this.config.minProfitThresholdUsd / ethPriceUsd;
+      // Convert USD threshold to ETH amount using Chainlink oracle
+      const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+      const connectionManager = { getProvider: () => this.transactionManager.getProvider() } as any;
+      const oracle = new ChainlinkPriceOracleImpl(connectionManager);
+      const ethPriceUsd = await oracle.getEthUsdPrice();
+      const minProfitEth = this.config.minProfitThresholdUsd / Math.max(ethPriceUsd, 1e-6);
       const minProfitThreshold = ethers.parseEther(minProfitEth.toString());
 
       this.logger.debug('Liquidation parameters', {
@@ -548,19 +550,44 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
     opportunity: LiquidationOpportunity,
     route: LiquidationRoute
   ): string {
-    // This would encode the liquidation call for the protocol contract
-    // For now, return a placeholder
-    const abiCoder = new ethers.AbiCoder();
-
+    // Encode call data for protocol-specific liquidation
     this.logger.debug('Encoding direct liquidation data', {
       opportunityId: opportunity.id,
       routeSteps: route.steps.length,
       borrower: opportunity.borrower,
+      protocol: opportunity.protocol,
     });
 
-    return abiCoder.encode(
-      ['address', 'address', 'uint256'],
-      [opportunity.borrower, opportunity.collateralToken, opportunity.debtAmount]
+    if (opportunity.protocol === 'aave-v3') {
+      // Aave V3 liquidationCall(address collateral,address debt,address user,uint256 debtToCover,bool receiveAToken)
+      const iface = new ethers.Interface([
+        'function liquidationCall(address collateral,address debt,address user,uint256 debtToCover,bool receiveAToken)',
+      ]);
+      return iface.encodeFunctionData('liquidationCall', [
+        opportunity.collateralAsset,
+        opportunity.debtAsset,
+        opportunity.borrower,
+        route.flashLoanAmount,
+        false,
+      ]);
+    }
+
+    // For Compound-like protocols (Moonwell/Seamless), liquidateBorrow on cToken
+    if (opportunity.protocol === 'moonwell' || opportunity.protocol === 'seamless') {
+      const iface = new ethers.Interface([
+        'function liquidateBorrow(address borrower,uint256 repayAmount,address cTokenCollateral)',
+      ]);
+      // Here we assume collateralAsset is cTokenCollateral and debtAsset is cToken of debt
+      return iface.encodeFunctionData('liquidateBorrow', [
+        opportunity.borrower,
+        route.flashLoanAmount,
+        opportunity.collateralAsset,
+      ]);
+    }
+
+    // Default: encode no-op to prevent execution
+    throw new Error(
+      `Unsupported protocol for direct liquidation encoding: ${opportunity.protocol}`
     );
   }
 
@@ -571,14 +598,11 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
     opportunity: LiquidationOpportunity,
     route: LiquidationRoute
   ): Promise<bigint> {
-    // In production, this would:
-    // 1. Get the actual transaction receipt
-    // 2. Calculate token balances before/after
-    // 3. Account for gas costs and fees
-    // 4. Return net profit
-
-    // For now, return estimated profit minus gas costs
-    const gasCost = BigInt(200000) * BigInt(50e9); // 200k gas * 50 gwei gas price
+    // In production, fetch receipt and compute exact PnL; here estimate using real gas price
+    const provider = this.transactionManager.getProvider();
+    const feeData = await provider.getFeeData();
+    const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || 20_000_000_000n;
+    const gasCost = BigInt(route.totalGasEstimate) * gasPrice;
     const estimatedProfit = opportunity.estimatedProfit;
 
     this.logger.debug('Calculating liquidation profit', {
@@ -629,9 +653,11 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
       // Estimate flash loan fees (0.05% for Uniswap V3)
       const flashLoanFee = (liquidationSize * 5n) / 10000n;
 
-      // Estimate gas costs (approximate)
-      const gasPrice = 20000000000n; // 20 gwei
-      const gasLimit = 450000n; // Total gas for liquidation
+      // Estimate gas costs using current network conditions
+      const provider = this.transactionManager.getProvider();
+      const feeData = await provider.getFeeData();
+      const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || 20_000_000_000n;
+      const gasLimit = 450000n; // Estimated total gas for liquidation
       const gasCost = gasPrice * gasLimit;
 
       // Estimate slippage costs (1% of liquidation size)
