@@ -587,7 +587,7 @@ export class BaseMEVPlatform extends EventEmitter {
       this.platformLogger.info('Initializing Execution Engine');
 
       // Create signer from private key (in production, use secure key management)
-      const privateKey = process.env['EXECUTION_PRIVATE_KEY'];
+      const privateKey = process.env['EXECUTION_PRIVATE_KEY'] || process.env['PRIVATE_KEY'];
       if (!privateKey) {
         this.platformLogger.warn('No execution private key provided, execution engine disabled');
         // Set flag but continue with other components

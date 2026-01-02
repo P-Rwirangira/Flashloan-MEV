@@ -1,123 +1,220 @@
 /**
- * OracleAdapter
+ * Oracle Adapter
  *
- * Provides cached, timeout-backed access to ETH/USD and token/USD prices.
- * Wraps the existing ChainlinkPriceOracleImpl while adding:
- * - In-memory TTL cache (default 60s)
- * - Graceful fallbacks to last-good values (stale window configurable)
- * - Timeouts on underlying calls
+ * Unified interface for price feeds with fallback mechanisms
  */
 
-import { ethers } from 'ethers';
+import { Address } from '../types/common';
+import { createComponentLogger } from '../utils/logger';
+import { ChainlinkPriceOracleImpl } from './chainlink-oracle';
 
-// Lazy import to avoid circular deps on module load
-async function getChainlinkImpl() {
-  const mod = await import('./chainlink-oracle');
-  return mod.ChainlinkPriceOracleImpl as any;
+export interface PriceData {
+  price: number;
+  timestamp: number;
+  source: string;
+  confidence: number; // 0-1 scale
 }
 
-export interface ProviderLike {
-  getProvider: () => ethers.Provider;
+export interface OracleConfig {
+  chainlinkEnabled: boolean;
+  fallbackApiEnabled: boolean;
+  cacheTimeMs: number;
+  maxPriceAge: number;
+  priceDeviationThreshold: number; // Maximum allowed deviation between sources
 }
 
-export interface OracleAdapterOptions {
-  ttlMs?: number; // cache TTL for fresh values
-  staleWindowMs?: number; // allow serving stale values up to this window
-  timeoutMs?: number; // timeout for underlying oracle calls
-}
-
-type CacheEntry = { value: number; ts: number };
-
+/**
+ * Oracle Adapter with multiple price sources and fallback
+ */
 export class OracleAdapter {
-  private readonly providerLike: ProviderLike;
-  private readonly ttlMs: number;
-  private readonly staleWindowMs: number;
-  private readonly timeoutMs: number;
-  private readonly cache = new Map<string, CacheEntry>();
+  private readonly logger = createComponentLogger('oracle-adapter');
+  private readonly chainlinkOracle: ChainlinkPriceOracleImpl;
+  private readonly config: OracleConfig;
 
-  constructor(providerLike: ProviderLike, opts?: OracleAdapterOptions) {
-    this.providerLike = providerLike;
-    this.ttlMs = opts?.ttlMs ?? 60_000; // 60s
-    this.staleWindowMs = opts?.staleWindowMs ?? 5 * 60_000; // 5m
-    this.timeoutMs = opts?.timeoutMs ?? 3_000; // 3s
+  // Price cache
+  private priceCache = new Map<string, PriceData>();
+
+  constructor(connectionManager: any, config: Partial<OracleConfig> = {}) {
+    this.config = {
+      chainlinkEnabled: config.chainlinkEnabled ?? true,
+      fallbackApiEnabled: config.fallbackApiEnabled ?? true,
+      cacheTimeMs: config.cacheTimeMs ?? 60000, // 1 minute
+      maxPriceAge: config.maxPriceAge ?? 300000, // 5 minutes
+      priceDeviationThreshold: config.priceDeviationThreshold ?? 0.05, // 5%
+      ...config,
+    };
+
+    this.chainlinkOracle = new ChainlinkPriceOracleImpl(connectionManager);
   }
 
-  private get now() {
-    return Date.now();
-  }
-
-  private getCached(key: string): number | undefined {
-    const e = this.cache.get(key);
-    if (!e) return undefined;
-    // Fresh within TTL
-    if (this.now - e.ts <= this.ttlMs) return e.value;
-    // Stale but within allowed stale window
-    if (this.now - e.ts <= this.ttlMs + this.staleWindowMs) return e.value;
-    return undefined;
-  }
-
-  private setCached(key: string, val: number) {
-    this.cache.set(key, { value: val, ts: this.now });
-  }
-
-  private async withTimeout<T>(p: Promise<T>): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const to = setTimeout(() => reject(new Error('oracle-timeout')), this.timeoutMs);
-      p.then(v => {
-        clearTimeout(to);
-        resolve(v);
-      }).catch(err => {
-        clearTimeout(to);
-        reject(err);
-      });
-    });
-  }
-
+  /**
+   * Get ETH/USD price with fallback
+   */
   async getEthUsd(): Promise<number> {
-    const key = 'ETH_USD';
-    const fresh = this.getCached(key);
-    if (fresh !== undefined && this.now - (this.cache.get(key)?.ts || 0) <= this.ttlMs)
-      return fresh;
+    const cacheKey = 'ETH/USD';
 
-    try {
-      const ChainlinkPriceOracleImpl = await getChainlinkImpl();
-      const oracle = new ChainlinkPriceOracleImpl(this.providerLike);
-      const price = await this.withTimeout(oracle.getEthUsdPrice());
-      if (typeof price === 'number' && price > 0) {
-        this.setCached(key, price);
-        return price;
-      }
-      // fall through to stale
-    } catch (_) {
-      // ignore, fallback below
+    // Check cache first
+    const cached = this.priceCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < this.config.cacheTimeMs) {
+      return cached.price;
     }
 
-    const cached = this.getCached(key);
-    if (cached !== undefined) return cached; // serve last-good even if stale
-    throw new Error('ETH/USD price unavailable');
+    const prices: PriceData[] = [];
+
+    // Try Chainlink first
+    if (this.config.chainlinkEnabled) {
+      try {
+        const chainlinkPrice = await this.chainlinkOracle.getEthUsdPrice();
+        prices.push({
+          price: chainlinkPrice,
+          timestamp: Date.now(),
+          source: 'chainlink',
+          confidence: 0.95,
+        });
+      } catch (error) {
+        this.logger.warn('Chainlink ETH/USD price failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // Try fallback API
+    if (this.config.fallbackApiEnabled && prices.length === 0) {
+      try {
+        const apiPrice = await this.fetchEthPriceFromApi();
+        prices.push({
+          price: apiPrice,
+          timestamp: Date.now(),
+          source: 'coingecko',
+          confidence: 0.8,
+        });
+      } catch (error) {
+        this.logger.warn('Fallback API ETH/USD price failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (prices.length === 0) {
+      throw new Error('No price sources available for ETH/USD');
+    }
+
+    // Use highest confidence price
+    const bestPrice = prices.reduce((best, current) =>
+      current.confidence > best.confidence ? current : best
+    );
+
+    // Cache the result
+    this.priceCache.set(cacheKey, bestPrice);
+
+    this.logger.debug('ETH/USD price retrieved', {
+      price: bestPrice.price,
+      source: bestPrice.source,
+      confidence: bestPrice.confidence,
+    });
+
+    return bestPrice.price;
   }
 
-  async getTokenUsd(token: string): Promise<number> {
-    const key = `TOKEN_USD_${token.toLowerCase()}`;
-    const fresh = this.getCached(key);
-    if (fresh !== undefined && this.now - (this.cache.get(key)?.ts || 0) <= this.ttlMs)
-      return fresh;
+  /**
+   * Get token/USD price
+   */
+  async getTokenUsd(tokenAddress: Address): Promise<number> {
+    const cacheKey = `${tokenAddress}/USD`;
 
-    try {
-      const ChainlinkPriceOracleImpl = await getChainlinkImpl();
-      const oracle = new ChainlinkPriceOracleImpl(this.providerLike);
-      const price = await this.withTimeout(oracle.getTokenUsdPrice(token));
-      if (typeof price === 'number' && price > 0) {
-        this.setCached(key, price);
-        return price;
-      }
-    } catch (_) {
-      // ignore
+    // Check cache first
+    const cached = this.priceCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < this.config.cacheTimeMs) {
+      return cached.price;
     }
 
-    const cached = this.getCached(key);
-    if (cached !== undefined) return cached;
-    // As a conservative fallback, return 0 (caller should handle zero-good price by skipping trades)
-    return 0;
+    try {
+      // Try Chainlink first
+      if (this.config.chainlinkEnabled) {
+        const price = await this.chainlinkOracle.getTokenUsdPrice(tokenAddress);
+
+        const priceData: PriceData = {
+          price,
+          timestamp: Date.now(),
+          source: 'chainlink',
+          confidence: 0.95,
+        };
+
+        this.priceCache.set(cacheKey, priceData);
+        return price;
+      }
+    } catch (error) {
+      this.logger.warn('Chainlink token price failed', {
+        token: tokenAddress,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // Fallback to 1.0 for stablecoins
+    const stablecoins = [
+      '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // USDC on Base
+      '0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb', // DAI on Base
+    ];
+
+    if (stablecoins.includes(tokenAddress.toLowerCase())) {
+      const priceData: PriceData = {
+        price: 1.0,
+        timestamp: Date.now(),
+        source: 'hardcoded-stable',
+        confidence: 0.99,
+      };
+
+      this.priceCache.set(cacheKey, priceData);
+      return 1.0;
+    }
+
+    throw new Error(`No price feed available for token: ${tokenAddress}`);
+  }
+
+  /**
+   * Fetch ETH price from external API
+   */
+  private async fetchEthPriceFromApi(): Promise<number> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    try {
+      const response = await fetch(
+        'https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd',
+        { signal: controller.signal }
+      );
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
+      const data = (await response.json()) as any;
+
+      if (!data.ethereum || typeof data.ethereum.usd !== 'number') {
+        throw new Error('Invalid API response format');
+      }
+
+      return data.ethereum.usd;
+    } catch (error) {
+      clearTimeout(timeoutId);
+      throw error;
+    }
+  }
+
+  /**
+   * Clear price cache
+   */
+  clearCache(): void {
+    this.priceCache.clear();
+    this.logger.debug('Price cache cleared');
+  }
+
+  /**
+   * Get cached prices for debugging
+   */
+  getCachedPrices(): Map<string, PriceData> {
+    return new Map(this.priceCache);
   }
 }

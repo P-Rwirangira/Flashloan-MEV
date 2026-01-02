@@ -1,89 +1,106 @@
 /**
- * Centralized Profit Thresholds Configuration
- * Single source of truth for all profit-related thresholds
+ * Profit Thresholds Configuration
+ *
+ * Centralized profit validation and threshold management
  */
 
-export interface ProfitThresholds {
-  arbitrage: {
-    minProfitUsd: number;
-    minProfitMarginBps: number;
-    maxSlippageBps: number;
-  };
-  liquidation: {
-    minProfitUsd: number;
-    minProfitMarginBps: number;
-    maxSlippageBps: number;
-  };
-  stablePool: {
-    minProfitUsd: number;
-    minProfitMarginBps: number;
-    maxSlippageBps: number;
-  };
-  backrun: {
-    minProfitUsd: number;
-    minProfitMarginBps: number;
-    maxSlippageBps: number;
-  };
+export interface ProfitThreshold {
+  minProfitUsd: number;
+  minProfitMarginBps: number;
+  strategy: string;
+  description: string;
 }
 
-/**
- * Base L2 optimized profit thresholds
- */
-export const BASE_L2_PROFIT_THRESHOLDS: ProfitThresholds = {
+export interface ProfitValidationResult {
+  valid: boolean;
+  reason?: string;
+  threshold: ProfitThreshold;
+}
+
+// Base L2 optimized thresholds
+const PROFIT_THRESHOLDS: Record<string, ProfitThreshold> = {
   arbitrage: {
-    minProfitUsd: 8.0, // Lower threshold for Base L2 due to low gas costs
+    minProfitUsd: 8.0, // Base L2 optimized - lower gas costs
     minProfitMarginBps: 50, // 0.5% minimum margin
-    maxSlippageBps: 100, // 1% max slippage
+    strategy: 'arbitrage',
+    description: 'Cross-DEX arbitrage on Base L2',
   },
   liquidation: {
-    minProfitUsd: 15.0, // Higher due to complexity and gas usage
+    minProfitUsd: 15.0, // Higher due to complexity
     minProfitMarginBps: 100, // 1% minimum margin
-    maxSlippageBps: 250, // 2.5% max slippage
+    strategy: 'liquidation',
+    description: 'Lending protocol liquidations',
   },
   stablePool: {
     minProfitUsd: 5.0, // Lower for stable swaps
     minProfitMarginBps: 25, // 0.25% minimum margin
-    maxSlippageBps: 50, // 0.5% max slippage
-  },
-  backrun: {
-    minProfitUsd: 12.0, // Medium threshold for backrun opportunities
-    minProfitMarginBps: 75, // 0.75% minimum margin
-    maxSlippageBps: 150, // 1.5% max slippage
+    strategy: 'stablePool',
+    description: 'Stable pool rebalancing',
   },
 };
 
 /**
- * Get profit threshold for specific strategy
+ * Get profit threshold for strategy
  */
-export function getProfitThreshold(
-  strategy: keyof ProfitThresholds
-): ProfitThresholds[keyof ProfitThresholds] {
-  return BASE_L2_PROFIT_THRESHOLDS[strategy];
+export function getProfitThreshold(strategy: string): ProfitThreshold {
+  const threshold = PROFIT_THRESHOLDS[strategy];
+  if (!threshold) {
+    throw new Error(`Unknown strategy: ${strategy}`);
+  }
+  return threshold;
 }
 
 /**
- * Validate if profit meets threshold requirements
+ * Validate profit against threshold
  */
 export function validateProfitThreshold(
-  strategy: keyof ProfitThresholds,
+  strategy: string,
   profitUsd: number,
   profitMarginBps: number
-): { valid: boolean; reason?: string } {
+): ProfitValidationResult {
   const threshold = getProfitThreshold(strategy);
 
   if (profitUsd < threshold.minProfitUsd) {
     return {
       valid: false,
       reason: `Profit ${profitUsd.toFixed(2)} USD below minimum ${threshold.minProfitUsd} USD`,
+      threshold,
     };
   }
 
   if (profitMarginBps < threshold.minProfitMarginBps) {
     return {
       valid: false,
-      reason: `Margin ${profitMarginBps}bps below minimum ${threshold.minProfitMarginBps}bps`,
+      reason: `Margin ${profitMarginBps.toFixed(0)}bps below minimum ${threshold.minProfitMarginBps}bps`,
+      threshold,
     };
   }
 
-  return { valid: true };
+  return {
+    valid: true,
+    threshold,
+  };
+}
+
+/**
+ * Update profit threshold for strategy
+ */
+export function updateProfitThreshold(strategy: string, threshold: Partial<ProfitThreshold>): void {
+  const existing = PROFIT_THRESHOLDS[strategy];
+  if (!existing) {
+    throw new Error(`Unknown strategy: ${strategy}`);
+  }
+
+  PROFIT_THRESHOLDS[strategy] = {
+    ...existing,
+    ...threshold,
+    strategy, // Ensure strategy field is preserved
+  };
+}
+
+/**
+ * Get all profit thresholds
+ */
+export function getAllProfitThresholds(): Record<string, ProfitThreshold> {
+  return { ...PROFIT_THRESHOLDS };
 }

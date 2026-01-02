@@ -111,7 +111,7 @@ This guide covers deploying the Base MEV Platform in various environments, from 
    # Required
    BASE_RPC_URL=http://localhost:8545
    BASE_WS_URL=ws://localhost:8546
-   PRIVATE_KEY=your_private_key_here
+   EXECUTION_PRIVATE_KEY=your_private_key_here  # (fallback: PRIVATE_KEY)
 
    # Optional but recommended
    BLOXROUTE_API_KEY=your_api_key
@@ -422,7 +422,7 @@ Access Grafana at `http://localhost:3000` (default credentials: admin/admin - **
      namespace: mev-platform
    type: Opaque
    stringData:
-     PRIVATE_KEY: "your_private_key"
+     EXECUTION_PRIVATE_KEY: "your_private_key"  # (fallback env var: PRIVATE_KEY)
      BLOXROUTE_API_KEY: "your_api_key"
      FLASHBOTS_AUTH_KEY: "your_auth_key"
    ```

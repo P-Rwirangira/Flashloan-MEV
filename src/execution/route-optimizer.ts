@@ -497,7 +497,7 @@ export class RouteOptimizer extends EventEmitter {
             (this as any).transactionManager?.getProvider?.() || (this as any).provider,
         } as any;
         const { OracleAdapter } = await import('../oracles/oracle-adapter');
-        const oa = new OracleAdapter(cm, { ttlMs: 60_000 });
+        const oa = new OracleAdapter(cm, { cacheTimeMs: 60_000 });
         const ethUsd = await oa.getEthUsd();
         profitUsd = (Number(netProfit) / 1e18) * ethUsd;
       } catch {

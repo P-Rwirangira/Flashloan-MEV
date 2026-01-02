@@ -148,9 +148,9 @@ export class PrivateOrderflowManager extends EventEmitter {
 
     if (this.config.enabled) {
       // Initialize signer once from environment
-      const pk = process.env['EXECUTION_PRIVATE_KEY'];
+      const pk = process.env['EXECUTION_PRIVATE_KEY'] || process.env['PRIVATE_KEY'];
       if (!pk || pk.trim() === '') {
-        throw new Error('EXECUTION_PRIVATE_KEY not configured');
+        throw new Error('EXECUTION_PRIVATE_KEY (or PRIVATE_KEY fallback) not configured');
       }
       this.signer = new ethers.Wallet(pk, this.provider);
 
