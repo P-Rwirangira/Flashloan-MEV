@@ -8,6 +8,9 @@
 import { EventEmitter } from 'events';
 import { ethers } from 'ethers';
 import { createComponentLogger } from '../utils/logger';
+import { computeProfit, makeCosts, formatProfitResult } from '../utils/pnl-model';
+import { BribeOptimizer } from '../bundler/bribe-optimizer';
+import { DEFAULT_BUNDLER_CONFIG } from '../bundler/transaction-bundler';
 import { Address } from '../types/common';
 import { OpportunityStateMachine } from './opportunity-state-machine';
 import { FlashLoanManager } from './flash-loan-manager';
@@ -262,13 +265,23 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
 
       // Calculate actual profit (simplified)
       const actualProfit = await this.calculateArbitrageProfit(opportunity, arbOpp);
+      // Build ProfitResult for reconciliation and logging
 
       // Get transaction receipt from transaction manager
       const receipt = await this.getTransactionReceipt(transactionHash);
 
       // Calculate actual costs from receipt
       const gasCost = receipt.gasUsed * receipt.effectiveGasPrice;
-      const netProfit = actualProfit - gasCost;
+      const profitRes = computeProfit(
+        { grossProfitWei: actualProfit },
+        makeCosts({ gasCostWei: gasCost /* bribe/fees unknown here; bundler should fill later */ }),
+        { clampNegative: true }
+      );
+      const netProfit = profitRes.netProfitWei;
+      this.logger.debug('Arbitrage PnL (realized)', {
+        breakdown: profitRes.breakdown,
+        pretty: formatProfitResult(profitRes),
+      });
 
       const result: ExecutionResult = {
         opportunityId: opportunity.id,
@@ -386,19 +399,44 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
       const gasEstimate = await this.estimateGas(opportunity);
       const totalGasCost = gasEstimate * context.maxFeePerGas;
 
+      // Estimate bribe using BribeOptimizer
+      const feeData = await this.getProvider().getFeeData();
+      const baseGasPrice = feeData.gasPrice || context.maxFeePerGas;
+      const bribeOptimizer = new BribeOptimizer();
+      bribeOptimizer.updateCongestionLevel(baseGasPrice);
+      const bribeParams = {
+        baseGasPrice,
+        networkCongestion: bribeOptimizer.getCurrentCongestion(),
+        timeUrgency: 0.8,
+        priority: 'high' as const,
+        targetInclusionProbability: 0.7,
+        maxBribe: DEFAULT_BUNDLER_CONFIG.maxBribe,
+        minBribe: DEFAULT_BUNDLER_CONFIG.minBribe,
+      };
+      const bribeResult = bribeOptimizer.calculateOptimalBribe(bribeParams);
+      const bribeWei = bribeResult.optimalBribe;
+
       // Build execution data for flash loan callback
       const executionData = await this.buildExecutionData(opportunity.route);
 
-      // Calculate expected profit after fees
+      // Calculate expected profit using unified ProfitModel
       const flashLoanFee = flashLoanSource.fee; // Fee is already for the requested amount
-      const expectedProfit = opportunity.estimatedProfit - flashLoanFee - totalGasCost;
+      const grossProfitWei = opportunity.estimatedProfit;
+      const costs = makeCosts({
+        gasCostWei: totalGasCost,
+        bribeWei: bribeWei,
+        flashLoanFeeWei: flashLoanFee,
+        dexFeesWei: 0n, // included implicitly in route quotes if available; else 0
+        slippageWei: 0n,
+      });
+      const profitEval = computeProfit({ grossProfitWei }, costs, { clampNegative: true });
 
       const plan: RouteExecutionPlan = {
         flashLoanSource,
         swapRoute: opportunity.route,
-        expectedProfit: opportunity.estimatedProfit,
+        expectedProfit: grossProfitWei,
         totalGasCost,
-        netProfit: expectedProfit,
+        netProfit: profitEval.netProfitWei,
         executionData,
       };
 
@@ -406,11 +444,11 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
       if (this.config.enableProfitValidation) {
         try {
           const { validateProfitThreshold } = await import('../config/profit-thresholds');
-          const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+          const { OracleAdapter } = await import('../oracles/oracle-adapter');
           const cm = { getProvider: () => this.getProvider() } as any;
-          const oracle = new ChainlinkPriceOracleImpl(cm);
-          const ethUsd = await oracle.getEthUsdPrice();
-          const netProfitUsd = (Number(expectedProfit) / 1e18) * ethUsd;
+          const oa = new OracleAdapter(cm);
+          const ethUsd = await oa.getEthUsd();
+          const netProfitUsd = (Number(profitEval.netProfitWei) / 1e18) * ethUsd;
           const profitMarginBps =
             Number(opportunity.amountIn) > 0
               ? (netProfitUsd / ((Number(opportunity.amountIn) / 1e18) * ethUsd)) * 10000
@@ -422,7 +460,7 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
           }
         } catch (e) {
           // On oracle failure, still require positive netProfit in wei
-          if (expectedProfit <= 0n) {
+          if (profitEval.netProfitWei <= 0n) {
             throw new Error('Net profit non-positive');
           }
         }
@@ -433,7 +471,7 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
         flashLoanProvider: flashLoanSource.provider,
         flashLoanFee: flashLoanFee.toString(),
         totalGasCost: totalGasCost.toString(),
-        netProfit: expectedProfit.toString(),
+        netProfit: profitEval.netProfitWei.toString(),
       });
 
       return plan;
@@ -836,11 +874,11 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
         arbOpp.estimatedProfit > estimatedGasCost ? arbOpp.estimatedProfit - estimatedGasCost : 0n;
       if (receiptDeltaTokenOut !== null) {
         try {
-          const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+          const { OracleAdapter } = await import('../oracles/oracle-adapter');
           const cm = { getProvider: () => this.getProvider() } as any;
-          const oracle = new ChainlinkPriceOracleImpl(cm);
-          const ethUsd = await oracle.getEthUsdPrice();
-          const tokenOutUsd = await oracle.getTokenUsdPrice(arbOpp.tokenOut as Address);
+          const oa = new OracleAdapter(cm);
+          const ethUsd = await oa.getEthUsd();
+          const tokenOutUsd = await oa.getTokenUsd(arbOpp.tokenOut as Address);
           const erc20 = new ethers.Contract(
             arbOpp.tokenOut as string,
             ['function decimals() view returns (uint8)'],
@@ -949,7 +987,7 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
       return {
         status: receipt.status || 0,
         gasUsed: receipt.gasUsed,
-        effectiveGasPrice: receipt.gasPrice || 0n,
+        effectiveGasPrice: (receipt as any).effectiveGasPrice || (receipt as any).gasPrice || 0n,
         blockNumber: receipt.blockNumber,
       };
     } catch (error) {

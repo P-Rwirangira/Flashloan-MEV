@@ -581,12 +581,12 @@ export class RealStablePoolRebalancingCalculator {
     // Pool size risk (smaller pools = higher risk)
     let totalLiquidityUsd = 0;
     try {
-      const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
       const cm = { getProvider: () => this.provider } as any;
-      const oracle = new ChainlinkPriceOracleImpl(cm);
+      const { OracleAdapter } = await import('../oracles/oracle-adapter');
+      const oa = new OracleAdapter(cm);
       // Fetch token USD prices (approximate via known feeds)
-      const price0 = await oracle.getTokenUsdPrice(poolState.token0 as any);
-      const price1 = await oracle.getTokenUsdPrice(poolState.token1 as any);
+      const price0 = await oa.getTokenUsd(poolState.token0 as any);
+      const price1 = await oa.getTokenUsd(poolState.token1 as any);
       // Fetch decimals for both tokens
       const erc20Abi = ['function decimals() view returns (uint8)'];
       const t0 = new ethers.Contract(poolState.token0, erc20Abi, this.provider);

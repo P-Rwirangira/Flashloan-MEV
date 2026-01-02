@@ -1529,24 +1529,60 @@ export class BaseMEVPlatform extends EventEmitter {
         return;
       }
 
-      // Check if backrun is profitable
+      // Check if backrun is profitable using unified ProfitModel
       if (opportunity.backrunProfit && opportunity.backrunProfit > 0n) {
+        const gasCost = (opportunity.gasPrice || 0n) * (opportunity.gasLimit || 0n);
+        const { computeProfit, makeCosts } = await import('./utils/pnl-model');
+        const { BribeOptimizer } = await import('./bundler/bribe-optimizer');
+        const { DEFAULT_BUNDLER_CONFIG } = await import('./bundler/transaction-bundler');
+        // Estimate bribe for backrun
+        const bribeOpt = new BribeOptimizer();
+        bribeOpt.updateCongestionLevel(opportunity.gasPrice || 0n);
+        const bribeParams = {
+          baseGasPrice: opportunity.gasPrice || 0n,
+          networkCongestion: bribeOpt.getCurrentCongestion(),
+          timeUrgency: 0.9,
+          priority: 'high' as const,
+          targetInclusionProbability: 0.8,
+          maxBribe: DEFAULT_BUNDLER_CONFIG.maxBribe,
+          minBribe: DEFAULT_BUNDLER_CONFIG.minBribe,
+        };
+        const bribe = bribeOpt.calculateOptimalBribe(bribeParams).optimalBribe;
+        const res = computeProfit(
+          { grossProfitWei: opportunity.backrunProfit },
+          makeCosts({
+            gasCostWei: BigInt(gasCost),
+            bribeWei: bribe,
+            flashLoanFeeWei: 0n,
+            dexFeesWei: 0n,
+            slippageWei: 0n,
+          }),
+          { clampNegative: true }
+        );
+        if (res.netProfitWei <= 0n) {
+          this.platformLogger.debug('Backrun opportunity not profitable after costs', {
+            breakdown: res.breakdown,
+          });
+          this.platformLogger.endPerformanceTracking(operationId);
+          return;
+        }
         this.platformLogger.info('Profitable backrun opportunity detected', {
           opportunityId: opportunity.id,
           txHash: opportunity.txHash,
           protocol: opportunity.dexProtocol,
           backrunProfit: ethers.formatEther(opportunity.backrunProfit),
           gasPrice: ethers.formatUnits(opportunity.gasPrice, 'gwei'),
+          pnl: (await import('./utils/pnl-model')).formatProfitResult(res),
         });
 
         // Record opportunity
         this.metricsCollector.recordOpportunitySuccess(
           RelayProvider.FLASHBOTS_PROTECT,
-          opportunity.backrunProfit,
-          BigInt(Math.floor(Number(opportunity.gasPrice) * Number(opportunity.gasLimit))),
-          0n, // bribe
+          res.netProfitWei + res.gasCostWei + res.bribeWei, // gross
+          res.gasCostWei,
+          res.bribeWei || 0n,
           Date.now(),
-          1000 // latency
+          1000
         );
       }
 
@@ -1587,6 +1623,34 @@ export class BaseMEVPlatform extends EventEmitter {
       const calculation = await this.liquidationCalculator.calculateLiquidationProfit(opportunity);
 
       if (calculation.profitable) {
+        const { computeProfit, makeCosts } = await import('./utils/pnl-model');
+        const { BribeOptimizer } = await import('./bundler/bribe-optimizer');
+        const { DEFAULT_BUNDLER_CONFIG } = await import('./bundler/transaction-bundler');
+        // Bribe is optional for liquidation; estimate conservatively if using private relay
+        const feeData = await this.connectionManager.getProvider().getFeeData();
+        const baseGasPrice = feeData.gasPrice || 0n;
+        const opt = new BribeOptimizer();
+        opt.updateCongestionLevel(baseGasPrice);
+        const bribe = opt.calculateOptimalBribe({
+          baseGasPrice,
+          networkCongestion: opt.getCurrentCongestion(),
+          timeUrgency: 0.7,
+          priority: 'medium',
+          targetInclusionProbability: 0.6,
+          maxBribe: DEFAULT_BUNDLER_CONFIG.maxBribe,
+          minBribe: DEFAULT_BUNDLER_CONFIG.minBribe,
+        }).optimalBribe;
+        const res = computeProfit(
+          { grossProfitWei: calculation.grossProfit },
+          makeCosts({
+            gasCostWei: calculation.gasCost,
+            bribeWei: bribe,
+            flashLoanFeeWei: calculation.flashLoanFee,
+            dexFeesWei: 0n,
+            slippageWei: calculation.slippageCost,
+          }),
+          { clampNegative: true }
+        );
         this.platformLogger.info('Profitable liquidation opportunity found', {
           opportunityId: opportunity.id,
           protocol: opportunity.protocol,
@@ -1597,11 +1661,11 @@ export class BaseMEVPlatform extends EventEmitter {
         // Record successful opportunity
         this.metricsCollector.recordOpportunitySuccess(
           RelayProvider.FLASHBOTS_PROTECT,
-          calculation.netProfit,
-          calculation.gasCost,
-          0n, // bribe
+          res.netProfitWei + res.gasCostWei + res.bribeWei,
+          res.gasCostWei,
+          res.bribeWei || 0n,
           Date.now(),
-          3000 // latency
+          3000
         );
       }
 
@@ -1642,6 +1706,34 @@ export class BaseMEVPlatform extends EventEmitter {
       const calculation = await this.stablePoolCalculator.calculateRebalancingProfit(opportunity);
 
       if (calculation.profitable) {
+        const { computeProfit, makeCosts } = await import('./utils/pnl-model');
+        const { BribeOptimizer } = await import('./bundler/bribe-optimizer');
+        const { DEFAULT_BUNDLER_CONFIG } = await import('./bundler/transaction-bundler');
+        // Bribe is optional for stable rebalancing; estimate conservatively if private relay is used
+        const feeData = await this.connectionManager.getProvider().getFeeData();
+        const baseGasPrice = feeData.gasPrice || 0n;
+        const opt = new BribeOptimizer();
+        opt.updateCongestionLevel(baseGasPrice);
+        const bribe = opt.calculateOptimalBribe({
+          baseGasPrice,
+          networkCongestion: opt.getCurrentCongestion(),
+          timeUrgency: 0.6,
+          priority: 'medium',
+          targetInclusionProbability: 0.6,
+          maxBribe: DEFAULT_BUNDLER_CONFIG.maxBribe,
+          minBribe: DEFAULT_BUNDLER_CONFIG.minBribe,
+        }).optimalBribe;
+        const res = computeProfit(
+          { grossProfitWei: calculation.grossProfit },
+          makeCosts({
+            gasCostWei: calculation.gasCost,
+            bribeWei: bribe,
+            flashLoanFeeWei: 0n,
+            dexFeesWei: 0n,
+            slippageWei: calculation.slippageCost,
+          }),
+          { clampNegative: true }
+        );
         this.platformLogger.info('Profitable stable pool rebalancing opportunity found', {
           opportunityId: opportunity.id,
           poolAddress: opportunity.poolAddress,
@@ -1653,11 +1745,11 @@ export class BaseMEVPlatform extends EventEmitter {
         // Record successful opportunity
         this.metricsCollector.recordOpportunitySuccess(
           RelayProvider.LOCAL_NODE,
-          calculation.netProfit,
-          calculation.gasCost,
-          0n, // bribe
+          res.netProfitWei + res.gasCostWei + res.bribeWei,
+          res.gasCostWei,
+          res.bribeWei || 0n,
           Date.now(),
-          2000 // latency
+          2000
         );
       }
 
@@ -1748,12 +1840,14 @@ export class BaseMEVPlatform extends EventEmitter {
    */
   private async getCurrentEthPrice(): Promise<number> {
     try {
-      // Try to get price from Chainlink oracle first
-      if (this.chainlinkOracle) {
-        const ethPrice = await this.chainlinkOracle.getEthPrice();
-        if (ethPrice > 0) {
-          return ethPrice;
-        }
+      // Try OracleAdapter (wraps Chainlink with caching/fallbacks)
+      try {
+        const { OracleAdapter } = await import('./oracles/oracle-adapter');
+        const oa = new OracleAdapter(this.connectionManager);
+        const ethPrice = await oa.getEthUsd();
+        if (ethPrice > 0) return ethPrice;
+      } catch (_) {
+        // fall through
       }
 
       // Fallback to external API

@@ -548,7 +548,7 @@ export class TransactionLifecycleManager
         confirmationTime: Date.now() - startTime,
         blockNumber: receipt.blockNumber,
         gasUsed: receipt.gasUsed,
-        effectiveGasPrice: receipt.gasPrice,
+        effectiveGasPrice: (receipt as any).effectiveGasPrice || (receipt as any).gasPrice || 0n,
       };
     } catch (error) {
       this.logger.error('Transaction confirmation failed', {

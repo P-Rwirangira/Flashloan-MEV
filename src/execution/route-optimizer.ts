@@ -492,13 +492,13 @@ export class RouteOptimizer extends EventEmitter {
       // Convert to USD using oracle (fallback to conservative default if unavailable)
       let profitUsd = 0;
       try {
-        const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
         const cm = {
           getProvider: () =>
             (this as any).transactionManager?.getProvider?.() || (this as any).provider,
         } as any;
-        const oracle = new ChainlinkPriceOracleImpl(cm);
-        const ethUsd = await oracle.getEthUsdPrice();
+        const { OracleAdapter } = await import('../oracles/oracle-adapter');
+        const oa = new OracleAdapter(cm, { ttlMs: 60_000 });
+        const ethUsd = await oa.getEthUsd();
         profitUsd = (Number(netProfit) / 1e18) * ethUsd;
       } catch {
         throw new Error('ETH/USD price unavailable from oracle');
@@ -579,18 +579,22 @@ export class RouteOptimizer extends EventEmitter {
     inputAmount: bigint
   ): Promise<bigint> {
     try {
-      // Simplified calculation - would use actual pool math in production
-      const feeRate = pool.fee || 0.003; // 0.3% default
-      const outputAmount = (inputAmount * BigInt(Math.floor((1 - feeRate) * 10000))) / 10000n;
+      // Per-hop fee: prefer explicit feeBps if present; else derive from decimal fee
+      const anyPool: any = pool as any;
+      const feeBps: number =
+        typeof anyPool.feeBps === 'number'
+          ? anyPool.feeBps
+          : Math.round(((pool.fee ?? 0.003) as number) * 10000);
+      const afterFee = (inputAmount * BigInt(10000 - feeBps)) / 10000n;
 
-      // Apply price impact (simplified)
-      const priceImpact = this.calculatePriceImpact(pool, inputAmount);
-      const finalOutput = (outputAmount * BigInt(Math.floor((1 - priceImpact) * 10000))) / 10000n;
+      // Per-hop liquidity-based price impact (bps)
+      const impactBps = this.estimateImpactBps(pool, inputAmount);
+      const finalOutput = (afterFee * BigInt(10000 - impactBps)) / 10000n;
 
-      return finalOutput;
+      return finalOutput > 0n ? finalOutput : 0n;
     } catch (error) {
       this.logger.error('Failed to calculate swap output', {
-        pool: pool.address,
+        pool: (pool as any)?.address || 'unknown',
         error: error instanceof Error ? error.message : String(error),
       });
       return 0n;
@@ -600,10 +604,19 @@ export class RouteOptimizer extends EventEmitter {
   /**
    * Calculate price impact for a swap
    */
-  private calculatePriceImpact(pool: PoolInfo, inputAmount: bigint): number {
-    // Simplified price impact calculation
-    const liquidityRatio = Number(inputAmount) / Number(pool.liquidity || 1000000n);
-    return Math.min(liquidityRatio * 0.1, 0.05); // Max 5% price impact
+  private estimateImpactBps(pool: PoolInfo, inputAmount: bigint): number {
+    // Liquidity-aware price impact in basis points
+    try {
+      const liquidity = Number((pool as any).liquidity || 0n);
+      if (liquidity <= 0) return 100; // 1% default if unknown
+      const trade = Number(inputAmount);
+      // impactBps grows sublinearly with trade/liquidity
+      const ratio = trade / (liquidity * 10); // 10x liquidity headroom
+      const bps = Math.min(Math.max(Math.round(ratio * 10000), 10), 200); // clamp 0.10%..2%
+      return bps;
+    } catch {
+      return 50; // 0.50% fallback
+    }
   }
 
   /**
@@ -654,7 +667,7 @@ export class RouteOptimizer extends EventEmitter {
   private async getCurrentGasPrice(): Promise<bigint> {
     try {
       const feeData = await this.provider.getFeeData();
-      return feeData.gasPrice || this.config.gasPrice;
+      return feeData.maxFeePerGas || feeData.gasPrice || this.config.gasPrice;
     } catch (error) {
       this.logger.warn('Failed to get gas price from provider, using config default', {
         error: error instanceof Error ? error.message : String(error),

@@ -321,7 +321,7 @@ export class ProfitabilityOptimizer extends EventEmitter {
 
     // Get real gas price
     const feeData = await provider.getFeeData();
-    const gasPrice = feeData.gasPrice || 20000000000n;
+    const gasPrice = feeData.maxFeePerGas || feeData.gasPrice || 20000000000n;
 
     // Get network congestion from recent blocks
     const latestBlock = await provider.getBlock('latest');

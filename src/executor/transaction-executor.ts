@@ -134,7 +134,8 @@ export class TransactionExecutor {
       // Get current gas price
       const provider = this.connectionManager.getProvider();
       const feeData = await provider.getFeeData();
-      const maxFeePerGas = options?.maxGasPrice ?? feeData.maxFeePerGas ?? undefined;
+      const maxFeePerGas =
+        options?.maxGasPrice ?? feeData.maxFeePerGas ?? feeData.gasPrice ?? undefined;
       const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? undefined;
 
       // Prepare transaction with gas settings
@@ -196,7 +197,8 @@ export class TransactionExecutor {
 
       // Calculate actual profit and gas cost
       const gasUsed = receipt.gasUsed;
-      const effectiveGasPrice = receipt.gasPrice;
+      const effectiveGasPrice =
+        (receipt as any).effectiveGasPrice || (receipt as any).gasPrice || 0n;
       const gasCost = gasUsed * effectiveGasPrice;
 
       // Actual profit = expected profit - gas cost
