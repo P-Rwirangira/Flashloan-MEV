@@ -48,7 +48,7 @@ export class TransactionBuilder {
    */
   private getFlashExecutorAddress(): Address {
     const config = this.contractManager.getFlashExecutorConfig();
-    if (!config.address) {
+    if (!config?.address) {
       throw new Error('Flash Executor contract not deployed');
     }
     return config.address as Address;

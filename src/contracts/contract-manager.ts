@@ -1,368 +1,223 @@
 /**
  * Contract Manager
  *
- * Manages contract deployment, verification, and configuration
+ * Manages smart contract deployments, configurations, and interactions
  */
 
 import { ethers } from 'ethers';
-import { promises as fs } from 'fs';
-import { join } from 'path';
-import * as yaml from 'yaml';
-import { logger } from '../utils/logger';
 import { Address } from '../types/common';
+import { createComponentLogger } from '../utils/logger';
 
 export interface ContractConfig {
-  address: string;
-  deploymentBlock: number;
-  deploymentTime: string;
+  address: Address;
+  minProfit: string;
+  owner: Address;
   network: string;
   chainId: string;
-  owner: string;
-  minProfit: string;
-}
-
-export interface PoolConfig {
-  address: string;
-  token0: string;
-  token1: string;
-  fee?: number;
-  stable?: boolean;
+  deploymentBlock: number;
+  deploymentTime: string;
 }
 
 export interface DeploymentConfig {
   minProfitEth: string;
   gasLimit: number;
-  gasPrice: string;
 }
 
-export interface NetworkConfig {
-  rpcUrl: string;
-  chainId: number;
-  blockExplorer: string;
+export interface PoolConfig {
+  address: Address;
+  enabled: boolean;
+  priority: number;
+  minTvl: number;
+  maxSlippage: number;
+  tags: string[];
 }
 
-export interface CompoundMarket {
-  underlying: string;
-  cToken: string;
-}
-export interface ProtocolAddresses {
-  aaveV3: { poolAddress: string };
-  compoundLike: {
-    moonwell: { comptroller: string; markets?: CompoundMarket[] };
-    seamless: { comptroller: string; markets?: CompoundMarket[] };
-  };
-}
-
-export interface ContractsYaml {
-  contracts: {
-    flashExecutor: ContractConfig;
-    authorizedPools: {
-      uniswapV3: PoolConfig[];
-      aerodrome: PoolConfig[];
-    };
-  };
-  deployment: DeploymentConfig;
-  protocols: ProtocolAddresses;
-  networks: {
-    [key: string]: NetworkConfig;
-  };
-}
-
+/**
+ * Contract Manager for deployment and configuration
+ */
 export class ContractManager {
-  private configPath: string;
-  private config: ContractsYaml;
+  private readonly logger = createComponentLogger('contract-manager');
+  private flashExecutorConfig?: ContractConfig;
+  private authorizedPools: Map<Address, PoolConfig> = new Map();
 
-  private constructor(configPath: string, config: ContractsYaml) {
-    this.configPath = configPath;
-    this.config = config;
-  }
-
-  /**
-   * Create ContractManager instance asynchronously
-   */
-  static async create(configPath: string = 'config/contracts.yaml'): Promise<ContractManager> {
-    const fullPath = join(process.cwd(), configPath);
-    const config = await ContractManager.loadConfigAsync(fullPath);
-    return new ContractManager(fullPath, config);
-  }
-
-  /**
-   * Load configuration from YAML file asynchronously
-   */
-  private static async loadConfigAsync(configPath: string): Promise<ContractsYaml> {
-    try {
-      const configFile = await fs.readFile(configPath, 'utf8');
-      return yaml.parse(configFile) as ContractsYaml;
-    } catch (error) {
-      logger.error('Failed to load contracts configuration:', error);
-      throw new Error(`Failed to load contracts configuration: ${error}`);
-    }
-  }
-
-  /**
-   * Load configuration from YAML file (returns Promise)
-   */
-  async loadConfig(): Promise<ContractsYaml> {
-    this.config = await ContractManager.loadConfigAsync(this.configPath);
-    return this.config;
-  }
-
-  /**
-   * Save configuration to YAML file asynchronously
-   */
-  private async saveConfig(): Promise<void> {
-    try {
-      const yamlString = yaml.stringify(this.config, { indent: 2 });
-      const tempPath = `${this.configPath}.tmp`;
-
-      // Write to temp file first
-      await fs.writeFile(tempPath, yamlString, 'utf8');
-
-      // Atomically rename temp file to real path
-      await fs.rename(tempPath, this.configPath);
-
-      logger.info('Contracts configuration saved successfully');
-    } catch (error) {
-      logger.error('Failed to save contracts configuration:', error);
-      throw new Error(`Failed to save contracts configuration: ${error}`);
-    }
-  }
-
-  /**
-   * Update Flash Executor contract configuration
-   */
-  async updateFlashExecutorConfig(contractConfig: ContractConfig): Promise<void> {
-    this.config.contracts.flashExecutor = contractConfig;
-    await this.saveConfig();
-    logger.info(`Flash Executor configuration updated: ${contractConfig.address}`);
-  }
-
-  /**
-   * Get Flash Executor contract configuration
-   */
-  getFlashExecutorConfig(): ContractConfig {
-    return this.config.contracts.flashExecutor;
-  }
-
-  /**
-   * Get authorized pools configuration
-   */
-  getAuthorizedPools(): { uniswapV3: PoolConfig[]; aerodrome: PoolConfig[] } {
-    return this.config.contracts.authorizedPools;
-  }
-
-  /**
-   * Add normalized address helper
-   */
-  private normalizeAddress(address: string): string {
-    return address.toLowerCase();
-  }
-
-  /**
-   * Add authorized pool
-   */
-  async addAuthorizedPool(protocol: 'uniswapV3' | 'aerodrome', pool: PoolConfig): Promise<void> {
-    const pools = this.config.contracts.authorizedPools[protocol];
-    const normalizedAddress = this.normalizeAddress(pool.address);
-
-    // Check for duplicates using normalized addresses
-    const exists = pools.some(
-      existingPool => this.normalizeAddress(existingPool.address) === normalizedAddress
-    );
-
-    if (!exists) {
-      pools.push(pool);
-      await this.saveConfig();
-      logger.info(`Added authorized ${protocol} pool: ${pool.address}`);
-    } else {
-      logger.warn(`Pool already exists in ${protocol} authorized pools: ${pool.address}`);
-    }
-  }
-
-  /**
-   * Remove authorized pool
-   */
-  async removeAuthorizedPool(
-    protocol: 'uniswapV3' | 'aerodrome',
-    poolAddress: string
-  ): Promise<void> {
-    const pools = this.config.contracts.authorizedPools[protocol];
-    const normalizedAddress = this.normalizeAddress(poolAddress);
-    const index = pools.findIndex(
-      pool => this.normalizeAddress(pool.address) === normalizedAddress
-    );
-
-    if (index !== -1) {
-      pools.splice(index, 1);
-      await this.saveConfig();
-      logger.info(`Removed authorized ${protocol} pool: ${poolAddress}`);
-    } else {
-      logger.warn(`Pool not found in ${protocol} authorized pools: ${poolAddress}`);
-    }
+  constructor() {
+    this.loadDefaultPools();
   }
 
   /**
    * Get deployment configuration
    */
   getDeploymentConfig(): DeploymentConfig {
-    return this.config.deployment;
+    return {
+      minProfitEth: process.env['MIN_PROFIT_ETH'] || '0.008', // 0.008 ETH (~$20 at $2500 ETH)
+      gasLimit: parseInt(process.env['DEPLOY_GAS_LIMIT'] || '3000000', 10),
+    };
   }
 
   /**
-   * Get protocol addresses
+   * Update flash executor configuration
    */
-  getProtocolAddresses(): ProtocolAddresses {
-    return this.config.protocols;
+  updateFlashExecutorConfig(config: ContractConfig): void {
+    this.flashExecutorConfig = config;
+    this.logger.info('Flash executor configuration updated', {
+      address: config.address,
+      network: config.network,
+      chainId: config.chainId,
+    });
   }
 
   /**
-   * Get network configuration
+   * Get flash executor configuration
    */
-  getNetworkConfig(network: string): NetworkConfig {
-    const networkConfig = this.config.networks[network];
-    if (!networkConfig) {
-      throw new Error(`Network configuration not found: ${network}`);
-    }
-    return networkConfig;
-  }
-
-  /**
-   * Check if Flash Executor is deployed
-   */
-  isFlashExecutorDeployed(): boolean {
-    return this.config.contracts.flashExecutor.address !== '';
+  getFlashExecutorConfig(): ContractConfig | undefined {
+    return this.flashExecutorConfig;
   }
 
   /**
    * Get all authorized pool addresses
    */
   getAllAuthorizedPoolAddresses(): Address[] {
-    const pools: Address[] = [];
-
-    // Add Uniswap V3 pools with normalized addresses
-    this.config.contracts.authorizedPools.uniswapV3.forEach(pool => {
-      pools.push(this.normalizeAddress(pool.address) as Address);
-    });
-
-    // Add Aerodrome pools with normalized addresses
-    this.config.contracts.authorizedPools.aerodrome.forEach(pool => {
-      pools.push(this.normalizeAddress(pool.address) as Address);
-    });
-
-    return pools;
+    return Array.from(this.authorizedPools.keys()).filter(
+      address => this.authorizedPools.get(address)?.enabled
+    );
   }
 
   /**
-   * Resolve cToken for underlying for a compound-like protocol
+   * Add authorized pool
    */
-  getCTokenFor(protocol: 'moonwell' | 'seamless', underlying: string): string | undefined {
-    const list = this.config.protocols.compoundLike[protocol]?.markets || [];
-    const key = underlying.toLowerCase();
-    const found = list.find(m => m.underlying.toLowerCase() === key);
-    return found?.cToken;
+  addAuthorizedPool(address: Address, config: Partial<PoolConfig> = {}): void {
+    const poolConfig: PoolConfig = {
+      address,
+      enabled: config.enabled ?? true,
+      priority: config.priority ?? 1,
+      minTvl: config.minTvl ?? 100000, // $100k minimum TVL
+      maxSlippage: config.maxSlippage ?? 0.02, // 2% max slippage
+      tags: config.tags ?? [],
+      ...config,
+    };
+
+    this.authorizedPools.set(address, poolConfig);
+    this.logger.info('Authorized pool added', { address, config: poolConfig });
   }
 
   /**
-   * Validate contract configuration
+   * Remove authorized pool
    */
-  validateConfig(): boolean {
+  removeAuthorizedPool(address: Address): void {
+    const removed = this.authorizedPools.delete(address);
+    if (removed) {
+      this.logger.info('Authorized pool removed', { address });
+    }
+  }
+
+  /**
+   * Get pool configuration
+   */
+  getPoolConfig(address: Address): PoolConfig | undefined {
+    return this.authorizedPools.get(address);
+  }
+
+  /**
+   * Load default pools for Base mainnet
+   */
+  private loadDefaultPools(): void {
+    // Base mainnet pools - high liquidity pairs
+    const defaultPools: Array<{ address: Address; config: Partial<PoolConfig> }> = [
+      {
+        address: '0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18' as Address, // WETH/USDC 0.05%
+        config: {
+          priority: 1,
+          minTvl: 1000000,
+          maxSlippage: 0.01,
+          tags: ['high-volume', 'stable'],
+        },
+      },
+      {
+        address: '0xd0b53D9277642d899DF5C87A3966A349A798F224' as Address, // WETH/USDC 0.3%
+        config: {
+          priority: 2,
+          minTvl: 500000,
+          maxSlippage: 0.02,
+          tags: ['medium-volume'],
+        },
+      },
+      {
+        address: '0xcDAC0d6c6C59727a65F871236188350531885C43' as Address, // Aerodrome WETH/USDC
+        config: {
+          priority: 1,
+          minTvl: 500000,
+          maxSlippage: 0.02,
+          tags: ['volatile', 'high-volume'],
+        },
+      },
+    ];
+
+    for (const { address, config } of defaultPools) {
+      this.addAuthorizedPool(address, config);
+    }
+
+    this.logger.info('Default pools loaded', { count: defaultPools.length });
+  }
+
+  /**
+   * Validate contract deployment
+   */
+  async validateDeployment(contractAddress: Address, provider: ethers.Provider): Promise<boolean> {
     try {
-      // Check if Flash Executor is configured
-      if (!this.isFlashExecutorDeployed()) {
-        logger.warn('Flash Executor not deployed');
+      // Check if contract exists
+      const code = await provider.getCode(contractAddress);
+      if (code === '0x') {
+        this.logger.error('Contract not deployed', { address: contractAddress });
         return false;
       }
 
-      // Validate contract address format
-      if (!ethers.isAddress(this.config.contracts.flashExecutor.address)) {
-        logger.error('Invalid Flash Executor address format');
+      // Try to call a view function to verify it's our contract
+      const contract = new ethers.Contract(
+        contractAddress,
+        ['function owner() view returns (address)'],
+        provider
+      );
+
+      const owner = await (contract['owner'] as () => Promise<string>)();
+      if (!ethers.isAddress(owner)) {
+        this.logger.error('Invalid contract owner', { address: contractAddress, owner });
         return false;
       }
 
-      // Validate authorized pools
-      const allPools = this.getAllAuthorizedPoolAddresses();
-      for (const poolAddress of allPools) {
-        if (!ethers.isAddress(poolAddress)) {
-          logger.error(`Invalid pool address format: ${poolAddress}`);
-          return false;
-        }
-      }
+      this.logger.info('Contract deployment validated', {
+        address: contractAddress,
+        owner,
+      });
 
-      // Validate minimum profit
-      try {
-        ethers.parseEther(this.config.deployment.minProfitEth);
-      } catch (error) {
-        logger.error('Invalid minimum profit format');
-        return false;
-      }
-
-      // Validate protocol addresses
-      const protocols = this.config.protocols;
-      if (!protocols || !protocols.aaveV3 || !ethers.isAddress(protocols.aaveV3.poolAddress)) {
-        logger.error('Invalid Aave V3 pool address in protocols config');
-        return false;
-      }
-      const moonwell = protocols.compoundLike?.moonwell;
-      const seamless = protocols.compoundLike?.seamless;
-      for (const entry of [moonwell, seamless]) {
-        if (!entry || !ethers.isAddress(entry.comptroller)) {
-          logger.error('Invalid Compound-like comptroller address in protocols config');
-          return false;
-        }
-        if (entry.markets) {
-          for (const m of entry.markets) {
-            if (!ethers.isAddress(m.underlying) || !ethers.isAddress(m.cToken)) {
-              logger.error('Invalid market mapping (underlying/cToken) in protocols config');
-              return false;
-            }
-          }
-        }
-      }
-
-      logger.info('Contract configuration validation passed');
       return true;
     } catch (error) {
-      logger.error('Contract configuration validation failed:', error);
+      this.logger.error('Contract validation failed', {
+        address: contractAddress,
+        error: error instanceof Error ? error.message : String(error),
+      });
       return false;
     }
   }
 
   /**
-   * Get contract deployment summary
+   * Get contract ABI for flash executor
    */
-  getDeploymentSummary(): {
-    flashExecutor: ContractConfig;
-    authorizedPoolsCount: number;
-    networks: string[];
-    isValid: boolean;
-  } {
-    return {
-      flashExecutor: this.config.contracts.flashExecutor,
-      authorizedPoolsCount: this.getAllAuthorizedPoolAddresses().length,
-      networks: Object.keys(this.config.networks),
-      isValid: this.validateConfig(),
-    };
-  }
-
-  /**
-   * Reset configuration (for testing only)
-   */
-  async resetConfig(): Promise<void> {
-    // Environment guard - only allow in test environment
-    if (process.env['NODE_ENV'] !== 'test') {
-      throw new Error('resetConfig can only be called in test environment');
-    }
-
-    this.config.contracts.flashExecutor = {
-      address: '',
-      deploymentBlock: 0,
-      deploymentTime: '',
-      network: '',
-      chainId: '',
-      owner: '',
-      minProfit: '',
-    };
-    await this.saveConfig();
-    logger.info('Contract configuration reset');
+  getFlashExecutorABI(): string[] {
+    return [
+      'function executeArbitrage(address flashPool, uint256 amount0, uint256 amount1, bytes calldata routeData) external',
+      'function uniswapV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external',
+      'function isAuthorizedPool(address pool) external view returns (bool)',
+      'function getMinProfit() external view returns (uint256)',
+      'function paused() external view returns (bool)',
+      'function owner() external view returns (address)',
+      'function setMinProfit(uint256 minProfit) external',
+      'function addAuthorizedPool(address pool) external',
+      'function removeAuthorizedPool(address pool) external',
+      'function pause() external',
+      'function unpause() external',
+      'function emergencyWithdraw(address token, uint256 amount) external',
+      'event ArbitrageExecuted(address indexed caller, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 profit, uint256 gasUsed)',
+      'event ArbitrageFailed(address indexed caller, string reason, uint256 gasUsed)',
+    ];
   }
 }

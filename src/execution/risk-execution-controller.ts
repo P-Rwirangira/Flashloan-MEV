@@ -892,10 +892,12 @@ export class RiskExecutionController extends EventEmitter implements IRiskContro
         this.circuitBreakerActivatedAt &&
         Date.now() - this.circuitBreakerActivatedAt > this.config.circuitBreakerRecoveryTimeMs
       ) {
-        // Check if conditions have improved
-        if (this.currentRiskScore < this.config.circuitBreakerThreshold * 0.8) {
-          this.deactivateCircuitBreaker('Risk conditions improved');
-        }
+        this.deactivateCircuitBreaker('Automatic recovery timeout');
+      }
+
+      // Check if conditions have improved
+      if (this.currentRiskScore < this.config.circuitBreakerThreshold * 0.8) {
+        this.deactivateCircuitBreaker('Risk conditions improved');
       }
     }, 60000); // Every minute
   }
