@@ -35,6 +35,16 @@ import { FlashLoanManager } from './execution/flash-loan-manager';
 import { TransactionLifecycleManager } from './execution/transaction-lifecycle-manager';
 import { PrivateRelayManager } from './execution/private-relay-manager';
 import { RiskExecutionController } from './execution/risk-execution-controller';
+// New simulator components
+import { FoundrySimulator } from './simulator/foundry-simulator';
+import { GasEstimator } from './simulator/gas-estimator';
+import { ProfitCalculator } from './simulator/profit-calculator';
+import { LiquidationCalculator } from './simulator/liquidation-calculator';
+import { StablePoolCalculator } from './simulator/stable-pool-calculator';
+// Configuration and utilities
+import { OracleAdapter } from './oracles/oracle-adapter';
+import { ContractManager } from './contracts/contract-manager';
+import { PoolStateManager } from './scanner/pool-state-manager';
 import { OpportunityType } from './types/execution';
 import { RelayProvider as PrivateRelayProvider } from './types/private-relay';
 import { EventEmitter } from 'events';
@@ -106,6 +116,16 @@ export class BaseMEVPlatform extends EventEmitter {
   private stablePoolCalculator?: RealStablePoolRebalancingCalculator;
   private transactionValidator?: RealTransactionValidator;
   private chainlinkOracle?: any; // Oracle for ETH price
+
+  // New simulator and utility components
+  private foundrySimulator?: FoundrySimulator;
+  private gasEstimator?: GasEstimator;
+  private profitCalculator?: ProfitCalculator;
+  private liquidationSimulator?: LiquidationCalculator;
+  private stablePoolSimulator?: StablePoolCalculator;
+  private oracleAdapter?: OracleAdapter;
+  private contractManager?: ContractManager;
+  private poolStateManager?: PoolStateManager;
 
   private isRunning = false;
   private platformLogger = createComponentLogger('platform');
@@ -581,6 +601,70 @@ export class BaseMEVPlatform extends EventEmitter {
         await this.handleStablePoolOpportunity(opportunity);
       });
     }
+
+    // Initialize new simulator and utility components
+    this.platformLogger.info('Initializing simulator and utility components');
+
+    // Initialize oracle adapter
+    this.oracleAdapter = new OracleAdapter({
+      chainlinkFeeds: {
+        'ETH/USD': '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70', // Base mainnet ETH/USD
+        'BTC/USD': '0x64c911996D3c6aC71f9b455B1E8E7266BcbD848F', // Base mainnet BTC/USD
+      },
+      fallbackProvider: 'coingecko',
+      updateInterval: 60000, // 1 minute
+      maxPriceAge: 300000, // 5 minutes
+    });
+
+    // Initialize contract manager
+    this.contractManager = new ContractManager();
+
+    // Initialize pool state manager
+    this.poolStateManager = new PoolStateManager(this.connectionManager, {
+      updateIntervalMs: 5000, // 5 seconds
+      maxStaleTimeMs: 30000, // 30 seconds
+      enableWebSocketUpdates: true,
+      batchUpdateSize: 10,
+    });
+
+    // Initialize foundry simulator
+    this.foundrySimulator = new FoundrySimulator({
+      forkUrl: process.env['BASE_RPC_URL'] || 'https://mainnet.base.org',
+      enableTracing: true,
+      maxGasLimit: 1000000n,
+    });
+
+    // Initialize gas estimator
+    this.gasEstimator = new GasEstimator({
+      provider: this.connectionManager.getProvider(),
+      safetyBuffer: 0.2, // 20% buffer
+      maxGasPrice: ethers.parseUnits('50', 'gwei'),
+      priorityFeeMultiplier: 1.1,
+    });
+
+    // Initialize profit calculator
+    this.profitCalculator = new ProfitCalculator({
+      flashLoanFeeRate: 0.0005, // 0.05%
+      gasPrice: 2000000000n, // 2 gwei for Base L2
+      maxSlippageBps: 250, // 2.5%
+      bribeMultiplier: 1.1,
+    });
+
+    // Initialize liquidation simulator
+    this.liquidationSimulator = new LiquidationCalculator({
+      provider: this.connectionManager.getProvider(),
+      maxGasPrice: ethers.parseUnits('50', 'gwei'),
+      minProfitThreshold: ethers.parseEther('0.01'), // 0.01 ETH
+      maxRiskScore: 80,
+    });
+
+    // Initialize stable pool simulator
+    this.stablePoolSimulator = new StablePoolCalculator({
+      maxPriceImpact: 0.5, // 0.5%
+      minProfitThreshold: ethers.parseEther('0.005'), // 0.005 ETH
+      gasPrice: 2000000000n, // 2 gwei
+      targetEfficiencyScore: 80,
+    });
 
     // Initialize Execution Engine
     if (this.config.featureFlags.enableExecutionEngine && this.config.execution?.enabled) {
@@ -1271,6 +1355,37 @@ export class BaseMEVPlatform extends EventEmitter {
   private async startPhaseComponents(): Promise<void> {
     if (!this.config) return;
 
+    // Start new utility components
+    if (this.poolStateManager) {
+      this.platformLogger.info('Starting pool state manager');
+      try {
+        await this.poolStateManager.start();
+        this.platformLogger.info('Pool state manager started successfully');
+      } catch (error) {
+        this.platformLogger.warn('Pool state manager startup failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (this.contractManager) {
+      this.platformLogger.info('Initializing contract configurations');
+      try {
+        // Log contract manager status
+        this.platformLogger.debug('Contract manager initialized', {
+          hasFlashExecutor: !!process.env['FLASH_EXECUTOR_ADDRESS'],
+        });
+      } catch (error) {
+        this.platformLogger.warn('Contract manager initialization failed', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    if (this.foundrySimulator) {
+      this.platformLogger.info('Foundry simulator ready for transaction validation');
+    }
+
     // Start Phase 1: Arbitrage scanning
     if (this.config.phases.arbitrage.enabled && this.arbitrageScanner) {
       this.platformLogger.info('Starting arbitrage scanning');
@@ -1357,6 +1472,47 @@ export class BaseMEVPlatform extends EventEmitter {
     try {
       const operationId = `arbitrage-${opportunity.id}`;
       this.platformLogger.startPerformanceTracking(operationId);
+
+      // Use gas estimator for better gas estimation
+      if (this.gasEstimator && opportunity.type === 'arbitrage') {
+        try {
+          const gasEstimate = await this.gasEstimator.estimateArbitrageGas(opportunity);
+          this.platformLogger.debug('Gas estimation completed', {
+            opportunityId: opportunity.id,
+            gasLimit: gasEstimate.gasLimit.toString(),
+            totalCost: gasEstimate.totalCost.toString(),
+            confidence: gasEstimate.confidence,
+          });
+        } catch (error) {
+          this.platformLogger.warn('Gas estimation failed', {
+            opportunityId: opportunity.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      // Use profit calculator for detailed profit analysis
+      if (this.profitCalculator && opportunity.type === 'arbitrage') {
+        try {
+          const gasEstimate = 300000n; // Fallback gas estimate
+          const profitBreakdown = this.profitCalculator.calculateArbitrageProfit(
+            opportunity,
+            gasEstimate
+          );
+
+          this.platformLogger.debug('Profit calculation completed', {
+            opportunityId: opportunity.id,
+            netProfit: profitBreakdown.netProfit.toString(),
+            profitMarginBps: profitBreakdown.profitMarginBps,
+            gasCost: profitBreakdown.gasCost.toString(),
+          });
+        } catch (error) {
+          this.platformLogger.warn('Profit calculation failed', {
+            opportunityId: opportunity.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
 
       // Check circuit breaker
       const canExecute = await new Promise<boolean>(resolve => {
@@ -1602,6 +1758,35 @@ export class BaseMEVPlatform extends EventEmitter {
       const operationId = `liquidation-${opportunity.id}`;
       this.platformLogger.startPerformanceTracking(operationId);
 
+      // Use liquidation simulator for detailed analysis
+      if (this.liquidationSimulator && opportunity.type === 'liquidation') {
+        try {
+          const liquidationResult =
+            await this.liquidationSimulator.calculateLiquidation(opportunity);
+          this.platformLogger.debug('Liquidation simulation completed', {
+            opportunityId: opportunity.id,
+            profitable: liquidationResult.profitable,
+            netProfit: liquidationResult.profitAfterGas.toString(),
+            riskScore: liquidationResult.riskScore,
+            maxLiquidationAmount: liquidationResult.maxLiquidationAmount.toString(),
+          });
+
+          // Skip if simulation shows it's not profitable or too risky
+          if (!liquidationResult.profitable) {
+            this.platformLogger.info('Liquidation simulation shows unprofitable opportunity', {
+              opportunityId: opportunity.id,
+              riskScore: liquidationResult.riskScore,
+            });
+            return;
+          }
+        } catch (error) {
+          this.platformLogger.warn('Liquidation simulation failed', {
+            opportunityId: opportunity.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
       // Check circuit breaker
       const canExecute = await new Promise<boolean>(resolve => {
         this.circuitBreaker
@@ -1684,6 +1869,35 @@ export class BaseMEVPlatform extends EventEmitter {
     try {
       const operationId = `stable-rebalance-${opportunity.id}`;
       this.platformLogger.startPerformanceTracking(operationId);
+
+      // Use stable pool simulator for detailed analysis
+      if (this.stablePoolSimulator && opportunity.type === 'rebalance') {
+        try {
+          const rebalanceResult = this.stablePoolSimulator.calculateRebalancing(opportunity);
+          this.platformLogger.debug('Stable pool simulation completed', {
+            opportunityId: opportunity.id,
+            profitable: rebalanceResult.profitable,
+            netProfit: rebalanceResult.profitAfterGas.toString(),
+            efficiencyScore: rebalanceResult.efficiencyScore,
+            priceImpact: rebalanceResult.priceImpact,
+            newRatio: rebalanceResult.newRatio,
+          });
+
+          // Skip if simulation shows it's not profitable or efficient
+          if (!rebalanceResult.profitable) {
+            this.platformLogger.info('Stable pool simulation shows unprofitable opportunity', {
+              opportunityId: opportunity.id,
+              efficiencyScore: rebalanceResult.efficiencyScore,
+            });
+            return;
+          }
+        } catch (error) {
+          this.platformLogger.warn('Stable pool simulation failed', {
+            opportunityId: opportunity.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
 
       // Check circuit breaker
       const canExecute = await new Promise<boolean>(resolve => {
@@ -1840,14 +2054,16 @@ export class BaseMEVPlatform extends EventEmitter {
    */
   private async getCurrentEthPrice(): Promise<number> {
     try {
-      // Try OracleAdapter (wraps Chainlink with caching/fallbacks)
-      try {
-        const { OracleAdapter } = await import('./oracles/oracle-adapter');
-        const oa = new OracleAdapter(this.connectionManager);
-        const ethPrice = await oa.getEthUsd();
-        if (ethPrice > 0) return ethPrice;
-      } catch (_) {
-        // fall through
+      // Try initialized OracleAdapter first
+      if (this.oracleAdapter) {
+        try {
+          const ethPrice = await this.oracleAdapter.getEthUsd();
+          if (ethPrice > 0) return ethPrice;
+        } catch (error) {
+          this.platformLogger.warn('Oracle adapter failed, falling back', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
 
       // Fallback to external API
