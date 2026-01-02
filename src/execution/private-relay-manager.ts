@@ -403,8 +403,377 @@ export class PrivateRelayManager extends EventEmitter implements IPrivateRelayMa
   }
 
   /**
-   * Submit bundle of transactions
+   * Submit raw/signed bundle (rawTransactions first, then sign and include TransactionRequest[])
    */
+  async submitBundleRaw(
+    bundle: import('../types/private-relay').BundleSubmissionRaw,
+    _options: import('../types/private-relay').SubmissionOptions = {}
+  ): Promise<import('../types/private-relay').BundleSubmissionResult> {
+    const startTime = Date.now();
+    try {
+      const provider = this.config.defaultRelay;
+      const relayConfig = this.relayConfigs.get(provider);
+      if (!relayConfig) throw new Error('Default relay not configured');
+
+      const txHashes: string[] = [];
+
+      // Submit raw transactions first (e.g., target user tx)
+      for (const raw of bundle.rawTransactions || []) {
+        const res = await this.postRawToRelay(relayConfig, raw);
+        if (!res.success || !res.transactionHash) {
+          return {
+            success: false,
+            relayProvider: provider,
+            latency: Date.now() - startTime,
+            failureReason: res.failureReason || 'Raw tx submission failed',
+            timestamp: Date.now(),
+          };
+        }
+        txHashes.push(res.transactionHash);
+      }
+
+      // Sign and submit our own TransactionRequests as raw
+      for (const tx of bundle.transactions || []) {
+        const signed = await this.signer.signTransaction(tx);
+        const res = await this.postRawToRelay(relayConfig, signed);
+        if (!res.success || !res.transactionHash) {
+          return {
+            success: false,
+            relayProvider: provider,
+            latency: Date.now() - startTime,
+            failureReason: res.failureReason || 'Signed tx submission failed',
+            timestamp: Date.now(),
+          };
+        }
+        txHashes.push(res.transactionHash);
+      }
+
+      return {
+        success: true,
+        relayProvider: provider,
+        transactionHashes: txHashes,
+        latency: Date.now() - startTime,
+        timestamp: Date.now(),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        relayProvider: this.config.defaultRelay,
+        latency: Date.now() - startTime,
+        failureReason: error instanceof Error ? error.message : String(error),
+        timestamp: Date.now(),
+      };
+    }
+  }
+
+  async submitProviderRawBundle(
+    provider: import('../types/private-relay').RelayProvider,
+    bundle: import('../types/private-relay').ProviderRawBundleRequest,
+    options: import('../types/private-relay').SubmissionOptions = {}
+  ): Promise<import('../types/private-relay').BundleSubmissionResult> {
+    const start = Date.now();
+    try {
+      const relayConfig = this.relayConfigs.get(provider);
+      if (!relayConfig) throw new Error('Relay not configured');
+
+      if (provider === RelayProvider.FLASHBOTS_PROTECT) {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (relayConfig.authentication?.apiKey)
+          headers['Authorization'] = `Bearer ${relayConfig.authentication.apiKey}`;
+        // Optional simulation before submission
+        if (options.simulateFirst) {
+          const simBody = {
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'eth_callBundle',
+            params: [
+              {
+                txs: bundle.rawTransactions,
+                blockNumber: '0x' + bundle.targetBlockNumber.toString(16),
+                stateBlockNumber: 'latest',
+                timestamp: bundle.minTimestamp || Math.floor(Date.now() / 1000),
+              },
+            ],
+          };
+          const simResp = await fetch(relayConfig.endpoint, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(simBody),
+            signal: AbortSignal.timeout(relayConfig.timeoutMs),
+          });
+          const simJson: any = await simResp.json();
+          if (!simResp.ok || simJson.error) {
+            return {
+              success: false,
+              relayProvider: provider,
+              failureReason: simJson?.error?.message || `Simulation HTTP ${simResp.status}`,
+              latency: Date.now() - start,
+              timestamp: Date.now(),
+            };
+          }
+          // Basic failure detection: errors in results or overall negative coinbaseDiff
+          try {
+            const results = simJson.result?.results;
+            if (Array.isArray(results) && results.some((r: any) => r.error)) {
+              return {
+                success: false,
+                relayProvider: provider,
+                failureReason: 'Simulation failed: tx error in bundle',
+                latency: Date.now() - start,
+                timestamp: Date.now(),
+              };
+            }
+            // Guard: require positive coinbaseDiff for profitable/acceptable bundles
+            const coinbaseDiffHex: any = simJson.result?.coinbaseDiff;
+            if (typeof coinbaseDiffHex === 'string') {
+              let diff = 0n;
+              try {
+                // Supports 0x-prefixed hex or decimal string
+                diff = coinbaseDiffHex.startsWith('0x')
+                  ? BigInt(coinbaseDiffHex)
+                  : BigInt(coinbaseDiffHex);
+              } catch {}
+              if (diff <= 0n) {
+                return {
+                  success: false,
+                  relayProvider: provider,
+                  failureReason: 'Simulation failed: non-positive coinbaseDiff',
+                  latency: Date.now() - start,
+                  timestamp: Date.now(),
+                };
+              }
+            }
+            // Additional simulation checks: per-tx revert reason parsing and gas usage thresholds
+            try {
+              const results = simJson.result?.results;
+              if (Array.isArray(results)) {
+                // Detect explicit revert reasons in any tx
+                for (const r of results) {
+                  const errMsg = (
+                    r?.error?.message ||
+                    r?.error ||
+                    r?.revertReason ||
+                    ''
+                  ).toString();
+                  if (errMsg && /revert/i.test(errMsg)) {
+                    return {
+                      success: false,
+                      relayProvider: provider,
+                      failureReason: `Simulation failed: ${errMsg}`,
+                      latency: Date.now() - start,
+                      timestamp: Date.now(),
+                    };
+                  }
+                }
+                // Optional gas usage thresholds via env
+                const maxTotalGasEnv = process.env['BACKRUN_SIM_MAX_TOTAL_GAS'];
+                const maxTxGasEnv = process.env['BACKRUN_SIM_MAX_TX_GAS'];
+                const maxTotalGas = maxTotalGasEnv ? BigInt(maxTotalGasEnv) : undefined;
+                const maxTxGas = maxTxGasEnv ? BigInt(maxTxGasEnv) : undefined;
+                let totalGasUsed = 0n;
+                for (const r of results) {
+                  const gu = r?.gasUsed;
+                  if (gu !== undefined) {
+                    let g = 0n;
+                    try {
+                      g = typeof gu === 'string' && gu.startsWith('0x') ? BigInt(gu) : BigInt(gu);
+                    } catch {}
+                    totalGasUsed += g;
+                    if (maxTxGas !== undefined && g > maxTxGas) {
+                      return {
+                        success: false,
+                        relayProvider: provider,
+                        failureReason: `Simulation failed: tx gasUsed ${g.toString()} exceeds per-tx limit`,
+                        latency: Date.now() - start,
+                        timestamp: Date.now(),
+                      };
+                    }
+                  }
+                }
+                if (maxTotalGas !== undefined && totalGasUsed > maxTotalGas) {
+                  return {
+                    success: false,
+                    relayProvider: provider,
+                    failureReason: `Simulation failed: total gasUsed ${totalGasUsed.toString()} exceeds limit`,
+                    latency: Date.now() - start,
+                    timestamp: Date.now(),
+                  };
+                }
+              }
+            } catch {}
+          } catch {}
+        }
+        const body = {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'eth_sendBundle',
+          params: [
+            {
+              txs: bundle.rawTransactions,
+              blockNumber: '0x' + bundle.targetBlockNumber.toString(16),
+              minTimestamp: bundle.minTimestamp,
+              maxTimestamp: bundle.maxTimestamp,
+              revertingTxHashes: bundle.revertingTxHashes,
+            },
+          ],
+        };
+        const resp = await fetch(relayConfig.endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(relayConfig.timeoutMs),
+        });
+        const json: any = await resp.json();
+        if (!resp.ok || json.error) throw new Error(json.error?.message || `HTTP ${resp.status}`);
+        const bundleHash = json.result?.bundleHash || json.result?.bundleHashHex || json.result;
+        return {
+          success: true,
+          relayProvider: provider,
+          bundleHash,
+          latency: Date.now() - start,
+          timestamp: Date.now(),
+        };
+      }
+
+      // bloXroute: attempt provider-specific raw bundle if endpoint override provided
+      if (provider === RelayProvider.BLOXROUTE) {
+        const override = process.env['BLOXROUTE_RAW_BUNDLE_ENDPOINT'];
+        const relayConfig = this.relayConfigs.get(provider);
+        if (override || relayConfig) {
+          try {
+            const endpoint = override || (relayConfig as any).endpoint;
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (relayConfig?.authentication?.apiKey)
+              headers['Authorization'] = relayConfig.authentication.apiKey;
+            const body = {
+              transactions: bundle.rawTransactions,
+              blockchain_network: 'Base',
+              target_block: bundle.targetBlockNumber,
+            };
+            const resp = await fetch(`${endpoint}/v1/txs/bundle`, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify(body),
+              signal: AbortSignal.timeout(relayConfig?.timeoutMs || 30000),
+            });
+            const json: any = await resp.json();
+            if (!resp.ok || !json.success) throw new Error(json.error || `HTTP ${resp.status}`);
+            const bundleHash = json.bundle_hash || json.result || undefined;
+            return {
+              success: true,
+              relayProvider: provider,
+              bundleHash,
+              latency: Date.now() - start,
+              timestamp: Date.now(),
+            };
+          } catch (e) {
+            return {
+              success: false,
+              relayProvider: provider,
+              failureReason: e instanceof Error ? e.message : String(e),
+              latency: Date.now() - start,
+              timestamp: Date.now(),
+            };
+          }
+        }
+      }
+
+      // Fallback: provider doesn't support raw bundle endpoint
+      return {
+        success: false,
+        relayProvider: provider,
+        failureReason: 'Provider-specific raw bundle not supported',
+        latency: Date.now() - start,
+        timestamp: Date.now(),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        relayProvider: provider,
+        failureReason: error instanceof Error ? error.message : String(error),
+        latency: Date.now() - start,
+        timestamp: Date.now(),
+      };
+    }
+  }
+
+  private async postRawToRelay(
+    relay: import('../types/private-relay').RelayProviderConfig,
+    rawTx: string
+  ): Promise<import('../types/private-relay').RelaySubmissionResult> {
+    const start = Date.now();
+    try {
+      if (relay.provider === RelayProvider.FLASHBOTS_PROTECT) {
+        const body = {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'eth_sendRawTransaction',
+          params: [rawTx],
+        };
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (relay.authentication?.apiKey)
+          headers['Authorization'] = `Bearer ${relay.authentication.apiKey}`;
+        const resp = await fetch(relay.endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(relay.timeoutMs),
+        });
+        const json: any = await resp.json();
+        if (!resp.ok || json.error) throw new Error(json.error?.message || `HTTP ${resp.status}`);
+        return {
+          success: true,
+          relayProvider: relay.provider,
+          transactionHash: json.result,
+          latency: Date.now() - start,
+          retryCount: 0,
+          timestamp: Date.now(),
+        };
+      }
+      if (relay.provider === RelayProvider.BLOXROUTE) {
+        const body = { transaction: rawTx, blockchain_network: 'Base', mev_protection: true };
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (relay.authentication?.apiKey) headers['Authorization'] = relay.authentication.apiKey;
+        const resp = await fetch(`${relay.endpoint}/v1/tx`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(relay.timeoutMs),
+        });
+        const json: any = await resp.json();
+        if (!resp.ok || !json.success) throw new Error(json.error || `HTTP ${resp.status}`);
+        return {
+          success: true,
+          relayProvider: relay.provider,
+          transactionHash: json.tx_hash,
+          latency: Date.now() - start,
+          retryCount: 0,
+          timestamp: Date.now(),
+        };
+      }
+      // Local node fallback
+      const provider = new (require('ethers').JsonRpcProvider)(relay.endpoint);
+      const hash = await provider.send('eth_sendRawTransaction', [rawTx]);
+      return {
+        success: true,
+        relayProvider: relay.provider,
+        transactionHash: hash,
+        latency: Date.now() - start,
+        retryCount: 0,
+        timestamp: Date.now(),
+      };
+    } catch (error) {
+      return {
+        success: false,
+        relayProvider: relay.provider,
+        failureReason: error instanceof Error ? error.message : String(error),
+        latency: Date.now() - start,
+        retryCount: 0,
+        timestamp: Date.now(),
+      };
+    }
+  }
+
   async submitBundle(
     bundle: BundleSubmission,
     options: SubmissionOptions = {}

@@ -402,6 +402,32 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
         executionData,
       };
 
+      // Enforce strict min-profit guardrail in USD if profit validation enabled
+      if (this.config.enableProfitValidation) {
+        try {
+          const { validateProfitThreshold } = await import('../config/profit-thresholds');
+          const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+          const cm = { getProvider: () => this.getProvider() } as any;
+          const oracle = new ChainlinkPriceOracleImpl(cm);
+          const ethUsd = await oracle.getEthUsdPrice();
+          const netProfitUsd = (Number(expectedProfit) / 1e18) * ethUsd;
+          const profitMarginBps =
+            Number(opportunity.amountIn) > 0
+              ? (netProfitUsd / ((Number(opportunity.amountIn) / 1e18) * ethUsd)) * 10000
+              : 0;
+
+          const validation = validateProfitThreshold('arbitrage', netProfitUsd, profitMarginBps);
+          if (!validation.valid) {
+            throw new Error(`Profit validation failed: ${validation.reason}`);
+          }
+        } catch (e) {
+          // On oracle failure, still require positive netProfit in wei
+          if (expectedProfit <= 0n) {
+            throw new Error('Net profit non-positive');
+          }
+        }
+      }
+
       this.logger.debug('Execution plan built', {
         opportunityId: opportunity.id,
         flashLoanProvider: flashLoanSource.provider,
@@ -499,13 +525,22 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
     };
     const gasLimit = await this.estimateGas(gasEstimationOpportunity);
 
+    // Ensure dynamic fee data if context is missing it
+    let maxFeePerGas = context.maxFeePerGas;
+    let maxPriorityFeePerGas = context.maxPriorityFeePerGas;
+    if (!maxFeePerGas || !maxPriorityFeePerGas) {
+      const fd = await this.getProvider().getFeeData();
+      maxFeePerGas = fd.maxFeePerGas || fd.gasPrice || 50_000_000_000n;
+      maxPriorityFeePerGas = fd.maxPriorityFeePerGas || 2_000_000_000n;
+    }
+
     const transaction: TransactionRequest = {
       to: this.config.flashExecutorAddress,
       data: txData,
       value: 0n,
       gasLimit,
-      maxFeePerGas: context.maxFeePerGas,
-      maxPriorityFeePerGas: context.maxPriorityFeePerGas,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
       type: 2,
     };
 

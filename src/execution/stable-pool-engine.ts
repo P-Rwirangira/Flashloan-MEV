@@ -28,6 +28,9 @@ export interface StablePoolEngineConfig {
   readonly minImbalanceThreshold: number;
   readonly maxPriceImpactBps: number;
   readonly incentiveMultiplier: number;
+  readonly routerAddress?: Address; // Aerodrome router address
+  readonly recipientAddress?: Address; // Recipient for swaps
+  readonly deadlineSeconds?: number; // Deadline delta for swaps
 }
 
 export interface RebalancingTrade {
@@ -183,6 +186,7 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
 
       // Calculate price impact
       const priceImpact = await this.calculatePriceImpact(
+        opportunity.poolAddress,
         poolState,
         optimalAmount,
         expectedAmountOut
@@ -434,7 +438,12 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
         tokenOut: opportunity.token1,
         amountIn: optimalSize,
         expectedAmountOut,
-        priceImpact: await this.calculatePriceImpact(poolState, optimalSize, expectedAmountOut),
+        priceImpact: await this.calculatePriceImpact(
+          opportunity.poolAddress,
+          poolState,
+          optimalSize,
+          expectedAmountOut
+        ),
         tradingFee: (optimalSize * BigInt(poolState.fee)) / 10000n,
         expectedIncentives: await this.estimateIncentiveRewards(opportunity, optimalSize),
         gasEstimate: 300000n,
@@ -517,6 +526,7 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
    * Calculate price impact
    */
   private async calculatePriceImpact(
+    poolAddress: Address,
     poolState: StablePoolState,
     amountIn: bigint,
     amountOut: bigint
@@ -537,7 +547,7 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
           'function getAmountOut(uint256 amountIn, address tokenIn) view returns (uint256)',
         ];
         const poolContract = new ethers.Contract(
-          (this as any).currentPoolAddress || '',
+          poolState.token0 ? poolAddress : (poolAddress as string),
           poolAbi,
           provider
         );
@@ -649,29 +659,49 @@ export class StablePoolEngine extends EventEmitter implements ExecutionEngine {
     trade: RebalancingTrade
   ): Promise<TransactionRequest> {
     try {
-      // Build transaction data for stable pool rebalancing
-      // This would encode the swap call for Aerodrome stable pools
-      const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+      // Prefer using Aerodrome Router for safe swap with minOut and deadline
+      if (!this.config.routerAddress) {
+        throw new Error('Aerodrome routerAddress not configured in StablePoolEngineConfig');
+      }
 
-      // Encode swap parameters
-      const swapData = abiCoder.encode(
-        ['address', 'address', 'uint256', 'uint256', 'address'],
-        [
-          trade.tokenIn,
-          trade.tokenOut,
-          trade.amountIn,
-          trade.expectedAmountOut,
-          opportunity.poolAddress,
-        ]
-      );
+      const routerAbi = [
+        'function swapExactTokensForTokens(uint amountIn, uint amountOutMin, tuple(address from,address to,bool stable)[] routes, address to, uint deadline) returns (uint[] memory amounts)',
+      ];
+      const feeData = await this.transactionManager.getProvider().getFeeData();
+      const maxFeePerGas = feeData.maxFeePerGas || feeData.gasPrice || 50_000_000_000n;
+      const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas || 2_000_000_000n;
+
+      const amountOutMin =
+        (trade.expectedAmountOut * BigInt(10000 - this.config.maxSlippageBps)) / 10000n;
+      const routes = [
+        {
+          from: trade.tokenIn,
+          to: trade.tokenOut,
+          stable: true,
+        },
+      ];
+      const recipient =
+        this.config.recipientAddress ||
+        (process.env['EXECUTION_WALLET_ADDRESS'] as Address) ||
+        opportunity.poolAddress;
+      const deadline = Math.floor(Date.now() / 1000) + (this.config.deadlineSeconds ?? 60);
+
+      const iface = new ethers.Interface(routerAbi);
+      const data = iface.encodeFunctionData('swapExactTokensForTokens', [
+        trade.amountIn,
+        amountOutMin,
+        routes,
+        recipient,
+        deadline,
+      ]);
 
       return {
-        to: opportunity.poolAddress,
-        data: swapData,
+        to: this.config.routerAddress,
+        data,
         value: 0n,
         gasLimit: trade.gasEstimate,
-        maxFeePerGas: BigInt(50e9), // 50 gwei
-        maxPriorityFeePerGas: BigInt(2e9), // 2 gwei
+        maxFeePerGas,
+        maxPriorityFeePerGas,
         type: 2,
       };
     } catch (error) {

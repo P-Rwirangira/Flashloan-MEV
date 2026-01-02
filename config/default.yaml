@@ -78,7 +78,7 @@ performance:
 strategies:
   arbitrage:
     enabled: true
-    minProfitUSD: 15.0
+    minProfitUSD: 8.0  # Base L2 optimized threshold
     maxSlippageBps: 100  # 1%
     maxGasPriceGwei: 50
     maxPositionSize: 50000  # USD
@@ -88,7 +88,7 @@ strategies:
       - "wstETH/ETH"
     maxRoutes: 3
     fallbackRoutes: 2
-    minSpreadBps: 25  # 0.25%
+    minSpreadBps: 15  # Lowered from 25 to catch more opportunities
     maxPriceImpactBps: 50  # 0.5%
     dexPriority:
       - "uniswap-v3"
@@ -97,8 +97,8 @@ strategies:
 
   liquidation:
     enabled: false  # Phase 2
-    minProfitUSD: 10.0
-    maxSlippageBps: 100
+    minProfitUSD: 15.0  # Higher due to complexity
+    maxSlippageBps: 250  # 2.5%
     maxGasPriceGwei: 100
     maxPositionSize: 50000
     cooldownMs: 5000
@@ -114,8 +114,8 @@ strategies:
 
   rebalancing:
     enabled: false  # Phase 3
-    minProfitUSD: 3.0
-    maxSlippageBps: 30
+    minProfitUSD: 5.0  # Lower for stable swaps
+    maxSlippageBps: 50  # 0.5%
     maxGasPriceGwei: 30
     maxPositionSize: 5000
     cooldownMs: 2000
@@ -227,4 +227,4 @@ monitoring:
 # Environment settings
 environment: "development"
 debug: true
-dryRun: true
+dryRun: false  # Enable live trading

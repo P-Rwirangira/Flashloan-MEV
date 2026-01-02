@@ -56,6 +56,13 @@ export interface MempoolMonitorOptions {
   readonly uniswapV3QuoterAddress?: string | undefined;
   readonly aerodromeRouterAddress?: string | undefined;
   readonly backrunRecipient?: string | undefined;
+  readonly allowedTokens?: string[] | undefined;
+  readonly allowedPools?: string[] | undefined;
+  readonly enableExternalStreams?: boolean | undefined;
+  readonly flashbotsStreamUrl?: string | undefined;
+  readonly bloxrouteStreamUrl?: string | undefined;
+  readonly flashbotsAuth?: string | undefined;
+  readonly bloxrouteAuth?: string | undefined;
 }
 
 export interface MempoolStats {
@@ -66,6 +73,10 @@ export interface MempoolStats {
   sandwichOpportunities: number;
   avgGasPrice: bigint;
   memoryUsageMB: number;
+  decodeSuccess: number;
+  decodeFailure: number;
+  quoteSuccess: number;
+  quoteFailure: number;
 }
 
 export interface DecodedSwap {

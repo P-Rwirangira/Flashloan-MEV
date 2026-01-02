@@ -15,6 +15,7 @@ import {
   OpportunityType,
 } from '../types/execution';
 import { TransactionRequest } from '../types/transaction';
+import { RelayProvider } from '../types/private-relay';
 import { FlashLoanManager } from './flash-loan-manager';
 import { TransactionLifecycleManager } from './transaction-lifecycle-manager';
 import { Address } from '../types/common';
@@ -71,12 +72,14 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
   constructor(
     config: BackrunEngineConfig,
     flashLoanManager: FlashLoanManager,
-    transactionManager: TransactionLifecycleManager
+    transactionManager: TransactionLifecycleManager,
+    privateRelayManager?: import('../types/private-relay').IPrivateRelayManager
   ) {
     super();
     this.config = config;
     this.flashLoanManager = flashLoanManager;
     this.transactionManager = transactionManager;
+    (this as any).privateRelayManager = privateRelayManager;
 
     this.initializeMEVProtectionPatterns();
 
@@ -425,25 +428,52 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
       // Check if still profitable - convert USD threshold to ETH properly
       const currentProfit = await this.calculateCurrentProfit(opportunity);
 
-      // Convert USD threshold to ETH amount first, then to wei using Chainlink
+      // Convert USD threshold to ETH amount first, then to wei using centralized config
       try {
+        const { validateProfitThreshold } = await import('../config/profit-thresholds');
         const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
         const cm = { getProvider: () => this.transactionManager.getProvider() } as any;
         const oracle = new ChainlinkPriceOracleImpl(cm);
         const ethPriceUsd = await oracle.getEthUsdPrice();
-        const minProfitEth = this.config.minProfitThresholdUsd / Math.max(ethPriceUsd, 1e-9);
-        const minProfitThreshold = ethers.parseEther(minProfitEth.toString());
-        if (currentProfit < minProfitThreshold) {
+        const currentProfitUsd = (Number(currentProfit) / 1e18) * ethPriceUsd;
+        const profitMarginBps =
+          Number(opportunity.backrunAmount || 0n) > 0
+            ? (currentProfitUsd /
+                ((Number(opportunity.backrunAmount || 0n) / 1e18) * ethPriceUsd)) *
+              10000
+            : 0;
+
+        const validation = validateProfitThreshold('backrun', currentProfitUsd, profitMarginBps);
+        if (!validation.valid) {
           this.logger.warn('Backrun not profitable enough', {
             opportunityId: opportunity.id,
-            currentProfit: currentProfit.toString(),
-            minProfitThreshold: minProfitThreshold.toString(),
+            currentProfitUsd,
+            profitMarginBps,
+            reason: validation.reason,
           });
           return false;
         }
       } catch (e) {
-        // No fallback: require oracle availability for accurate thresholding
-        return false;
+        // Fallback to original threshold logic
+        try {
+          const { ChainlinkPriceOracleImpl } = await import('../oracles/chainlink-oracle');
+          const cm = { getProvider: () => this.transactionManager.getProvider() } as any;
+          const oracle = new ChainlinkPriceOracleImpl(cm);
+          const ethPriceUsd = await oracle.getEthUsdPrice();
+          const minProfitEth = this.config.minProfitThresholdUsd / Math.max(ethPriceUsd, 1e-9);
+          const minProfitThreshold = ethers.parseEther(minProfitEth.toString());
+          if (currentProfit < minProfitThreshold) {
+            this.logger.warn('Backrun not profitable enough (fallback)', {
+              opportunityId: opportunity.id,
+              currentProfit: currentProfit.toString(),
+              minProfitThreshold: minProfitThreshold.toString(),
+            });
+            return false;
+          }
+        } catch (fallbackError) {
+          // No fallback: require oracle availability for accurate thresholding
+          return false;
+        }
       }
 
       return true;
@@ -781,8 +811,111 @@ export class BackrunEngine extends EventEmitter implements ExecutionEngine {
       // Build backrun transaction
       const backrunTx = await this.buildBackrunTransaction(opportunity, route);
 
-      // Submit transaction through lifecycle manager
-      const transactionHash = await this.submitTransactionViaManager(backrunTx);
+      // If PrivateRelayManager is available, submit as a bundle (single-tx bundle for now)
+      let transactionHash: string;
+      const prm = (this as any).privateRelayManager as
+        | import('../types/private-relay').IPrivateRelayManager
+        | undefined;
+      if (prm) {
+        // Try to include the target transaction in the bundle if raw is available
+        let rawTarget: string | null = null;
+        try {
+          const raw = await (this.transactionManager.getProvider() as any).send(
+            'eth_getRawTransactionByHash',
+            [opportunity.targetTransaction]
+          );
+          if (typeof raw === 'string' && raw.startsWith('0x')) rawTarget = raw;
+        } catch (_) {}
+
+        const currentBlock = await this.transactionManager.getProvider().getBlockNumber();
+        const blockOffset = Number(process.env['BACKRUN_BUNDLE_BLOCK_OFFSET'] || '1');
+        const targetBlock = currentBlock + Math.max(1, isNaN(blockOffset) ? 1 : blockOffset);
+        const minTsEnv = process.env['BACKRUN_BUNDLE_MIN_TS'];
+        const maxTsEnv = process.env['BACKRUN_BUNDLE_MAX_TS'];
+        const minTs = minTsEnv ? Number(minTsEnv) : undefined;
+        const maxTs = maxTsEnv ? Number(maxTsEnv) : undefined;
+        let res: import('../types/private-relay').BundleSubmissionResult;
+        if (rawTarget) {
+          // Prefer provider-specific raw bundle if supported
+          const bundleReq: any = { rawTransactions: [rawTarget], targetBlockNumber: targetBlock };
+          if (minTs !== undefined) bundleReq.minTimestamp = minTs;
+          if (maxTs !== undefined) bundleReq.maxTimestamp = maxTs;
+          res = await prm.submitProviderRawBundle(RelayProvider.FLASHBOTS_PROTECT, bundleReq);
+          if (!res.success) {
+            // Fallback to generic raw submission flow
+            {
+              const opts: any = {
+                urgency: 'critical',
+                simulateFirst: true,
+                bundleTransactions: [backrunTx],
+              };
+              const mbEnv = process.env['BACKRUN_MAX_BRIBE_WEI'];
+              if (mbEnv !== undefined) opts.maxBribe = BigInt(mbEnv);
+              res = await prm.submitBundleRaw(
+                {
+                  rawTransactions: [rawTarget],
+                  transactions: [backrunTx],
+                  targetBlockNumber: targetBlock,
+                },
+                opts
+              );
+            }
+          } else {
+            // After sending bundle, submit our backrun tx raw as well to ensure inclusion (some relays expect only bundle)
+            {
+              const opts2: any = {
+                urgency: 'critical',
+                simulateFirst: true,
+                bundleTransactions: [backrunTx],
+              };
+              const mbEnv2 = process.env['BACKRUN_MAX_BRIBE_WEI'];
+              if (mbEnv2 !== undefined) opts2.maxBribe = BigInt(mbEnv2);
+              const appended = await prm.submitBundleRaw(
+                { rawTransactions: [], transactions: [backrunTx], targetBlockNumber: targetBlock },
+                opts2
+              );
+              // Do not override res success, but try to derive tx hash from append
+              if (
+                appended.success &&
+                appended.transactionHashes &&
+                appended.transactionHashes.length > 0
+              ) {
+                res.transactionHashes = appended.transactionHashes;
+              }
+            }
+            // Do not override res success, but try to derive tx hash from append
+          }
+        } else {
+          {
+            const opts3: any = {
+              urgency: 'critical',
+              simulateFirst: true,
+              bundleTransactions: [backrunTx],
+            };
+            const mbEnv3 = process.env['BACKRUN_MAX_BRIBE_WEI'];
+            if (mbEnv3 !== undefined) opts3.maxBribe = BigInt(mbEnv3);
+            res = await prm.submitBundle(
+              { transactions: [backrunTx], targetBlockNumber: targetBlock },
+              opts3
+            );
+          }
+        }
+        if (rawTarget) {
+          this.logger.info(
+            'Raw target transaction available for bundle (manager extension required)',
+            {
+              hasRawTarget: true,
+            }
+          );
+        }
+        if (!res.success || !res.transactionHashes || res.transactionHashes.length === 0) {
+          throw new Error(res.failureReason || 'Private relay bundle submission failed');
+        }
+        transactionHash = res.transactionHashes[0] as string;
+      } else {
+        // Submit transaction through lifecycle manager
+        transactionHash = await this.submitTransactionViaManager(backrunTx);
+      }
 
       // Monitor for inclusion and calculate actual profit
       const actualProfit = await this.calculateBackrunProfit(opportunity, route, transactionHash);

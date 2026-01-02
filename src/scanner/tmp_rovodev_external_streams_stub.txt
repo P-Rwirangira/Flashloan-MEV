@@ -1,0 +1,1 @@
+Scaffold: External streams will connect to provided WebSocket URLs (Flashbots or bloXroute) and normalize messages to tx hashes. Implemented in code via startExternalStreams and normalizeExternalMessage.

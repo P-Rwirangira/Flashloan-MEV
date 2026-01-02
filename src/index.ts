@@ -16,6 +16,8 @@ import { CircuitBreaker } from './monitoring/circuit-breaker';
 import { AlertingSystem } from './monitoring/alerting-system';
 import { HealthCheckSystem } from './monitoring/health-check';
 import { HealthServer } from './monitoring/health-server';
+import { ChainlinkPriceOracleImpl } from './oracles/chainlink-oracle';
+import { ethDeltaWeiToUsd } from './utils/pnl';
 import { RelayProvider } from './bundler/private-relay';
 import { LendingProtocolMonitor } from './scanner/lending-monitor';
 import { StablePoolMonitor } from './scanner/stable-pool-monitor';
@@ -261,6 +263,9 @@ export class BaseMEVPlatform extends EventEmitter {
       const rawConfig = await this.configLoader.load();
       this.config = this.parseConfig(rawConfig);
 
+      // Initialize price oracle
+      this.chainlinkOracle = new ChainlinkPriceOracleImpl(this.connectionManager);
+
       this.platformLogger.info('Configuration loaded successfully', {
         enabledPhases: Object.entries(this.config.phases)
           .filter(([, phase]) => phase.enabled)
@@ -443,6 +448,22 @@ export class BaseMEVPlatform extends EventEmitter {
         enableBackrun: true,
         enableFrontrun: false, // Disabled for ethical reasons
         enableSandwich: false, // Disabled for ethical reasons
+        // Fallback external streams (feature-flagged)
+        enableExternalStreams:
+          (process.env['ENABLE_EXTERNAL_MEMPOOL_STREAMS'] || 'false') === 'true',
+        flashbotsStreamUrl: process.env['FLASHBOTS_STREAM_URL'],
+        bloxrouteStreamUrl: process.env['BLOXROUTE_STREAM_URL'],
+        flashbotsAuth: process.env['FLASHBOTS_STREAM_AUTH'],
+        bloxrouteAuth: process.env['BLOXROUTE_STREAM_AUTH'],
+        // Allowlist filtering to reduce noise
+        allowedTokens: (process.env['ALLOWED_TOKENS'] || '')
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean),
+        allowedPools: (process.env['ALLOWED_POOLS'] || '')
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean),
       });
 
       // Set up event listener for mempool opportunities
@@ -603,9 +624,11 @@ export class BaseMEVPlatform extends EventEmitter {
           // Safe conversion to gwei using formatUnits equivalent
           maxGasPriceGwei: Number(this.config.execution.riskLimits.maxGasPrice) / 1e9,
           gasEstimationBuffer: 20, // 20%
-          // Fix: Convert ETH-denominated limit to USD properly
-          // TODO: Fetch current ETH/USD price from oracle for accurate conversion
-          maxDailyLossUsd: Number(this.config.execution.riskLimits.dailyLossLimit), // Convert to number
+          // Convert ETH-denominated daily loss limit to USD using Chainlink and pnl utils
+          maxDailyLossUsd: ethDeltaWeiToUsd(
+            this.config.execution.riskLimits.dailyLossLimit,
+            await this.chainlinkOracle.getEthUsdPrice()
+          ),
           maxConsecutiveLosses: 5,
           maxLossPerExecutionUsd: 100,
           maxPoolReserveChangeBps: 500, // 5%
@@ -741,15 +764,20 @@ export class BaseMEVPlatform extends EventEmitter {
           },
         });
 
-        this.transactionLifecycleManager = new TransactionLifecycleManager(provider, signer, {
-          maxSubmissionAttempts: 3,
-          submissionRetryDelayMs: 5000,
-          confirmationTimeoutMs: 60000,
-          confirmationBlocks: 1,
-          enableSimulation: true,
-          enableReplacement: true,
-          enableNonceManagement: true,
-        });
+        this.transactionLifecycleManager = new TransactionLifecycleManager(
+          provider,
+          signer,
+          {
+            maxSubmissionAttempts: 3,
+            submissionRetryDelayMs: 5000,
+            confirmationTimeoutMs: 60000,
+            confirmationBlocks: 1,
+            enableSimulation: true,
+            enableReplacement: true,
+            enableNonceManagement: true,
+          },
+          this.privateRelayManager
+        );
 
         // Get Flash Executor contract address from environment or config
         const flashExecutorAddress =
@@ -794,6 +822,8 @@ export class BaseMEVPlatform extends EventEmitter {
         );
 
         // Initialize Stable Pool Engine
+        // Resolve optional router and recipient for stable pool swaps
+        const stablePoolRecipient = (await signer.getAddress()) as any;
         this.stablePoolEngine = new StablePoolEngine(
           {
             maxSlippageBps: 100, // 1%
@@ -804,6 +834,9 @@ export class BaseMEVPlatform extends EventEmitter {
             minImbalanceThreshold: 0.02, // 2% minimum imbalance
             maxPriceImpactBps: 50, // 0.5% max price impact
             incentiveMultiplier: 1.2, // 20% bonus on incentives
+            routerAddress: (process.env['AERODROME_ROUTER_ADDRESS'] || '') as any,
+            recipientAddress: stablePoolRecipient,
+            deadlineSeconds: 60,
           },
           this.flashLoanManager,
           this.transactionLifecycleManager
@@ -822,7 +855,8 @@ export class BaseMEVPlatform extends EventEmitter {
             enableMEVProtectionDetection: true,
           },
           this.flashLoanManager,
-          this.transactionLifecycleManager
+          this.transactionLifecycleManager,
+          this.privateRelayManager
         );
 
         // Initialize execution orchestrator
@@ -1341,27 +1375,63 @@ export class BaseMEVPlatform extends EventEmitter {
         return;
       }
 
-      // Validate profit threshold using real market data
-      const currentEthPrice = await this.getCurrentEthPrice();
-      const minProfitUSD = 15.0; // Updated threshold for Base L2
-      // Use currentEthPrice for validation logic
-      this.platformLogger.debug('ETH price for validation', { currentEthPrice });
+      // Validate profit threshold using centralized configuration
+      try {
+        const { validateProfitThreshold } = await import('./config/profit-thresholds');
+        const currentEthPrice = await this.getCurrentEthPrice();
 
-      if (opportunity.expectedProfitUSD && opportunity.expectedProfitUSD < minProfitUSD) {
-        this.platformLogger.debug('Opportunity below profit threshold', {
+        // Calculate profit in USD
+        const profitUsd =
+          opportunity.expectedProfitUSD ||
+          (Number(opportunity.expectedProfit || 0n) / 1e18) * currentEthPrice;
+
+        // Calculate profit margin in basis points
+        const amountInUsd = (Number(opportunity.amountIn || 0n) / 1e18) * currentEthPrice;
+        const profitMarginBps = amountInUsd > 0 ? (profitUsd / amountInUsd) * 10000 : 0;
+
+        const validation = validateProfitThreshold('arbitrage', profitUsd, profitMarginBps);
+
+        if (!validation.valid) {
+          this.platformLogger.debug('Opportunity below profit threshold', {
+            opportunityId: opportunity.id,
+            expectedProfitUsd: profitUsd,
+            profitMarginBps,
+            reason: validation.reason,
+          });
+          return;
+        }
+
+        this.platformLogger.info('Profitable arbitrage opportunity found', {
           opportunityId: opportunity.id,
-          expectedProfit: opportunity.expectedProfitUSD,
-          minProfit: minProfitUSD,
+          route: opportunity.route,
+          expectedProfitUsd: profitUsd,
+          profitMarginBps,
+          spread: opportunity.spread,
         });
-        return;
-      }
+      } catch (error) {
+        // Fallback to basic validation if centralized config fails
+        const currentEthPrice = await this.getCurrentEthPrice();
+        const minProfitUSD = 8.0; // Base L2 optimized threshold
+        const profitUsd =
+          opportunity.expectedProfitUSD ||
+          (Number(opportunity.expectedProfit || 0n) / 1e18) * currentEthPrice;
 
-      this.platformLogger.info('Profitable arbitrage opportunity found', {
-        opportunityId: opportunity.id,
-        route: opportunity.route,
-        expectedProfit: opportunity.expectedProfitUSD,
-        spread: opportunity.spread,
-      });
+        if (profitUsd < minProfitUSD) {
+          this.platformLogger.debug('Opportunity below fallback profit threshold', {
+            opportunityId: opportunity.id,
+            expectedProfitUsd: profitUsd,
+            minProfit: minProfitUSD,
+          });
+          return;
+        }
+
+        this.platformLogger.info('Profitable arbitrage opportunity found (fallback validation)', {
+          opportunityId: opportunity.id,
+          route: opportunity.route,
+          expectedProfitUsd: profitUsd,
+          spread: opportunity.spread,
+        });
+      }
 
       // Execute opportunity using execution engine
       if (this.executionOrchestrator && this.config?.execution?.enabled) {

@@ -37,34 +37,91 @@ class ProfitThresholdCheck implements IRiskCheck {
   constructor(private config: RiskControllerConfig) {}
 
   async check(opportunity: BaseOpportunity, context: ExecutionContext): Promise<RiskCheckResult> {
-    // Use context for gas price validation
-    const currentGasPrice = context.gasPrice;
-    const profitUsd = Number(opportunity.estimatedProfit) / 1e18; // Assuming ETH-denominated
-    const amountUsd = Number((opportunity as ArbitrageOpportunity).amountIn || 0n) / 1e18;
-    const profitMarginBps = amountUsd > 0 ? (profitUsd / amountUsd) * 10000 : 0;
+    try {
+      // Import centralized profit thresholds
+      const { validateProfitThreshold } = await import('../config/profit-thresholds');
 
-    const meetsMinProfit = profitUsd >= this.config.minProfitUsd;
-    const meetsMinMargin = profitMarginBps >= this.config.minProfitMarginBps;
+      // Calculate profit in USD (handle different token denominations)
+      let profitUsd = 0;
+      let profitMarginBps = 0;
 
-    // Log context usage for validation (simple validation)
-    if (context.timestamp > 0 && currentGasPrice > 0n) {
-      // Context is being used for validation
+      if (opportunity.type === 'arbitrage') {
+        const arbOpp = opportunity as ArbitrageOpportunity;
+        // Use context for gas price validation
+        const currentGasPrice = context.gasPrice;
+
+        // Estimate profit in USD - this should be calculated by the opportunity detector
+        profitUsd = Number(opportunity.estimatedProfit) / 1e18; // Assuming ETH-denominated
+        const amountUsd = Number(arbOpp.amountIn || 0n) / 1e18;
+        profitMarginBps = amountUsd > 0 ? (profitUsd / amountUsd) * 10000 : 0;
+
+        // Log context usage for validation
+        if (context.timestamp > 0 && currentGasPrice > 0n) {
+          // Context is being used for validation
+        }
+
+        const validation = validateProfitThreshold('arbitrage', profitUsd, profitMarginBps);
+
+        return {
+          passed: validation.valid,
+          severity: this.severity,
+          checkName: this.name,
+          reason: validation.reason,
+          suggestedAction: validation.valid ? RiskAction.PROCEED : RiskAction.CANCEL_EXECUTION,
+          metadata: { profitUsd, profitMarginBps, strategy: 'arbitrage' },
+          timestamp: Date.now(),
+        };
+      } else {
+        // Fallback to config-based validation for other opportunity types
+        profitUsd = Number(opportunity.estimatedProfit) / 1e18;
+        const meetsMinProfit = profitUsd >= this.config.minProfitUsd;
+        const meetsMinMargin = profitMarginBps >= this.config.minProfitMarginBps;
+
+        return {
+          passed: meetsMinProfit && meetsMinMargin,
+          severity: this.severity,
+          checkName: this.name,
+          reason: !meetsMinProfit
+            ? `Profit ${profitUsd.toFixed(2)} below minimum ${this.config.minProfitUsd}`
+            : !meetsMinMargin
+              ? `Margin ${profitMarginBps.toFixed(0)}bps below minimum ${this.config.minProfitMarginBps}bps`
+              : undefined,
+          suggestedAction:
+            !meetsMinProfit || !meetsMinMargin ? RiskAction.CANCEL_EXECUTION : RiskAction.PROCEED,
+          metadata: { profitUsd, profitMarginBps, minProfitUsd: this.config.minProfitUsd },
+          timestamp: Date.now(),
+        };
+      }
+    } catch (error) {
+      // Fallback to original logic if centralized config fails
+      const currentGasPrice = context.gasPrice;
+      const profitUsd = Number(opportunity.estimatedProfit) / 1e18;
+      const amountUsd = Number((opportunity as ArbitrageOpportunity).amountIn || 0n) / 1e18;
+      const profitMarginBps = amountUsd > 0 ? (profitUsd / amountUsd) * 10000 : 0;
+
+      const meetsMinProfit = profitUsd >= this.config.minProfitUsd;
+      const meetsMinMargin = profitMarginBps >= this.config.minProfitMarginBps;
+
+      // Log context usage for validation
+      if (context.timestamp > 0 && currentGasPrice > 0n) {
+        // Context is being used for validation
+      }
+
+      return {
+        passed: meetsMinProfit && meetsMinMargin,
+        severity: this.severity,
+        checkName: this.name,
+        reason: !meetsMinProfit
+          ? `Profit ${profitUsd.toFixed(2)} below minimum ${this.config.minProfitUsd}`
+          : !meetsMinMargin
+            ? `Margin ${profitMarginBps.toFixed(0)}bps below minimum ${this.config.minProfitMarginBps}bps`
+            : undefined,
+        suggestedAction:
+          !meetsMinProfit || !meetsMinMargin ? RiskAction.CANCEL_EXECUTION : RiskAction.PROCEED,
+        metadata: { profitUsd, profitMarginBps, minProfitUsd: this.config.minProfitUsd },
+        timestamp: Date.now(),
+      };
     }
-
-    return {
-      passed: meetsMinProfit && meetsMinMargin,
-      severity: this.severity,
-      checkName: this.name,
-      reason: !meetsMinProfit
-        ? `Profit ${profitUsd.toFixed(2)} below minimum ${this.config.minProfitUsd}`
-        : !meetsMinMargin
-          ? `Margin ${profitMarginBps.toFixed(0)}bps below minimum ${this.config.minProfitMarginBps}bps`
-          : undefined,
-      suggestedAction:
-        !meetsMinProfit || !meetsMinMargin ? RiskAction.CANCEL_EXECUTION : RiskAction.PROCEED,
-      metadata: { profitUsd, profitMarginBps, minProfitUsd: this.config.minProfitUsd },
-      timestamp: Date.now(),
-    };
   }
 }
 

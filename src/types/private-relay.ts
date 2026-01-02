@@ -125,6 +125,21 @@ export interface BundleSubmission {
   maxTimestamp?: number;
 }
 
+export interface BundleSubmissionRaw {
+  rawTransactions: string[];
+  transactions?: TransactionRequest[]; // will be signed by relay manager
+  targetBlockNumber?: number;
+  maxBribe?: bigint;
+}
+
+export interface ProviderRawBundleRequest {
+  rawTransactions: string[];
+  targetBlockNumber: number;
+  minTimestamp?: number;
+  maxTimestamp?: number;
+  revertingTxHashes?: string[];
+}
+
 /**
  * Bundle submission result
  */
@@ -183,6 +198,17 @@ export interface IPrivateRelayManager {
    */
   submitBundle(
     bundle: BundleSubmission,
+    options?: SubmissionOptions
+  ): Promise<BundleSubmissionResult>;
+
+  submitBundleRaw(
+    bundle: BundleSubmissionRaw,
+    options?: SubmissionOptions
+  ): Promise<BundleSubmissionResult>;
+
+  submitProviderRawBundle(
+    provider: RelayProvider,
+    bundle: ProviderRawBundleRequest,
     options?: SubmissionOptions
   ): Promise<BundleSubmissionResult>;
 

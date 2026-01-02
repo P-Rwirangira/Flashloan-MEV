@@ -182,6 +182,7 @@ export class ArbitrageScanner extends EventEmitter {
   private readonly config: ArbitrageConfig;
   private readonly scanIntervalMs: number;
   private readonly priceOracle: IPriceOracle;
+  private readonly logger = console; // Simple logger for now
 
   // Scanning state
   private isScanning = false;
@@ -500,7 +501,7 @@ export class ArbitrageScanner extends EventEmitter {
       }
 
       // Calculate optimal trade amount for this specific route
-      const optimalAmount = this.calculateOptimalTradeAmount(uniV3Pool, aeroPool, spread);
+      const optimalAmount = await this.calculateOptimalTradeAmount(uniV3Pool, aeroPool, spread);
       if (optimalAmount === 0n) {
         return undefined; // No viable trade amount
       }
@@ -588,9 +589,9 @@ export class ArbitrageScanner extends EventEmitter {
       };
     });
 
-    // Get current ETH price for minimum profit calculation
+    // Get current ETH price and use it for profit calculation
     const ethUsdPrice = await this.priceOracle.getEthUsdPrice();
-    const minProfitWei = this.calculateMinProfitWei(ethUsdPrice);
+    const minProfitWei = await this.calculateMinProfitWei(ethUsdPrice);
 
     return {
       id: opportunityId,
@@ -832,18 +833,102 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
-   * Calculate optimal trade amount for arbitrage with conservative sizing for Base L2
+   * Calculate optimal trade amount using mathematical optimization
    */
-  private calculateOptimalTradeAmount(
+  private async calculateOptimalTradeAmount(
+    uniV3Pool: UniswapV3PoolState,
+    aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState,
+    spread: ArbitrageSpread
+  ): Promise<bigint> {
+    try {
+      // Import optimization utilities
+      const { calculateOptimalTradeSize } = await import('../utils/swap-simulation');
+
+      // Build swap route for optimization
+      const route: any[] = [];
+      const poolStates = new Map();
+
+      if (spread.direction === 'uni_to_aero') {
+        route.push({
+          poolAddress: uniV3Pool.address,
+          tokenIn: uniV3Pool.token0,
+          tokenOut: uniV3Pool.token1,
+          protocol: 'uniswap-v3',
+        });
+        route.push({
+          poolAddress: aeroPool.address,
+          tokenIn: uniV3Pool.token1,
+          tokenOut: uniV3Pool.token0,
+          protocol: 'aerodrome',
+        });
+        poolStates.set(uniV3Pool.address, uniV3Pool);
+        poolStates.set(aeroPool.address, aeroPool);
+      } else {
+        route.push({
+          poolAddress: aeroPool.address,
+          tokenIn: aeroPool.token0,
+          tokenOut: aeroPool.token1,
+          protocol: 'aerodrome',
+        });
+        route.push({
+          poolAddress: uniV3Pool.address,
+          tokenIn: aeroPool.token1,
+          tokenOut: aeroPool.token0,
+          protocol: 'uniswap-v3',
+        });
+        poolStates.set(aeroPool.address, aeroPool);
+        poolStates.set(uniV3Pool.address, uniV3Pool);
+      }
+
+      // Calculate maximum trade size based on available liquidity
+      const uniV3TokenAmount = this.estimateUniV3TokenAmount(uniV3Pool);
+      const aeroTokenAmount = this.getAerodromeTokenAmount(aeroPool);
+      const maxTradeSize = uniV3TokenAmount < aeroTokenAmount ? uniV3TokenAmount : aeroTokenAmount;
+
+      if (maxTradeSize === 0n) {
+        return 0n;
+      }
+
+      // Cap at 5% of available liquidity to prevent excessive price impact
+      const cappedMaxSize = (maxTradeSize * 5n) / 100n;
+
+      // Get current gas price for optimization
+      const gasPrice = await this.getCurrentGasPrice();
+
+      // Use mathematical optimization to find optimal size
+      const optimization = calculateOptimalTradeSize(
+        route,
+        poolStates,
+        cappedMaxSize,
+        0.0005, // 0.05% flash loan fee
+        gasPrice
+      );
+
+      // Ensure minimum viable size ($50 equivalent for Base L2)
+      const minAmountWei = ethers.parseEther('0.02'); // ~$50 at $2500 ETH
+
+      if (optimization.optimalSize < minAmountWei) {
+        return optimization.maxProfit > 0n ? minAmountWei : 0n;
+      }
+
+      return optimization.optimalSize;
+    } catch (error) {
+      // Fallback to conservative sizing if optimization fails
+      return this.calculateConservativeTradeAmount(uniV3Pool, aeroPool, spread);
+    }
+  }
+
+  /**
+   * Fallback conservative trade amount calculation
+   */
+  private calculateConservativeTradeAmount(
     uniV3Pool: UniswapV3PoolState,
     aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState,
     spread: ArbitrageSpread
   ): bigint {
-    // Convert Uniswap V3 liquidity to comparable token amounts
     const uniV3TokenAmount = this.estimateUniV3TokenAmount(uniV3Pool);
     const aeroTokenAmount = this.getAerodromeTokenAmount(aeroPool);
 
-    // Use smaller of the two token amounts (ensure both are valid)
     const availableTokenAmount =
       uniV3TokenAmount > 0n && aeroTokenAmount > 0n
         ? uniV3TokenAmount < aeroTokenAmount
@@ -857,38 +942,17 @@ export class ArbitrageScanner extends EventEmitter {
       return 0n;
     }
 
-    // CONSERVATIVE SIZING: Use 0.5-2% of available liquidity for Base L2
-    const maxSizePercent = 2; // 2% maximum to minimize slippage
+    // Conservative sizing: 1% of available liquidity
+    const baseAmount = availableTokenAmount / 100n;
 
-    // Base amount: 0.5% of available liquidity
-    const baseAmount = availableTokenAmount / 200n; // 0.5%
+    // Adjust based on spread (higher spread = larger size)
+    const spreadMultiplier = Math.min(2, Math.max(0.5, spread.spread / 100));
+    const adjustedAmount = BigInt(Math.floor(Number(baseAmount) * spreadMultiplier));
 
-    // Adjust based on spread size (larger spreads allow larger trades)
-    const spreadMultiplier = Math.min(4, Math.max(1, spread.spread / 50)); // 1x to 4x based on spread
-    const sizeMultiplier = BigInt(Math.floor(spreadMultiplier * 100));
+    // Minimum viable size for Base L2
+    const minAmountWei = ethers.parseEther('0.02');
 
-    let optimalAmount = (baseAmount * sizeMultiplier) / 100n;
-
-    // Cap at maximum size (2% of liquidity)
-    const maxAmount = (availableTokenAmount * BigInt(maxSizePercent)) / 100n;
-
-    // Ensure minimum viable size ($100 equivalent at ~$3000 ETH = 0.033 ETH)
-    const minAmountWei = 33000000000000000n; // 0.033 ETH minimum
-
-    // Check if minimum exceeds maximum - if so, skip this trade
-    if (minAmountWei > maxAmount) {
-      return 0n;
-    }
-
-    if (optimalAmount > maxAmount) {
-      optimalAmount = maxAmount;
-    }
-
-    if (optimalAmount < minAmountWei) {
-      optimalAmount = minAmountWei;
-    }
-
-    return optimalAmount;
+    return adjustedAmount > minAmountWei ? adjustedAmount : minAmountWei;
   }
 
   /**
@@ -937,7 +1001,7 @@ export class ArbitrageScanner extends EventEmitter {
   }
 
   /**
-   * Calculate profitability including all costs
+   * Calculate profitability using accurate swap simulation
    */
   private async calculateProfitability(
     spread: ArbitrageSpread,
@@ -945,45 +1009,126 @@ export class ArbitrageScanner extends EventEmitter {
     uniV3Pool: UniswapV3PoolState,
     aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState
   ): Promise<ProfitCalculation> {
-    // Calculate gross profit from spread
-    const grossProfit = (tradeAmount * BigInt(spread.spread)) / 10000n;
+    try {
+      // Import swap simulation utilities
+      const { simulateArbitrageRoute } = await import('../utils/swap-simulation');
+      const { getProfitThreshold, validateProfitThreshold } =
+        await import('../config/profit-thresholds');
 
-    // Calculate flash loan fee (typically 0.05% for Uniswap V3)
-    const flashLoanFeeBps = 5n; // 0.05%
-    const flashLoanFee = (tradeAmount * flashLoanFeeBps) / 10000n;
+      // Build swap route based on arbitrage direction
+      const route: any[] = [];
+      const poolStates = new Map();
 
-    // Get real-time gas price
-    const gasPrice = await this.getCurrentGasPrice();
+      if (spread.direction === 'uni_to_aero') {
+        // Buy on Uniswap V3, sell on Aerodrome
+        route.push({
+          poolAddress: uniV3Pool.address,
+          tokenIn: uniV3Pool.token0,
+          tokenOut: uniV3Pool.token1,
+          protocol: 'uniswap-v3',
+          amountIn: tradeAmount,
+        });
+        route.push({
+          poolAddress: aeroPool.address,
+          tokenIn: uniV3Pool.token1,
+          tokenOut: uniV3Pool.token0,
+          protocol: 'aerodrome',
+          amountIn: 0n, // Will be set by simulation
+        });
+        poolStates.set(uniV3Pool.address, uniV3Pool);
+        poolStates.set(aeroPool.address, aeroPool);
+      } else {
+        // Buy on Aerodrome, sell on Uniswap V3
+        route.push({
+          poolAddress: aeroPool.address,
+          tokenIn: aeroPool.token0,
+          tokenOut: aeroPool.token1,
+          protocol: 'aerodrome',
+          amountIn: tradeAmount,
+        });
+        route.push({
+          poolAddress: uniV3Pool.address,
+          tokenIn: aeroPool.token1,
+          tokenOut: aeroPool.token0,
+          protocol: 'uniswap-v3',
+          amountIn: 0n, // Will be set by simulation
+        });
+        poolStates.set(aeroPool.address, aeroPool);
+        poolStates.set(uniV3Pool.address, uniV3Pool);
+      }
 
-    // Estimate gas costs
-    const gasEstimate = 300000n; // Estimated gas for flash loan + 2 swaps
-    const gasCost = gasEstimate * gasPrice;
+      // Get real-time gas price
+      const gasPrice = await this.getCurrentGasPrice();
 
-    // Calculate slippage costs using pool-specific data
-    const slippageCost = await this.calculateSlippageCost(tradeAmount, uniV3Pool, aeroPool);
+      // Simulate the complete arbitrage route
+      const simulation = simulateArbitrageRoute(
+        route,
+        tradeAmount,
+        poolStates,
+        0.0005, // 0.05% flash loan fee
+        gasPrice
+      );
 
-    // Calculate net profit
-    const totalCosts = flashLoanFee + gasCost + slippageCost;
-    const netProfit = grossProfit > totalCosts ? grossProfit - totalCosts : 0n;
+      // Calculate profit margin in percentage for validation
+      const profitMarginPercent = simulation.profitMarginBps / 100;
 
-    // Calculate profit margin
-    const profitMargin = tradeAmount > 0n ? Number((netProfit * 100n) / tradeAmount) : 0;
+      // Get ETH price for USD conversion
+      const ethUsdPrice = await this.priceOracle.getEthUsdPrice();
+      const netProfitUsd = (Number(simulation.netProfit) / 1e18) * ethUsdPrice;
 
-    // Get current ETH price and calculate minimum profit in Wei
-    const ethUsdPrice = await this.priceOracle.getEthUsdPrice();
-    const minProfitWei = this.calculateMinProfitWei(ethUsdPrice);
-    const isViable = netProfit >= minProfitWei && profitMargin >= 1.0; // 1% minimum margin
+      // Validate against profit thresholds and use threshold data
+      const threshold = getProfitThreshold('arbitrage');
+      const validation = validateProfitThreshold(
+        'arbitrage',
+        netProfitUsd,
+        simulation.profitMarginBps
+      );
 
-    return {
-      grossProfit,
-      flashLoanFee,
-      gasEstimate,
-      gasCost,
-      slippageCost,
-      netProfit,
-      profitMargin,
-      isViable,
-    };
+      // Log threshold information for debugging
+      if (this.logger?.debug) {
+        this.logger.debug('Profit validation', {
+          netProfitUsd,
+          profitMarginBps: simulation.profitMarginBps,
+          thresholdMinUsd: threshold.minProfitUsd,
+          thresholdMinMarginBps: threshold.minProfitMarginBps,
+          validationPassed: validation.valid,
+        });
+      }
+
+      return {
+        grossProfit:
+          simulation.finalAmountOut > tradeAmount ? simulation.finalAmountOut - tradeAmount : 0n,
+        flashLoanFee: BigInt(Math.floor(Number(tradeAmount) * 0.0005)),
+        gasEstimate: simulation.totalGasEstimate,
+        gasCost: simulation.totalGasEstimate * gasPrice,
+        slippageCost: BigInt(
+          Math.floor((Number(tradeAmount) * simulation.totalPriceImpact) / 10000)
+        ),
+        netProfit: simulation.netProfit,
+        profitMargin: profitMarginPercent,
+        isViable: validation.valid && simulation.profitable,
+      };
+    } catch (error) {
+      // Fallback to simplified calculation if simulation fails
+      const gasPrice = await this.getCurrentGasPrice();
+      const gasEstimate = 300000n;
+      const gasCost = gasEstimate * gasPrice;
+      const flashLoanFee = (tradeAmount * 5n) / 10000n; // 0.05%
+
+      // Use slippage calculation for more accurate fallback
+      const slippageCost = await this.calculateSlippageCost(tradeAmount, uniV3Pool, aeroPool);
+
+      return {
+        grossProfit: 0n,
+        flashLoanFee,
+        gasEstimate,
+        gasCost,
+        slippageCost,
+        netProfit: 0n,
+        profitMargin: 0,
+        isViable: false,
+      };
+    }
   }
 
   /**
@@ -1011,25 +1156,30 @@ export class ArbitrageScanner extends EventEmitter {
   /**
    * Calculate minimum profit in Wei based on USD amount and current ETH price
    */
-  private calculateMinProfitWei(ethUsdPrice: number): bigint {
+  private async calculateMinProfitWei(ethUsdPrice: number): Promise<bigint> {
     try {
-      const minProfitUsd = this.config.minProfitUSD;
-      const minProfitEth = minProfitUsd / ethUsdPrice;
+      const { getProfitThreshold } = await import('../config/profit-thresholds');
+      const threshold = getProfitThreshold('arbitrage');
+      const minProfitEth = threshold.minProfitUsd / ethUsdPrice;
       return ethers.parseEther(minProfitEth.toString());
     } catch (error) {
-      // Fallback calculation
-      return ethers.parseEther(this.config.minProfitUSD.toString()) / 3000n;
+      // Fallback calculation using Base L2 optimized threshold
+      const fallbackMinProfitUsd = 8.0; // Base L2 optimized
+      const minProfitEth = fallbackMinProfitUsd / Math.max(ethUsdPrice, 1000); // Prevent division by very small numbers
+      return ethers.parseEther(minProfitEth.toString());
     }
   }
 
   /**
    * Calculate slippage cost based on pool liquidity and trade size
+   * Integrated with new simulation but kept for backward compatibility
    */
   private async calculateSlippageCost(
     tradeAmount: bigint,
     uniV3Pool: UniswapV3PoolState,
     aeroPool: AerodromeVolatilePoolState | AerodromeStablePoolState
   ): Promise<bigint> {
+    // This method is now replaced by swap simulation but kept for compatibility
     try {
       // Calculate price impact based on pool liquidity
       const uniV3Impact = this.calculateUniV3PriceImpact(tradeAmount, uniV3Pool);
@@ -1041,7 +1191,20 @@ export class ArbitrageScanner extends EventEmitter {
       // Cap at configured maximum slippage
       const cappedImpactBps = Math.min(maxImpactBps, this.config.maxSlippageBps);
 
-      return (tradeAmount * BigInt(cappedImpactBps)) / 10000n;
+      // Log slippage calculation for monitoring
+      if (this.logger?.debug) {
+        this.logger.debug('Slippage cost calculated', {
+          tradeAmount: tradeAmount.toString(),
+          uniV3Impact,
+          aeroImpact,
+          maxImpactBps,
+          cappedImpactBps,
+        });
+      }
+
+      // Use the calculated slippage cost in fallback profit calculations
+      const slippageCost = (tradeAmount * BigInt(cappedImpactBps)) / 10000n;
+      return slippageCost;
     } catch (error) {
       // Fallback to configured max slippage
       const slippageBps = BigInt(this.config.maxSlippageBps);
@@ -1216,7 +1379,11 @@ export class ArbitrageScanner extends EventEmitter {
     }
 
     // Calculate optimal trade amount
-    const optimalAmount = this.calculateOptimalTradeAmount(bestUniV3Pool, bestAeroPool, spread);
+    const optimalAmount = await this.calculateOptimalTradeAmount(
+      bestUniV3Pool,
+      bestAeroPool,
+      spread
+    );
     if (optimalAmount === 0n) {
       return; // No viable trade amount
     }

@@ -36,6 +36,7 @@ export class TransactionLifecycleManager
   private readonly config: TransactionLifecycleManagerConfig;
   private readonly provider: ethers.Provider;
   private readonly signer: ethers.Signer;
+  private readonly privateRelayManager?: any; // Optional private relay manager
 
   private readonly transactions = new Map<string, TransactionLifecycleData>();
   private readonly nonceStates = new Map<Address, NonceState>();
@@ -47,12 +48,14 @@ export class TransactionLifecycleManager
   constructor(
     provider: ethers.Provider,
     signer: ethers.Signer,
-    config: Partial<TransactionLifecycleManagerConfig> = {}
+    config: Partial<TransactionLifecycleManagerConfig> = {},
+    privateRelayManager?: any
   ) {
     super();
 
     this.provider = provider;
     this.signer = signer;
+    this.privateRelayManager = privateRelayManager;
 
     this.config = {
       maxSubmissionAttempts: config.maxSubmissionAttempts ?? 3,
@@ -470,6 +473,22 @@ export class TransactionLifecycleManager
     try {
       this.logger.debug('Submitting transaction', { opportunityId });
 
+      // Prefer private relay submission if available
+      if (this.privateRelayManager) {
+        const relayResult = await this.privateRelayManager.submitTransaction(transaction, {
+          urgency: 'high',
+        });
+        if (!relayResult.success || !relayResult.transactionHash) {
+          throw new Error(relayResult.failureReason || 'Private relay submission failed');
+        }
+        return {
+          success: true,
+          transactionHash: relayResult.transactionHash,
+          submissionTime: Date.now(),
+        };
+      }
+
+      // Fallback to public submission
       const txResponse = await this.signer.sendTransaction(transaction);
 
       return {

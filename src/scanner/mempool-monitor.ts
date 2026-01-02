@@ -54,6 +54,9 @@ export class MempoolMonitor extends EventEmitter {
   private readonly uniswapV3QuoterAddress?: string | undefined;
   private readonly aerodromeRouterAddress?: string | undefined;
   private readonly backrunRecipient?: string | undefined;
+  private readonly allowedTokens?: Set<string> | undefined;
+  private readonly allowedPools?: Set<string> | undefined;
+  private externalWsClients: { name: string; ws: WebSocket; url: string }[] = [];
 
   private isMonitoring = false;
   private pendingTxs: Map<string, PendingTxOpportunity> = new Map();
@@ -67,6 +70,10 @@ export class MempoolMonitor extends EventEmitter {
     sandwichOpportunities: 0,
     avgGasPrice: 0n,
     memoryUsageMB: 0,
+    decodeSuccess: 0,
+    decodeFailure: 0,
+    quoteSuccess: 0,
+    quoteFailure: 0,
   };
 
   constructor(options: MempoolMonitorOptions) {
@@ -97,6 +104,12 @@ export class MempoolMonitor extends EventEmitter {
     this.aerodromeRouterAddress = this.options.aerodromeRouterAddress;
     this.backrunRecipient =
       options.backrunRecipient || (process.env['EXECUTION_WALLET_ADDRESS'] as string | undefined);
+    this.allowedTokens = options.allowedTokens
+      ? new Set(options.allowedTokens.map(t => t.toLowerCase()))
+      : undefined;
+    this.allowedPools = options.allowedPools
+      ? new Set(options.allowedPools.map(p => p.toLowerCase()))
+      : undefined;
 
     this.logger.info('Mempool monitor created', {
       enabledProtocols: this.options.enabledProtocols,
@@ -133,6 +146,12 @@ export class MempoolMonitor extends EventEmitter {
       this.startStatsReporting();
 
       this.isMonitoring = true;
+
+      // If WebSocket subscription not supported or external streams enabled, start fallback streams
+      if (this.options.enableBackrun && (this.options as any).enableExternalStreams) {
+        await this.startExternalStreams();
+      }
+
       this.logger.info('Mempool monitoring started successfully');
       this.emit('monitoringStarted');
     } catch (error) {
@@ -167,6 +186,15 @@ export class MempoolMonitor extends EventEmitter {
 
     this.isMonitoring = false;
     this.pendingTxs.clear();
+
+    // Close external stream clients
+    for (const c of this.externalWsClients) {
+      try {
+        c.ws.close();
+      } catch {}
+    }
+    this.externalWsClients = [];
+
     this.logger.info('Mempool monitoring stopped');
     this.emit('monitoringStopped');
   }
@@ -300,7 +328,25 @@ export class MempoolMonitor extends EventEmitter {
       const swapDetails = await this.decodeSwap(methodSig, tx.data, tx.to ?? '');
 
       if (!swapDetails) {
+        this.stats.decodeFailure++;
+        this.emit('decodeStats', { success: false, protocol: 'unknown' });
         return null;
+      }
+      this.stats.decodeSuccess++;
+      this.emit('decodeStats', { success: true, protocol: swapDetails.protocol });
+
+      // Allowlist filtering
+      if (this.allowedTokens) {
+        const tokenInOk = this.allowedTokens.has(swapDetails.tokenIn.toLowerCase());
+        const tokenOutOk = this.allowedTokens.has(swapDetails.tokenOut.toLowerCase());
+        if (!tokenInOk || !tokenOutOk) {
+          return null;
+        }
+      }
+      if (this.allowedPools && swapDetails.poolAddress) {
+        if (!this.allowedPools.has(swapDetails.poolAddress.toLowerCase())) {
+          return null;
+        }
       }
 
       // Filter by minimum swap value
@@ -725,8 +771,12 @@ export class MempoolMonitor extends EventEmitter {
       }
 
       if (expectedOut === 0n) {
+        this.stats.quoteFailure++;
+        this.emit('quoteStats', { success: false, protocol: swap.protocol });
         return undefined; // Unable to quote
       }
+      this.stats.quoteSuccess++;
+      this.emit('quoteStats', { success: true, protocol: swap.protocol });
 
       // Build actual calldata for a minimal backrun and estimate gas precisely
       let gasEstimate = 200000n;
@@ -865,6 +915,105 @@ export class MempoolMonitor extends EventEmitter {
   /**
    * Start periodic cleanup of old pending transactions
    */
+  private async startExternalStreams(): Promise<void> {
+    const urls: { name: string; url?: string; auth?: string }[] = [
+      {
+        name: 'flashbots',
+        url: (this.options as any).flashbotsStreamUrl,
+        auth: (this.options as any).flashbotsAuth,
+      },
+      {
+        name: 'bloxroute',
+        url: (this.options as any).bloxrouteStreamUrl,
+        auth: (this.options as any).bloxrouteAuth,
+      },
+    ];
+
+    for (const cfg of urls) {
+      if (!cfg.url) continue;
+      await this.connectExternalStream(cfg.name, cfg.url, cfg.auth);
+    }
+  }
+
+  private async connectExternalStream(name: string, url: string, auth?: string): Promise<void> {
+    try {
+      const headers: Record<string, string> = {};
+      if (auth) headers['Authorization'] = auth;
+      const ws = new WebSocket(url, { headers });
+
+      const client = { name, ws, url };
+      this.externalWsClients.push(client);
+
+      ws.on('open', () => {
+        this.logger.info(`External mempool stream connected: ${name}`, { url });
+      });
+
+      ws.on('message', async (data: WebSocket.Data) => {
+        try {
+          const text = typeof data === 'string' ? data : data.toString();
+          const msg = JSON.parse(text);
+          const hashes = this.normalizeExternalMessage(name, msg);
+          for (const h of hashes) {
+            await this.handlePendingTransaction(h);
+          }
+        } catch (error) {
+          this.logger.debug('External stream message parse error', {
+            name,
+            error: (error as Error).message,
+          });
+        }
+      });
+
+      ws.on('close', (_code, _reason) => {
+        this.logger.warn(`External mempool stream closed: ${name}`, { url });
+        // Attempt reconnect after delay
+        setTimeout(() => {
+          if (this.isMonitoring) this.connectExternalStream(name, url, auth).catch(() => {});
+        }, 5000);
+      });
+
+      ws.on('error', (error: Error) => {
+        this.logger.debug('External stream error', { name, error: error.message });
+      });
+    } catch (error) {
+      this.logger.warn('Failed to connect external mempool stream', {
+        name,
+        url,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private normalizeExternalMessage(_provider: string, msg: any): string[] {
+    // Try common fields
+    const hashes: string[] = [];
+    const push = (v: any) => {
+      if (typeof v === 'string' && v.startsWith('0x') && v.length === 66) hashes.push(v);
+    };
+
+    // Generic JSON-RPC subscription
+    if (msg?.method === 'eth_subscription' && msg?.params?.result) {
+      push(msg.params.result);
+    }
+
+    // Flashbots/bloXroute common patterns
+    push(msg?.txHash);
+    push(msg?.hash);
+    push(msg?.transactionHash);
+    push(msg?.result);
+
+    // Nested
+    if (Array.isArray(msg?.transactions)) {
+      for (const t of msg.transactions) push(t?.hash || t?.txHash || t?.transactionHash);
+    }
+
+    // String payload
+    if (typeof msg === 'string') push(msg);
+
+    // Dedup
+    return Array.from(new Set(hashes));
+  }
+
   private startPeriodicCleanup(): void {
     this.cleanupInterval = setInterval(() => {
       const now = Date.now();
