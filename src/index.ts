@@ -2256,10 +2256,38 @@ export class BaseMEVPlatform extends EventEmitter {
   getConfiguration(): PlatformConfig | undefined {
     return this.config;
   }
+
+  /**
+   * Check if platform is in dry-run or paper trading mode
+   */
+  async isDryRunMode(): Promise<boolean> {
+    const rawConfig = await this.configLoader.load();
+    return rawConfig?.dryRun === true || rawConfig?.paperTrading === true;
+  }
 }
 
 async function main(): Promise<void> {
   const platform = new BaseMEVPlatform();
+
+  // Check if running in dry-run or paper trading mode
+  const rawConfig = await platform['configLoader'].load();
+  const isDryRun = rawConfig.dryRun === true;
+  const isPaperTrading = rawConfig.paperTrading === true;
+
+  if (isDryRun) {
+    logger.warn('🔒 RUNNING IN DRY-RUN MODE - No transactions will be submitted');
+    logger.warn('   Set dryRun: false in config/default.yaml to enable live trading');
+  }
+
+  if (isPaperTrading) {
+    logger.warn('📝 RUNNING IN PAPER TRADING MODE - Simulating execution without signing');
+    logger.warn('   Set paperTrading: false in config/default.yaml to enable real execution');
+  }
+
+  if (!isDryRun && !isPaperTrading) {
+    logger.info('⚠️  LIVE TRADING ENABLED - Real transactions will be submitted!');
+    logger.info('   Make sure you have completed pre-flight checklist');
+  }
 
   // Handle graceful shutdown
   const shutdown = async (signal: string) => {

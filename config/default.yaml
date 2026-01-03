@@ -78,9 +78,9 @@ performance:
 strategies:
   arbitrage:
     enabled: true
-    minProfitUSD: 8.0  # Base L2 optimized threshold
+    minProfitUSD: 15.0  # Conservative start - tune down after 1 week of testing
     maxSlippageBps: 100  # 1%
-    maxGasPriceGwei: 50
+    maxGasPriceGwei: 0.1  # Base L2 typical gas (was 50 - WAY too high!)
     maxPositionSize: 50000  # USD
     cooldownMs: 2000
     pairs:
@@ -220,11 +220,13 @@ monitoring:
         cooldownMs: 600000
   circuitBreaker:
     enabled: true
-    failureThreshold: 10
+    failureThreshold: 5  # More aggressive for initial deployment
     recoveryTimeMs: 60000
-    halfOpenMaxCalls: 5
+    halfOpenMaxCalls: 3
+    maxDailyLossUSD: 100  # Start with limited loss exposure
 
 # Environment settings
 environment: "development"
 debug: true
-dryRun: false  # Enable live trading
+dryRun: true  # SAFETY: Start in dry-run mode - set to false only after validation
+paperTrading: true  # SAFETY: Simulate execution without signing txs

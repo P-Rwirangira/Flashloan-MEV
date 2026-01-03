@@ -7,10 +7,15 @@
   "scripts": {
     "build": "tsc",
     "build:contracts": "hardhat compile",
-    "deploy:testnet": "hardhat run scripts/deploy-flash-executor.ts --network base-sepolia",
-    "deploy:mainnet": "hardhat run scripts/deploy-flash-executor.ts --network base",
+    "deploy:testnet": "hardhat run scripts/automated-deployment.ts --network base-sepolia",
+    "deploy:mainnet": "hardhat run scripts/automated-deployment.ts --network base",
+    "deploy:setup": "tsx scripts/setup-deployment-env.ts",
+    "deploy:test": "tsx scripts/test-contract-deployment.ts",
+    "relay:configure": "tsx scripts/configure-relays.ts",
+    "relay:test": "tsx scripts/test-relay-connectivity.ts",
     "verify:testnet": "hardhat verify --network base-sepolia ${CONTRACT_ADDRESS} ${CONSTRUCTOR_ARGS:-}",
     "verify:mainnet": "hardhat verify --network base ${CONTRACT_ADDRESS} ${CONSTRUCTOR_ARGS:-}",
+    "test:relay": "tsx scripts/test-relay-connectivity.ts",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "test": "jest",
@@ -83,7 +88,9 @@
   },
   "lint-staged": {
     "*.ts": [
-      "prettier --write"
+      "prettier --write",
+      "eslint --fix",
+      "bash -c 'npm run typecheck'"
     ]
   },
   "engines": {

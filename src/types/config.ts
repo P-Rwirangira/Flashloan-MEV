@@ -237,6 +237,7 @@ export interface Config {
   readonly environment: string;
   readonly debug: boolean;
   readonly dryRun: boolean;
+  readonly paperTrading?: boolean;
 }
 
 // Configuration validation result
