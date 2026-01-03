@@ -113,7 +113,7 @@ export class InteractiveMenu {
     );
     console.log();
     console.log(
-      chalk.yellow('💡 Focus Mode: Perfect for testing arbitrage with zero capital requirements')
+      chalk.yellow('Focus Mode: Perfect for testing arbitrage with zero capital requirements')
     );
     console.log(chalk.gray('   All strategies use flash loans - no upfront capital needed!'));
     console.log();
@@ -121,14 +121,14 @@ export class InteractiveMenu {
 
   private async showMainMenu(): Promise<void> {
     while (true) {
-      console.log(chalk.blue.bold('📋 MAIN MENU'));
+      console.log(chalk.blue.bold('MAIN MENU'));
       console.log(chalk.gray('─'.repeat(60)));
-      console.log('1. 🎯 Configure Strategies');
-      console.log('2. ⚙️  Execution Mode Settings');
-      console.log('3. 🛡️  Risk Management Settings');
-      console.log('4. 📊 View Current Configuration');
-      console.log('5. 🚀 Start Platform');
-      console.log('6. ❌ Exit');
+      console.log('1. Configure Strategies');
+      console.log('2. Execution Mode Settings');
+      console.log('3. Risk Management Settings');
+      console.log('4. View Current Configuration');
+      console.log('5. Start Platform');
+      console.log('6. Exit');
       console.log();
 
       const choice = await this.prompt(chalk.cyan('Select option (1-6): '));
@@ -150,11 +150,11 @@ export class InteractiveMenu {
           await this.startPlatform();
           return;
         case '6':
-          console.log(chalk.yellow('👋 Goodbye!'));
+          console.log(chalk.yellow('Goodbye!'));
           process.exit(0);
           break;
         default:
-          console.log(chalk.red('❌ Invalid option. Please try again.'));
+          console.log(chalk.red('Invalid option. Please try again.'));
           break;
       }
 
@@ -166,20 +166,20 @@ export class InteractiveMenu {
     console.clear();
     this.printHeader();
 
-    console.log(chalk.blue.bold('🎯 STRATEGY CONFIGURATION'));
+    console.log(chalk.blue.bold('STRATEGY CONFIGURATION'));
     console.log(chalk.gray('─'.repeat(60)));
-    console.log(chalk.yellow('💰 All strategies use flash loans - no capital required!'));
+    console.log(chalk.yellow('All strategies use flash loans - no capital required!'));
     console.log();
 
     // Show current strategy status
     this.config.strategies.forEach((strategy, index) => {
-      const status = strategy.enabled ? chalk.green('✅ ENABLED') : chalk.red('❌ DISABLED');
+      const status = strategy.enabled ? chalk.green('ENABLED') : chalk.red('DISABLED');
       const risk = this.getRiskColor(strategy.riskLevel);
 
       console.log(`${index + 1}. ${chalk.bold(strategy.name)} ${status}`);
       console.log(`   ${chalk.gray(strategy.description)}`);
       console.log(
-        `   💰 Capital: ${chalk.cyan(strategy.capitalRequired)} | Risk: ${risk} | Profit: ${chalk.green(strategy.avgProfit)}`
+        `   Capital: ${chalk.cyan(strategy.capitalRequired)} | Risk: ${risk} | Profit: ${chalk.green(strategy.avgProfit)}`
       );
       console.log();
     });
@@ -199,15 +199,15 @@ export class InteractiveMenu {
         return;
       case 'all':
         this.config.strategies.forEach(s => (s.enabled = true));
-        console.log(chalk.green('✅ All strategies enabled'));
+        console.log(chalk.green('All strategies enabled'));
         break;
       case 'none':
         this.config.strategies.forEach(s => (s.enabled = false));
-        console.log(chalk.yellow('⚠️  All strategies disabled'));
+        console.log(chalk.yellow('All strategies disabled'));
         break;
       case 'arbitrage-only':
         this.config.strategies.forEach(s => (s.enabled = s.key === 'arbitrage'));
-        console.log(chalk.green('🎯 Arbitrage-only mode activated (recommended for beginners)'));
+        console.log(chalk.green('Arbitrage-only mode activated (recommended for beginners)'));
         break;
       default:
         const strategyIndex = parseInt(choice) - 1;
@@ -216,10 +216,10 @@ export class InteractiveMenu {
           if (strategy) {
             strategy.enabled = !strategy.enabled;
             const status = strategy.enabled ? 'enabled' : 'disabled';
-            console.log(chalk.green(`✅ ${strategy.name} ${status}`));
+            console.log(chalk.green(`${strategy.name} ${status}`));
           }
         } else {
-          console.log(chalk.red('❌ Invalid strategy number'));
+          console.log(chalk.red('Invalid strategy number'));
         }
     }
 
@@ -230,13 +230,13 @@ export class InteractiveMenu {
     console.clear();
     this.printHeader();
 
-    console.log(chalk.blue.bold('⚙️  EXECUTION MODE SETTINGS'));
+    console.log(chalk.blue.bold('EXECUTION MODE SETTINGS'));
     console.log(chalk.gray('─'.repeat(60)));
     console.log();
 
-    console.log('1. 🧪 Dry Run Mode - Detection only, no transactions');
-    console.log('2. 📝 Paper Trading - Simulate execution without signing');
-    console.log('3. 🔴 Live Trading - Real transactions with real money');
+    console.log('1. Dry Run Mode - Detection only, no transactions');
+    console.log('2. Paper Trading - Simulate execution without signing');
+    console.log('3. Live Trading - Real transactions with real money');
     console.log();
 
     console.log(chalk.yellow('Current mode:'), this.getExecutionModeDisplay());
@@ -247,27 +247,27 @@ export class InteractiveMenu {
     switch (choice.trim()) {
       case '1':
         this.config.executionMode = 'dry-run';
-        console.log(chalk.green('✅ Dry run mode selected - Safe for testing'));
+        console.log(chalk.green('Dry run mode selected - Safe for testing'));
         break;
       case '2':
         this.config.executionMode = 'paper';
-        console.log(chalk.green('✅ Paper trading mode selected - Simulation only'));
+        console.log(chalk.green('Paper trading mode selected - Simulation only'));
         break;
       case '3':
-        console.log(chalk.red.bold('⚠️  WARNING: Live trading mode selected!'));
+        console.log(chalk.red.bold('WARNING: Live trading mode selected!'));
         console.log(chalk.red('This will execute real transactions with real money.'));
         const confirm = await this.prompt(chalk.yellow('Type "CONFIRM" to proceed: '));
         if (confirm.trim() === 'CONFIRM') {
           this.config.executionMode = 'live';
-          console.log(chalk.red('🔴 Live trading mode activated'));
+          console.log(chalk.red('Live trading mode activated'));
         } else {
-          console.log(chalk.yellow('❌ Live trading cancelled'));
+          console.log(chalk.yellow('Live trading cancelled'));
         }
         break;
       case 'back':
         return;
       default:
-        console.log(chalk.red('❌ Invalid option'));
+        console.log(chalk.red('Invalid option'));
     }
 
     await this.prompt(chalk.gray('Press Enter to continue...'));
@@ -277,7 +277,7 @@ export class InteractiveMenu {
     console.clear();
     this.printHeader();
 
-    console.log(chalk.blue.bold('🛡️  RISK MANAGEMENT SETTINGS'));
+    console.log(chalk.blue.bold('RISK MANAGEMENT SETTINGS'));
     console.log(chalk.gray('─'.repeat(60)));
     console.log();
 
@@ -302,27 +302,27 @@ export class InteractiveMenu {
         const slippageNum = parseFloat(slippage);
         if (slippageNum >= 0.1 && slippageNum <= 10) {
           this.config.riskSettings.maxSlippage = slippageNum;
-          console.log(chalk.green(`✅ Max slippage set to ${slippageNum}%`));
+          console.log(chalk.green(`Max slippage set to ${slippageNum}%`));
         } else {
-          console.log(chalk.red('❌ Invalid slippage value'));
+          console.log(chalk.red('Invalid slippage value'));
         }
         break;
       case '2':
         const gasPrice = await this.prompt('Enter max gas price (e.g., "50 gwei"): ');
         if (gasPrice.includes('gwei') || gasPrice.includes('wei')) {
           this.config.riskSettings.maxGasPrice = gasPrice;
-          console.log(chalk.green(`✅ Max gas price set to ${gasPrice}`));
+          console.log(chalk.green(`Max gas price set to ${gasPrice}`));
         } else {
-          console.log(chalk.red('❌ Invalid gas price format'));
+          console.log(chalk.red('Invalid gas price format'));
         }
         break;
       case '3':
         const lossLimit = await this.prompt('Enter daily loss limit (e.g., "0.1 ETH"): ');
         if (lossLimit.includes('ETH')) {
           this.config.riskSettings.dailyLossLimit = lossLimit;
-          console.log(chalk.green(`✅ Daily loss limit set to ${lossLimit}`));
+          console.log(chalk.green(`Daily loss limit set to ${lossLimit}`));
         } else {
-          console.log(chalk.red('❌ Invalid loss limit format'));
+          console.log(chalk.red('Invalid loss limit format'));
         }
         break;
       case '4':
@@ -331,12 +331,12 @@ export class InteractiveMenu {
           maxGasPrice: '30 gwei',
           dailyLossLimit: '0.05 ETH',
         };
-        console.log(chalk.green('✅ Risk settings reset to conservative defaults'));
+        console.log(chalk.green('Risk settings reset to conservative defaults'));
         break;
       case '5':
         return;
       default:
-        console.log(chalk.red('❌ Invalid option'));
+        console.log(chalk.red('Invalid option'));
     }
 
     await this.prompt(chalk.gray('Press Enter to continue...'));
@@ -346,13 +346,13 @@ export class InteractiveMenu {
     console.clear();
     this.printHeader();
 
-    console.log(chalk.blue.bold('📊 CURRENT CONFIGURATION'));
+    console.log(chalk.blue.bold('CURRENT CONFIGURATION'));
     console.log(chalk.gray('─'.repeat(60)));
     console.log();
 
     // Enabled strategies
     const enabledStrategies = this.config.strategies.filter(s => s.enabled);
-    console.log(chalk.green.bold('✅ ENABLED STRATEGIES:'));
+    console.log(chalk.green.bold('ENABLED STRATEGIES:'));
     if (enabledStrategies.length === 0) {
       console.log(chalk.red('   No strategies enabled!'));
     } else {
@@ -363,19 +363,19 @@ export class InteractiveMenu {
     console.log();
 
     // Execution mode
-    console.log(chalk.blue.bold('⚙️  EXECUTION MODE:'));
+    console.log(chalk.blue.bold('EXECUTION MODE:'));
     console.log(`   ${this.getExecutionModeDisplay()}`);
     console.log();
 
     // Risk settings
-    console.log(chalk.yellow.bold('🛡️  RISK SETTINGS:'));
+    console.log(chalk.yellow.bold('RISK SETTINGS:'));
     console.log(`   • Max Slippage: ${this.config.riskSettings.maxSlippage}%`);
     console.log(`   • Max Gas Price: ${this.config.riskSettings.maxGasPrice}`);
     console.log(`   • Daily Loss Limit: ${this.config.riskSettings.dailyLossLimit}`);
     console.log();
 
     // Capital requirements summary
-    console.log(chalk.cyan.bold('💰 CAPITAL REQUIREMENTS:'));
+    console.log(chalk.cyan.bold('CAPITAL REQUIREMENTS:'));
     console.log('   • Flash Loan Fees: ~0.05% per trade');
     console.log('   • Gas Costs: ~$2-5 per transaction on Base');
     console.log('   • No upfront capital needed!');
@@ -388,7 +388,7 @@ export class InteractiveMenu {
     console.clear();
     this.printHeader();
 
-    console.log(chalk.green.bold('🚀 STARTING BASE MEV PLATFORM'));
+    console.log(chalk.green.bold('STARTING BASE MEV PLATFORM'));
     console.log(chalk.gray('─'.repeat(60)));
     console.log();
 
@@ -401,24 +401,24 @@ export class InteractiveMenu {
     console.log();
 
     if (enabledStrategies.length === 0) {
-      console.log(chalk.red('❌ No strategies enabled! Please configure strategies first.'));
+      console.log(chalk.red('No strategies enabled! Please configure strategies first.'));
       await this.prompt(chalk.gray('Press Enter to return to menu...'));
       return;
     }
 
     // Confirmation for live trading
     if (this.config.executionMode === 'live') {
-      console.log(chalk.red.bold('⚠️  FINAL WARNING: LIVE TRADING MODE'));
+      console.log(chalk.red.bold('FINAL WARNING: LIVE TRADING MODE'));
       console.log(chalk.red('This will execute real transactions with real money!'));
       const confirm = await this.prompt(chalk.yellow('Type "START LIVE TRADING" to proceed: '));
       if (confirm.trim() !== 'START LIVE TRADING') {
-        console.log(chalk.yellow('❌ Platform start cancelled'));
+        console.log(chalk.yellow('Platform start cancelled'));
         await this.prompt(chalk.gray('Press Enter to return to menu...'));
         return;
       }
     }
 
-    console.log(chalk.green('✅ Configuration validated, starting platform...'));
+    console.log(chalk.green('Configuration validated, starting platform...'));
     console.log();
 
     // Close readline interface
@@ -485,11 +485,11 @@ export class InteractiveMenu {
       await this.platform.initialize();
       await this.platform.start();
 
-      console.log(chalk.green.bold('✅ Platform started successfully!'));
-      console.log(chalk.cyan('📊 Monitor logs for opportunity detection and execution'));
+      console.log(chalk.green.bold('Platform started successfully!'));
+      console.log(chalk.cyan('Monitor logs for opportunity detection and execution'));
       console.log(chalk.gray('Press Ctrl+C to stop the platform'));
     } catch (error) {
-      console.error(chalk.red('❌ Failed to start platform:'), error);
+      console.error(chalk.red('Failed to start platform:'), error);
       process.exit(1);
     }
   }
@@ -510,11 +510,11 @@ export class InteractiveMenu {
   private getExecutionModeDisplay(): string {
     switch (this.config.executionMode) {
       case 'dry-run':
-        return chalk.blue('🧪 Dry Run (Detection only)');
+        return chalk.blue('Dry Run (Detection only)');
       case 'paper':
-        return chalk.yellow('📝 Paper Trading (Simulation)');
+        return chalk.yellow('Paper Trading (Simulation)');
       case 'live':
-        return chalk.red('🔴 Live Trading (Real money)');
+        return chalk.red('Live Trading (Real money)');
       default:
         return chalk.gray('Unknown');
     }
@@ -536,11 +536,11 @@ export class InteractiveMenu {
 
 // Handle graceful shutdown
 process.on('SIGINT', async () => {
-  console.log(chalk.yellow('\n👋 Shutting down gracefully...'));
+  console.log(chalk.yellow('\nShutting down gracefully...'));
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  console.log(chalk.yellow('\n👋 Shutting down gracefully...'));
+  console.log(chalk.yellow('\nShutting down gracefully...'));
   process.exit(0);
 });
