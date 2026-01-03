@@ -1,5 +1,6 @@
 const { HardhatUserConfig } = require("hardhat/config");
 require("@nomicfoundation/hardhat-toolbox");
+require("ts-node/register");
 
 const config = {
   solidity: {
@@ -11,6 +12,7 @@ const config = {
             enabled: true,
             runs: 200,
           },
+          viaIR: true,
         },
       },
       // 0.7.6 compiler removed - no contracts in this project require it
@@ -61,6 +63,10 @@ const config = {
   gasReporter: {
     enabled: process.env.REPORT_GAS !== undefined,
     currency: "USD",
+  },
+  typechain: {
+    outDir: "typechain-types",
+    target: "ethers-v6",
   },
 };
 

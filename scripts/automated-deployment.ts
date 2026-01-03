@@ -3,10 +3,17 @@
  * Can deploy to testnet or mainnet based on environment
  */
 
-import { ethers } from 'hardhat';
+import { config } from 'dotenv';
+import { ethers } from 'ethers';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as YAML from 'yaml';
+
+// Load environment variables
+config();
+
+// Get network from command line argument
+const network = process.argv[2] || 'base-sepolia';
 
 interface DeploymentResult {
   contractAddress: string;
@@ -84,31 +91,60 @@ async function updateEnvFile(contractAddress: string): Promise<void> {
 }
 
 async function deployContract(): Promise<DeploymentResult> {
-  const [deployer] = await ethers.getSigners();
-  const network = await ethers.provider.getNetwork();
-
-  console.log('=== Deployment Configuration ===');
-  console.log('Deploying with account:', deployer.address);
-  console.log('Account balance:', ethers.formatEther(await ethers.provider.getBalance(deployer.address)), 'ETH');
-  console.log('Network:', network.name);
-  console.log('Chain ID:', network.chainId.toString());
-
-  // Check balance
-  const balance = await ethers.provider.getBalance(deployer.address);
-  if (balance < ethers.parseEther('0.01')) {
-    throw new Error(`Insufficient balance: ${ethers.formatEther(balance)} ETH. Need at least 0.01 ETH`);
+  // Setup provider based on network
+  let provider: ethers.Provider;
+  let chainId: number;
+  
+  if (network === 'base-sepolia') {
+    provider = new ethers.JsonRpcProvider(process.env.BASE_SEPOLIA_RPC_URL || 'https://sepolia.base.org');
+    chainId = 84532;
+  } else if (network === 'base') {
+    provider = new ethers.JsonRpcProvider(process.env.BASE_RPC_URL || 'https://mainnet.base.org');
+    chainId = 8453;
+  } else {
+    throw new Error(`Unsupported network: ${network}`);
   }
 
+  // Setup wallet
+  const privateKey = process.env.EXECUTION_PRIVATE_KEY || process.env.PRIVATE_KEY;
+  if (!privateKey) {
+    throw new Error('EXECUTION_PRIVATE_KEY or PRIVATE_KEY environment variable not set');
+  }
+  
+  const wallet = new ethers.Wallet(privateKey, provider);
+
+  console.log('=== Deployment Configuration ===');
+  console.log('Deploying with account:', wallet.address);
+  console.log('Account balance:', ethers.formatEther(await provider.getBalance(wallet.address)), 'ETH');
+  console.log('Network:', network);
+  console.log('Chain ID:', chainId);
+
   // Set minProfit based on environment
-  const isTestnet = network.chainId === 84532n; // Base Sepolia
+  const isTestnet = chainId === 84532; // Base Sepolia
+
+  // Check balance
+  const balance = await provider.getBalance(wallet.address);
+  const minBalance = isTestnet ? ethers.parseEther('0.0001') : ethers.parseEther('0.01');
+  if (balance < minBalance) {
+    throw new Error(`Insufficient balance: ${ethers.formatEther(balance)} ETH. Need at least ${ethers.formatEther(minBalance)} ETH`);
+  }
+
   const minProfitEth = isTestnet ? '0.001' : '0.005'; // Lower for testnet
   const minProfit = ethers.parseEther(minProfitEth);
 
   console.log('\n=== Deploying FlashExecutor ===');
   console.log('Min Profit:', minProfitEth, 'ETH');
 
-  const FlashExecutor = await ethers.getContractFactory('FlashExecutor');
-  const flashExecutor = await FlashExecutor.deploy(minProfit, {
+  // Load contract ABI and bytecode from artifacts
+  const artifactPath = path.join(process.cwd(), 'artifacts', 'contracts', 'FlashExecutor.sol', 'FlashExecutor.json');
+  if (!fs.existsSync(artifactPath)) {
+    throw new Error('Contract artifact not found. Run "npm run build:contracts" first.');
+  }
+  
+  const artifact = JSON.parse(fs.readFileSync(artifactPath, 'utf8'));
+  const contractFactory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, wallet);
+
+  const flashExecutor = await contractFactory.deploy(minProfit, {
     gasLimit: 5000000,
   });
 
@@ -121,7 +157,7 @@ async function deployContract(): Promise<DeploymentResult> {
   await flashExecutor.waitForDeployment();
 
   const contractAddress = await flashExecutor.getAddress();
-  const deploymentBlock = await ethers.provider.getBlockNumber();
+  const deploymentBlock = await provider.getBlockNumber();
   const owner = await flashExecutor.owner();
 
   console.log('\n=== Deployment Successful ===');
@@ -131,7 +167,7 @@ async function deployContract(): Promise<DeploymentResult> {
   console.log('Gas Used:', gasUsed.toString());
 
   // Load authorized pools from config
-  const poolsToAuthorize = await getAuthorizedPoolsFromConfig(network.chainId);
+  const poolsToAuthorize = await getAuthorizedPoolsFromConfig(BigInt(chainId));
 
   console.log(`\n=== Authorizing ${poolsToAuthorize.length} Pools ===`);
 
@@ -158,8 +194,8 @@ async function deployContract(): Promise<DeploymentResult> {
 
   const result: DeploymentResult = {
     contractAddress,
-    network: network.name,
-    chainId: network.chainId.toString(),
+    network,
+    chainId: chainId.toString(),
     owner,
     minProfit: minProfit.toString(),
     deploymentBlock,
@@ -174,7 +210,7 @@ async function deployContract(): Promise<DeploymentResult> {
   return result;
 }
 
-async function getAuthorizedPoolsFromConfig(chainId: bigint): Promise<string[]> {
+async function getAuthorizedPoolsFromConfig(_chainId: bigint): Promise<string[]> {
   const contractsYamlPath = path.join(process.cwd(), 'config', 'contracts.yaml');
 
   if (!fs.existsSync(contractsYamlPath)) {
@@ -245,13 +281,12 @@ async function main() {
   }
 }
 
-if (require.main === module) {
-  main()
-    .then(() => process.exit(0))
-    .catch(error => {
-      console.error(error);
-      process.exit(1);
-    });
-}
+// Run if this is the main module
+main()
+  .then(() => process.exit(0))
+  .catch(error => {
+    console.error(error);
+    process.exit(1);
+  });
 
 export { deployContract, DeploymentResult };

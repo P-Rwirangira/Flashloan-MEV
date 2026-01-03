@@ -10,6 +10,24 @@ import "@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3FlashCallback.s
 import "@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol";
 import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 
+// Protocol interfaces - defined outside contract
+interface IAaveV3Pool {
+    function liquidationCall(
+        address collateral,
+        address debt,
+        address user,
+        uint256 debtToCover,
+        bool receiveAToken
+    ) external;
+}
+
+interface ICompoundCToken {
+    function liquidateBorrow(address borrower, uint256 repayAmount, address cTokenCollateral) external returns (uint256);
+    function redeem(uint256 redeemTokens) external returns (uint256);
+    function balanceOf(address account) external view returns (uint256);
+    function underlying() external view returns (address);
+}
+
 /**
  * @title FlashExecutor
  * @dev Executes flash loan arbitrage on Base blockchain
@@ -96,24 +114,6 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         uint256 minProfit
     );
 
-   // Protocol interfaces
-   interface IAaveV3Pool {
-       function liquidationCall(
-           address collateral,
-           address debt,
-           address user,
-           uint256 debtToCover,
-           bool receiveAToken
-       ) external;
-   }
-
-   interface ICompoundCToken {
-       function liquidateBorrow(address borrower, uint256 repayAmount, address cTokenCollateral) external returns (uint256);
-       function redeem(uint256 redeemTokens) external returns (uint256);
-       function balanceOf(address account) external view returns (uint256);
-       function underlying() external view returns (address);
-   }
-    
     event PoolAuthorizationChanged(
         address indexed pool,
         bool isAuthorized
@@ -394,7 +394,18 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
     /**
      * @dev Get the other token in a pool
      */
-    function _getOtherToken(address pool, address token) internal view returns (address) {}
+    function _getOtherToken(address pool, address token) internal view returns (address) {
+        address token0 = IUniswapV3Pool(pool).token0();
+        address token1 = IUniswapV3Pool(pool).token1();
+        
+        if (token == token0) {
+            return token1;
+        } else if (token == token1) {
+            return token0;
+        } else {
+            revert("Token not in pool");
+        }
+    }
 
     // Execute liquidation and compute profit in borrowed token units
     function _executeLiquidationAndComputeProfit(
@@ -421,7 +432,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
 
         if (lq.protocol == ProtocolType.AAVE_V3) {
             // Approve debt to pool
-            IERC20(lq.debtAsset).safeApprove(lq.protocolAddress, lq.debtToCover);
+            IERC20(lq.debtAsset).approve(lq.protocolAddress, lq.debtToCover);
             IAaveV3Pool(lq.protocolAddress).liquidationCall(
                 lq.collateralAsset,
                 lq.debtAsset,
@@ -431,7 +442,7 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
             );
         } else if (lq.protocol == ProtocolType.COMPOUND_LIKE) {
             // Approve debt asset to cToken of debt if needed (for some implementations repay via debt underlying)
-            IERC20(lq.debtAsset).safeApprove(lq.cDebtToken, lq.debtToCover);
+            IERC20(lq.debtAsset).approve(lq.cDebtToken, lq.debtToCover);
             uint256 res = ICompoundCToken(lq.cDebtToken).liquidateBorrow(lq.borrower, lq.debtToCover, lq.cCollateralToken);
             require(res == 0, "Compound liquidation failed");
             // Redeem seized cTokens to underlying collateral
@@ -458,19 +469,6 @@ contract FlashExecutor is IUniswapV3FlashCallback, IUniswapV3SwapCallback, Ownab
         uint256 balAfter = IERC20(borrowedToken).balanceOf(address(this));
         require(balAfter >= amountOwed, "Insufficient post-liquidation balance");
         return balAfter - amountOwed;
-    }
-
-    function _getOtherToken(address pool, address token) internal view returns (address) {
-        address token0 = IUniswapV3Pool(pool).token0();
-        address token1 = IUniswapV3Pool(pool).token1();
-        
-        if (token == token0) {
-            return token1;
-        } else if (token == token1) {
-            return token0;
-        } else {
-            revert("Token not in pool");
-        }
     }
 
     /**

@@ -7,7 +7,7 @@
   "scripts": {
     "build": "tsc",
     "build:contracts": "hardhat compile",
-    "deploy:testnet": "hardhat run scripts/automated-deployment.ts --network base-sepolia",
+    "deploy:testnet": "tsx scripts/automated-deployment.ts base-sepolia",
     "deploy:mainnet": "hardhat run scripts/automated-deployment.ts --network base",
     "deploy:setup": "tsx scripts/setup-deployment-env.ts",
     "deploy:test": "tsx scripts/test-contract-deployment.ts",
@@ -19,7 +19,8 @@
     "verify:testnet": "hardhat verify --network base-sepolia ${CONTRACT_ADDRESS} ${CONSTRUCTOR_ARGS:-}",
     "verify:mainnet": "hardhat verify --network base ${CONTRACT_ADDRESS} ${CONSTRUCTOR_ARGS:-}",
     "test:relay": "tsx scripts/test-relay-connectivity.ts",
-    "dev": "tsx watch src/index.ts",
+    "dev": "tsx src/dev-menu.ts",
+    "dev:direct": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "test": "jest",
     "test:watch": "jest --watch",
@@ -83,6 +84,8 @@
     "@openzeppelin/contracts": "^5.4.0",
     "@uniswap/v3-core": "^1.0.1",
     "@uniswap/v3-periphery": "^1.4.4",
+    "chalk": "^5.6.2",
+    "dotenv": "^17.2.3",
     "ethers": "^6.8.1",
     "winston": "^3.11.0",
     "ws": "^8.14.2",
@@ -91,8 +94,6 @@
   },
   "lint-staged": {
     "*.ts": [
-      "prettier --write",
-      "eslint --fix",
       "bash -c 'npm run typecheck'"
     ]
   },

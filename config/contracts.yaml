@@ -1,7 +1,5 @@
-# Contract deployment configuration
 contracts:
   flashExecutor:
-    # Will be populated after deployment
     address: ""
     deploymentBlock: 0
     deploymentTime: ""
@@ -9,60 +7,57 @@ contracts:
     chainId: ""
     owner: ""
     minProfit: ""
-    
-  # Authorized pools for flash loans
   authorizedPools:
     uniswapV3:
-      # Base mainnet Uniswap V3 pools
-      - address: "0xd0b53d9277642d899df5c87a3966a349a798f224" # WETH/USDC 0.05%
-        token0: "WETH"
-        token1: "USDC"
+      - address: "0xd0b53d9277642d899df5c87a3966a349a798f224"
+        token0: WETH
+        token1: USDC
         fee: 500
-      - address: "0x6c561b446416e1a00e8e93e221854d6ea4171372" # WETH/USDC canonical pool
-        token0: "WETH"
-        token1: "USDC"
+      - address: "0x6c561b446416e1a00e8e93e221854d6ea4171372"
+        token0: WETH
+        token1: USDC
         fee: 3000
-    
     aerodrome:
-      # Base mainnet Aerodrome pools
-      - address: "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59" # WETH/USDC volatile
-        token0: "WETH"
-        token1: "USDC"
+      - address: "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59"
+        token0: WETH
+        token1: USDC
         stable: false
-
-# Deployment settings
 deployment:
-  minProfitEth: "0.001" # 0.001 ETH minimum profit
+  minProfitEth: "0.001"
   gasLimit: 5000000
-  gasPrice: "auto" # Use network suggested gas price
-  
-# Network configurations
+  gasPrice: auto
 protocols:
   aaveV3:
-    poolAddress: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5" # Base Aave V3 Pool
+    poolAddress: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
   compoundLike:
     moonwell:
       comptroller: "0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180"
       markets:
-        - underlying: "0x4200000000000000000000000000000000000006" # WETH
-          cToken: "0x0000000000000000000000000000000000000000" # TODO update
-        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" # USDC
-          cToken: "0x0000000000000000000000000000000000000000" # TODO update
+        - underlying: "0x4200000000000000000000000000000000000006"
+          cToken: "0x0000000000000000000000000000000000000000"
+        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          cToken: "0x0000000000000000000000000000000000000000"
     seamless:
       comptroller: "0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180"
       markets:
-        - underlying: "0x4200000000000000000000000000000000000006" # WETH
-          cToken: "0x0000000000000000000000000000000000000000" # TODO update
-        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" # USDC
-          cToken: "0x0000000000000000000000000000000000000000" # TODO update
-
+        - underlying: "0x4200000000000000000000000000000000000006"
+          cToken: "0x0000000000000000000000000000000000000000"
+        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          cToken: "0x0000000000000000000000000000000000000000"
 networks:
   base:
-    rpcUrl: "https://mainnet.base.org"
+    rpcUrl: https://mainnet.base.org
     chainId: 8453
-    blockExplorer: "https://basescan.org"
-    
+    blockExplorer: https://basescan.org
   baseSepolia:
-    rpcUrl: "https://sepolia.base.org"
+    rpcUrl: https://sepolia.base.org
     chainId: 84532
-    blockExplorer: "https://sepolia.basescan.org"
+    blockExplorer: https://sepolia.basescan.org
+flashExecutor:
+  address: "0x4208432729d72aE4a5812C040944f6AEd2A14E3c"
+  minProfit: "1000000000000000"
+  owner: "0x9649F6a1D354bB3668359548C3D9e7Cc92F5D67A"
+  network: base-sepolia
+  chainId: "84532"
+  deploymentBlock: 35851477
+  deploymentTime: 2026-01-03T20:14:03.132Z

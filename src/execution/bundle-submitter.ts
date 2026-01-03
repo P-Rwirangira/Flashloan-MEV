@@ -242,7 +242,7 @@ export class BundleSubmitter extends EventEmitter {
     transactions: TransactionRequest[]
   ): Promise<BundleTransaction[]> {
     const bundleTransactions: BundleTransaction[] = [];
-    let nonce = await this.signer.getNonce();
+    const nonce = await this.signer.getNonce();
 
     for (let i = 0; i < transactions.length; i++) {
       const tx = transactions[i];

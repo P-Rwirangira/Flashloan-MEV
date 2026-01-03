@@ -47,6 +47,7 @@ import { ContractManager } from './contracts/contract-manager';
 import { PoolStateManager } from './scanner/pool-state-manager';
 import { OpportunityType } from './types/execution';
 import { RelayProvider as PrivateRelayProvider } from './types/private-relay';
+import { InteractiveConfigManager } from './config/interactive-config';
 import { EventEmitter } from 'events';
 import { ethers } from 'ethers';
 import path from 'path';
@@ -152,7 +153,7 @@ export class BaseMEVPlatform extends EventEmitter {
         name: 'base',
         chainId: 8453,
         rpcUrl: process.env['BASE_RPC_URL'] || 'https://mainnet.base.org',
-        wsUrl: process.env['BASE_WS_URL'] || 'wss://mainnet.base.org',
+        wsUrl: process.env['BASE_WS_URL'] || '',
         fallbackRpcs: [
           'https://base-mainnet.g.alchemy.com/v2/demo',
           'https://base.blockpi.network/v1/rpc/public',
@@ -279,6 +280,18 @@ export class BaseMEVPlatform extends EventEmitter {
     return globalPerformanceTracker.trackOperation('platform-initialization', async () => {
       this.platformLogger.info('Initializing Base MEV Platform...');
 
+      // Initialize RPC connection manager first
+      try {
+        this.platformLogger.info('Initializing RPC connection manager...');
+        await this.connectionManager.initialize();
+        this.platformLogger.info('RPC connection manager initialized successfully');
+      } catch (error) {
+        this.platformLogger.logError(error as Error, {
+          operation: 'rpc-connection-initialization',
+        });
+        throw new Error('Failed to initialize RPC connections: ' + (error as Error).message);
+      }
+
       // Load configuration
       const rawConfig = await this.configLoader.load();
       this.config = this.parseConfig(rawConfig);
@@ -301,7 +314,58 @@ export class BaseMEVPlatform extends EventEmitter {
   }
 
   private parseConfig(rawConfig: any): PlatformConfig {
-    // Default configuration with all phases enabled
+    // Check if interactive configuration is available
+    const interactiveConfigManager = InteractiveConfigManager.getInstance();
+    const interactiveConfig = interactiveConfigManager.getConfig();
+
+    if (interactiveConfig) {
+      // Use interactive configuration with fallbacks to raw config
+      return {
+        phases: {
+          arbitrage: {
+            enabled: interactiveConfig.phases.arbitrage.enabled,
+            priority: interactiveConfig.phases.arbitrage.priority,
+          },
+          liquidations: {
+            enabled: interactiveConfig.phases.liquidations.enabled,
+            priority: interactiveConfig.phases.liquidations.priority,
+          },
+          stablePoolRebalancing: {
+            enabled: interactiveConfig.phases.stablePoolRebalancing.enabled,
+            priority: interactiveConfig.phases.stablePoolRebalancing.priority,
+          },
+        },
+        gracefulDegradation: {
+          enabled: rawConfig.gracefulDegradation?.enabled ?? true,
+          fallbackToArbitrageOnly: rawConfig.gracefulDegradation?.fallbackToArbitrageOnly ?? true,
+          maxConsecutiveFailures: rawConfig.gracefulDegradation?.maxConsecutiveFailures ?? 10,
+        },
+        featureFlags: {
+          enableLiquidationMonitoring: interactiveConfig.featureFlags.enableLiquidationMonitoring,
+          enableStablePoolMonitoring: interactiveConfig.featureFlags.enableStablePoolMonitoring,
+          enableAdvancedRouting: rawConfig.featureFlags?.enableAdvancedRouting ?? true,
+          enablePerformanceOptimizations:
+            rawConfig.featureFlags?.enablePerformanceOptimizations ?? true,
+          enableExecutionEngine: interactiveConfig.featureFlags.enableExecutionEngine,
+        },
+        execution: {
+          enabled: interactiveConfig.execution.enabled,
+          maxConcurrentExecutions: rawConfig.execution?.maxConcurrentExecutions ?? 5,
+          profitThresholds: {
+            arbitrage: rawConfig.execution?.profitThresholds?.arbitrage ?? 15.0,
+            liquidation: rawConfig.execution?.profitThresholds?.liquidation ?? 25.0,
+            stablePool: rawConfig.execution?.profitThresholds?.stablePool ?? 10.0,
+          },
+          riskLimits: {
+            maxSlippage: interactiveConfig.execution.maxSlippage / 100, // Convert percentage to decimal
+            maxGasPrice: this.parseGasPrice(interactiveConfig.execution.maxGasPrice),
+            dailyLossLimit: this.parseLossLimit(interactiveConfig.execution.dailyLossLimit),
+          },
+        },
+      };
+    }
+
+    // Default configuration when no interactive config is available
     return {
       phases: {
         arbitrage: {
@@ -347,6 +411,44 @@ export class BaseMEVPlatform extends EventEmitter {
         },
       },
     };
+  }
+
+  private parseGasPrice(gasPriceStr: string): bigint {
+    // Parse gas price strings like "50 gwei", "20000000000 wei"
+    const parts = gasPriceStr.toLowerCase().split(' ');
+    const value = parseFloat(parts[0] || '0');
+    const unit = parts[1] || 'gwei';
+
+    switch (unit) {
+      case 'gwei':
+        return BigInt(Math.floor(value * 1e9));
+      case 'wei':
+        return BigInt(Math.floor(value));
+      case 'eth':
+        return BigInt(Math.floor(value * 1e18));
+      default:
+        // Default to gwei if unit is not recognized
+        return BigInt(Math.floor(value * 1e9));
+    }
+  }
+
+  private parseLossLimit(lossLimitStr: string): bigint {
+    // Parse loss limit strings like "0.1 ETH", "100000000000000000 wei"
+    const parts = lossLimitStr.toLowerCase().split(' ');
+    const value = parseFloat(parts[0] || '0');
+    const unit = parts[1] || 'eth';
+
+    switch (unit) {
+      case 'eth':
+        return BigInt(Math.floor(value * 1e18));
+      case 'wei':
+        return BigInt(Math.floor(value));
+      case 'gwei':
+        return BigInt(Math.floor(value * 1e9));
+      default:
+        // Default to ETH if unit is not recognized
+        return BigInt(Math.floor(value * 1e18));
+    }
   }
 
   private async initializePhaseComponents(): Promise<void> {
@@ -2004,22 +2106,18 @@ export class BaseMEVPlatform extends EventEmitter {
   private startRealOpportunityDetection(): void {
     this.platformLogger.info('Starting real opportunity detection across all phases');
 
-    // Phase 1: Start arbitrage scanning
+    // Scanners are already started in startPhaseComponents
+    // Just log that they're active
     if (this.arbitrageScanner) {
-      this.arbitrageScanner.startScanning();
-      this.platformLogger.info('Phase 1: Arbitrage scanning started');
+      this.platformLogger.info('Phase 1: Arbitrage scanning active');
     }
 
-    // Phase 2: Start liquidation monitoring
     if (this.lendingMonitor && this.config?.phases.liquidations.enabled) {
-      this.lendingMonitor.startScanning();
-      this.platformLogger.info('Phase 2: Liquidation monitoring started');
+      this.platformLogger.info('Phase 2: Liquidation monitoring active');
     }
 
-    // Phase 3: Start stable pool monitoring
     if (this.stablePoolMonitor && this.config?.phases.stablePoolRebalancing.enabled) {
-      this.stablePoolMonitor.startScanning();
-      this.platformLogger.info('Phase 3: Stable pool monitoring started');
+      this.platformLogger.info('Phase 3: Stable pool monitoring active');
     }
 
     // Start mempool monitoring for backrun opportunities
@@ -2275,17 +2373,17 @@ async function main(): Promise<void> {
   const isPaperTrading = rawConfig.paperTrading === true;
 
   if (isDryRun) {
-    logger.warn('🔒 RUNNING IN DRY-RUN MODE - No transactions will be submitted');
+    logger.warn('RUNNING IN DRY-RUN MODE - No transactions will be submitted');
     logger.warn('   Set dryRun: false in config/default.yaml to enable live trading');
   }
 
   if (isPaperTrading) {
-    logger.warn('📝 RUNNING IN PAPER TRADING MODE - Simulating execution without signing');
+    logger.warn('RUNNING IN PAPER TRADING MODE - Simulating execution without signing');
     logger.warn('   Set paperTrading: false in config/default.yaml to enable real execution');
   }
 
   if (!isDryRun && !isPaperTrading) {
-    logger.info('⚠️  LIVE TRADING ENABLED - Real transactions will be submitted!');
+    logger.info('LIVE TRADING ENABLED - Real transactions will be submitted!');
     logger.info('   Make sure you have completed pre-flight checklist');
   }
 

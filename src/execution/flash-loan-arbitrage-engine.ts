@@ -521,7 +521,7 @@ export class FlashLoanArbitrageEngine extends EventEmitter implements IExecution
 
     // Determine flash loan amounts (amount0, amount1 for Uniswap V3 pools)
     let amount0 = 0n;
-    let amount1 = 0n;
+    const amount1 = 0n;
 
     // For simplicity, assume we're borrowing the input token as amount0
     // In practice, this would need to check the token order in the pool

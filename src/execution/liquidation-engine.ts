@@ -293,7 +293,7 @@ export class LiquidationEngine extends EventEmitter implements ExecutionEngine {
     let totalGasEstimate = 0n;
     let flashLoanRequired = false;
     let flashLoanAmount = 0n;
-    let flashLoanToken = opportunity.debtAsset;
+    const flashLoanToken = opportunity.debtAsset;
 
     // Step 1: Flash loan to get debt token
     flashLoanRequired = true;
