@@ -50,9 +50,10 @@ export class DexScreenerIntegration {
     if (config.multiHopScanner) {
       this.multiHopScanner = new DexScreenerMultiHopScanner(
         this.monitor,
-        config.multiHopScanner
+        config.multiHopScanner,
+        rpcProvider  // Pass RPC provider for real reserve fetching
       );
-      logger.info('Multi-hop scanner initialized');
+      logger.info('Multi-hop scanner initialized with RPC provider');
     }
 
     if (config.discovery) {

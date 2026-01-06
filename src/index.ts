@@ -773,7 +773,7 @@ export class BaseMEVPlatform extends EventEmitter {
         minProfitMargin: 0.05,
         maxPriceImpact: 0.01,
         incentiveMultiplier: 1.0,
-      });
+      }, this.oracleAdapter!);
 
       // Set up stable pool event handlers
       this.stablePoolMonitor.on('stablePoolOpportunityDetected', async opportunity => {

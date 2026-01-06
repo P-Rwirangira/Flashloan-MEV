@@ -77,8 +77,12 @@ export class CrossProtocolLiquidator extends EventEmitter {
     this.initializeProtocols();
     this.startMonitoring();
 
-    // Use provider for future gas price queries
-    this.getCurrentGasPrice();
+    // Initialize gas price asynchronously for validation
+    this.getCurrentGasPrice().catch((error) => {
+      this.logger.error('Failed to initialize gas price', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
 
     this.logger.info('Cross-protocol liquidator initialized', {
       protocolCount: this.protocols.size,

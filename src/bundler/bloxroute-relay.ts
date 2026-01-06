@@ -65,18 +65,23 @@ export class BloXrouteRelay {
       const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
 
       try {
-        // Verify API key by making a test request
-        const response = await fetch(`${this.endpoint}/api/v1/status`, {
+        // Verify API key by making a test request to health endpoint
+        const response = await fetch(`${this.endpoint}/health`, {
           headers: {
-            Authorization: this.apiKey,
+            Authorization: `Bearer ${this.apiKey}`,
           },
           signal: controller.signal,
         });
 
         clearTimeout(timeoutId);
 
-        if (!response.ok) {
-          throw new Error(`bloXroute API returned ${response.status}: ${response.statusText}`);
+        // Check for authentication failures
+        if (response.status === 401 || response.status === 403) {
+          throw new Error(`bloXroute authentication failed at /health endpoint: status ${response.status} - Invalid or unauthorized API key`);
+        }
+
+        if (response.status !== 200) {
+          throw new Error(`bloXroute /health endpoint returned status ${response.status}: ${response.statusText}`);
         }
 
         this.initialized = true;

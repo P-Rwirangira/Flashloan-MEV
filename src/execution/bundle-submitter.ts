@@ -315,6 +315,11 @@ export class BundleSubmitter extends EventEmitter {
     // Don't exceed 150% of average
     const maxLimit = (avgLimit * 150n) / 100n;
 
+    // Never return less than the original required amount
+    if (maxLimit < originalLimit) {
+      return originalLimit;
+    }
+
     return optimizedLimit > maxLimit ? maxLimit : optimizedLimit;
   }
 

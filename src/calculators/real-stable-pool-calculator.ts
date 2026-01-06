@@ -9,6 +9,7 @@ import { ethers } from 'ethers';
 import { createComponentLogger } from '../utils/logger';
 import { StablePoolOpportunity } from '../scanner/stable-pool-monitor';
 import { RpcConnectionManager } from '../rpc/connection-manager';
+import { OracleAdapter } from '../oracles/oracle-adapter';
 
 // Rebalancing calculation result
 export interface RebalancingCalculationResult {
@@ -75,10 +76,16 @@ export class RealStablePoolRebalancingCalculator {
   private readonly logger = createComponentLogger('real-stable-pool-calculator');
   private readonly options: RealStablePoolCalculatorOptions;
   private readonly provider: ethers.Provider;
+  private readonly oracleAdapter: OracleAdapter;
 
-  constructor(options: RealStablePoolCalculatorOptions) {
+  constructor(options: RealStablePoolCalculatorOptions, oracleAdapter: OracleAdapter) {
     this.options = options;
     this.provider = options.connectionManager.getProvider();
+    this.oracleAdapter = oracleAdapter;
+
+    if (!this.oracleAdapter) {
+      throw new Error('OracleAdapter is required for RealStablePoolRebalancingCalculator');
+    }
 
     this.logger.info('Real stable pool calculator initialized', {
       maxSlippage: `${(options.maxSlippage * 100).toFixed(2)}%`,
@@ -116,7 +123,7 @@ export class RealStablePoolRebalancingCalculator {
 
       // Step 3: Get real incentive data
       this.logger.markPerformance(operationId, 'incentive-calc');
-      const incentiveReward = await this.calculateRealIncentiveReward(poolState);
+      const incentiveReward = await this.calculateRealIncentiveReward(poolState, opportunity.poolAddress);
 
       // Step 4: Estimate execution costs
       this.logger.markPerformance(operationId, 'cost-estimation');
@@ -459,11 +466,47 @@ export class RealStablePoolRebalancingCalculator {
   /**
    * Calculate real incentive reward from Aerodrome gauges
    */
-  private async calculateRealIncentiveReward(_poolState: PoolState): Promise<bigint> {
+  private async calculateRealIncentiveReward(_poolState: PoolState, poolAddress: string): Promise<bigint> {
     try {
-      // Get gauge address for this pool - we need the pool address from context
-      // For now, return 0 as we don't have the opportunity context
-      return 0n;
+      // Get gauge address for this pool
+      const gaugeAddress = await this.getGaugeAddress(poolAddress);
+      
+      if (!gaugeAddress || gaugeAddress === ethers.ZeroAddress) {
+        return 0n;
+      }
+
+      // Query gauge for reward data
+      const gaugeContract = new ethers.Contract(
+        gaugeAddress,
+        [
+          'function rewardRate() external view returns (uint256)',
+          'function rewardToken() external view returns (address)',
+        ],
+        this.provider
+      );
+
+      const [rewardRate, rewardToken] = await Promise.all([
+        gaugeContract['rewardRate']?.().catch(() => 0n),
+        gaugeContract['rewardToken']?.().catch(() => ethers.ZeroAddress),
+      ]);
+
+      if (!rewardRate || rewardRate === 0n || !rewardToken || rewardToken === ethers.ZeroAddress) {
+        return 0n;
+      }
+
+      // Get reward token decimals for future use
+      const tokenContract = new ethers.Contract(
+        rewardToken,
+        ['function decimals() external view returns (uint8)'],
+        this.provider
+      );
+      await tokenContract['decimals']?.().catch(() => 18); // Fetch but don't store for now
+
+      // Convert reward rate to normalized bigint
+      // Assuming rewardRate is per second, calculate for typical swap execution time (1 block ~2 seconds)
+      const rewardForExecution = rewardRate * 2n;
+
+      return rewardForExecution;
     } catch (error) {
       this.logger.debug('Failed to calculate real incentive reward', {
         error: error instanceof Error ? error.message : String(error),
@@ -581,12 +624,9 @@ export class RealStablePoolRebalancingCalculator {
     // Pool size risk (smaller pools = higher risk)
     let totalLiquidityUsd = 0;
     try {
-      const cm = { getProvider: () => this.provider } as any;
-      const { OracleAdapter } = await import('../oracles/oracle-adapter');
-      const oa = new OracleAdapter(cm);
-      // Fetch token USD prices (approximate via known feeds)
-      const price0 = await oa.getTokenUsd(poolState.token0 as any);
-      const price1 = await oa.getTokenUsd(poolState.token1 as any);
+      // Fetch token USD prices using injected oracle adapter
+      const price0 = await this.oracleAdapter.getTokenUsd(poolState.token0 as any);
+      const price1 = await this.oracleAdapter.getTokenUsd(poolState.token1 as any);
       // Fetch decimals for both tokens
       const erc20Abi = ['function decimals() view returns (uint8)'];
       const t0 = new ethers.Contract(poolState.token0, erc20Abi, this.provider);
@@ -597,8 +637,11 @@ export class RealStablePoolRebalancingCalculator {
       const usd0 = (Number(poolState.reserve0) / Math.pow(10, dec0)) * price0;
       const usd1 = (Number(poolState.reserve1) / Math.pow(10, dec1)) * price1;
       totalLiquidityUsd = usd0 + usd1;
-    } catch (_) {
+    } catch (err) {
       // If price/decimals unavailable, default to conservative 0 which increases risk
+      this.logger.debug('Failed to calculate pool liquidity USD', {
+        error: err instanceof Error ? err.message : String(err),
+      });
       totalLiquidityUsd = 0;
     }
     if (totalLiquidityUsd < 100000) {

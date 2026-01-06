@@ -49,7 +49,7 @@ export class InteractiveMenu {
           key: 'arbitrage',
           name: 'Cross-DEX Arbitrage',
           description: 'Flash loan arbitrage between Uniswap V3 and Aerodrome',
-          enabled: true, // Default enabled for arbitrage focus
+          enabled: true,
           capitalRequired: '0 ETH (Flash loans only)',
           riskLevel: 'Low',
           avgProfit: '$15-50 per trade',
