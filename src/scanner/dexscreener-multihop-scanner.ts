@@ -991,7 +991,7 @@ export class DexScreenerMultiHopScanner {
       // Metadata
       detectedAt: now,
       expiresAt: now + 20000, // 20 seconds (shorter for multi-hop)
-      source: 'dexscreener-hybrid-multihop'
+      source: `dexscreener-${path.pathType}-multihop`
     };
   }
 
