@@ -39,6 +39,16 @@ export class PoolManager extends EventEmitter {
   private uniswapV3Monitor?: UniswapV3Monitor;
   private aerodromeMonitor?: AerodromeMonitor;
 
+  /**
+   * Get monitors for external access (used by auto-discovery)
+   */
+  getMonitors() {
+    return {
+      uniswapV3Monitor: this.uniswapV3Monitor,
+      aerodromeMonitor: this.aerodromeMonitor,
+    };
+  }
+
   // Allowlist enforcement
   private allowlistViolations: Map<Address, AllowlistViolation> = new Map();
 

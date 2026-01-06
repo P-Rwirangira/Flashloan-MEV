@@ -19,7 +19,7 @@ featureFlags:
   enableStablePoolMonitoring: false
   enableAdvancedRouting: true
   enablePerformanceOptimizations: true
-  enableMempoolMonitoring: true
+  enableMempoolMonitoring: false  # ❌ DISABLED: Not needed for cross-DEX arbitrage (only for backrun)
   enableCompetitionTracking: true
 
 # Graceful Degradation
@@ -34,11 +34,12 @@ gracefulDegradation:
 network:
   chainId: 8453  # Base mainnet
   name: "base"
-  rpcUrl: "https://mainnet.base.org"
-  wsUrl: "${WS_URL:}"
+  rpcUrl: "${BASE_RPC_URL:https://base-rpc.publicnode.com}"
+  wsUrl: "${BASE_WS_URL:wss://base-rpc.publicnode.com}"
   fallbackRpcs:
     - "https://base.llamarpc.com"
-    - "https://base.blockpi.network/v1/rpc/public"
+    - "https://base.meowrpc.com"
+    - "https://mainnet.base.org"
 
 # Gas configuration
 gas:
@@ -78,22 +79,33 @@ performance:
 strategies:
   arbitrage:
     enabled: true
-    minProfitUSD: 15.0  # Conservative start - tune down after 1 week of testing
-    maxSlippageBps: 100  # 1%
-    maxGasPriceGwei: 0.1  # Base L2 typical gas (was 50 - WAY too high!)
-    maxPositionSize: 50000  # USD
-    cooldownMs: 2000
+    minProfitUSD: 8.0  # Lowered for Base L2 - more opportunities
+    maxSlippageBps: 150  # 1.5% - more realistic
+    maxGasPriceGwei: 0.5  # Base L2 typical gas
+    maxPositionSize: 25000  # USD - reduced for safety
+    cooldownMs: 1000  # Faster scanning on L2
     pairs:
       - "WETH/USDC"
-      - "wstETH/ETH"
-    maxRoutes: 3
-    fallbackRoutes: 2
-    minSpreadBps: 15  # Lowered from 25 to catch more opportunities
-    maxPriceImpactBps: 50  # 0.5%
+      - "WETH/cbETH"
+      - "USDC/USDbC"
+    maxRoutes: 2  # Simplified routing
+    fallbackRoutes: 1
+    minSpreadBps: 10  # Lowered to catch more opportunities
+    maxPriceImpactBps: 75  # 0.75%
     dexPriority:
       - "uniswap-v3"
       - "aerodrome"
-    competitionThreshold: 3
+    competitionThreshold: 2
+    # Enhanced scanning parameters
+    enableMultiHop: false  # Disabled for initial testing
+    enableTriangularArbitrage: false  # Disabled for initial testing
+    scanIntervalMs: 3000  # 3 seconds - balanced for Base L2
+    maxConcurrentScans: 3
+    enablePoolDiscovery: false  # Manual pools only for now
+    # Rate limiting protection
+    rpcCallsPerSecond: 10  # Conservative to avoid rate limits
+    maxRetries: 2
+    retryDelayMs: 1000
 
   liquidation:
     enabled: false  # Phase 2
@@ -125,29 +137,55 @@ strategies:
     maxRebalanceAmount: 20000
     targetUtilization: 0.8
 
-# Pool allowlists
+# Pool allowlists - VERIFIED BASE MAINNET POOLS
 allowedPools:
   uniswapV3:
-    - address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18"  # WETH/USDC 0.05%
+    # WETH/USDC 0.05% - High volume, most liquid pair on Base
+    - address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18"
+      dex: "uniswap-v3"
       enabled: true
       priority: 1
-      minTvl: 1000000
-      maxSlippage: 0.01
-      tags: ["high-volume", "stable"]
-    - address: "0xd0b53D9277642d899DF5C87A3966A349A798F224"  # WETH/USDC 0.3%
+      minTvl: 500000  # Reduced from 1M to catch more opportunities
+      maxSlippage: 0.015  # 1.5% - more realistic for Base L2
+      tags: ["high-volume", "stable", "primary"]
+    
+    # WETH/USDC 0.3% - Alternative fee tier
+    - address: "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+      dex: "uniswap-v3"
       enabled: true
       priority: 2
-      minTvl: 500000
-      maxSlippage: 0.02
-      tags: ["medium-volume"]
+      minTvl: 200000  # Reduced threshold
+      maxSlippage: 0.025  # 2.5%
+      tags: ["medium-volume", "alternative-fee"]
+    
+    # WETH/cbETH 0.05% - ETH derivatives arbitrage
+    - address: "0x7B73644935b8e68019ac6356c40661E1bc315860"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 3
+      minTvl: 100000
+      maxSlippage: 0.03
+      tags: ["eth-derivatives", "medium-volume"]
+    
+    # USDC/USDbC 0.01% - Stablecoin arbitrage
+    - address: "0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7b"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 4
+      minTvl: 50000
+      maxSlippage: 0.005  # Tight for stablecoins
+      tags: ["stablecoin", "low-risk"]
 
+  # Aerodrome pools - Base's native DEX
   aerodrome:
-    - address: "0xcDAC0d6c6C59727a65F871236188350531885C43"  # WETH/USDC volatile
+    # WETH/USDC Volatile Pool
+    - address: "0xcDAC0d6c6C59727a65F871236188350531885C43"
+      dex: "aerodrome"
       enabled: true
       priority: 1
-      minTvl: 500000
+      minTvl: 100000
       maxSlippage: 0.02
-      tags: ["volatile", "high-volume"]
+      tags: ["volatile", "high-volume", "native-dex"]
 
 # Token allowlists
 allowedTokens:
@@ -166,9 +204,8 @@ allowedTokens:
 
 # Relay configuration
 relays:
-  primary: "flashbots"
+  primary: "bloxroute"  # Use bloXroute as primary (Flashbots not on Base)
   fallbacks:
-    - "bloxroute"
     - "local"
   maxBribeGwei: 10
   retryAttempts: 3
@@ -177,8 +214,8 @@ relays:
     flashbots:
       name: "Flashbots Protect"
       url: "https://rpc.flashbots.net"
-      enabled: true
-      priority: 1
+      enabled: false  # NOT AVAILABLE ON BASE
+      priority: 99
       maxLatencyMs: 500
       rateLimit: 100
     bloxroute:
@@ -186,9 +223,9 @@ relays:
       url: "https://base.bdn.blxrbdn.com"
       apiKey: "${BLOXROUTE_API_KEY:}"
       enabled: true
-      priority: 2
+      priority: 1  # PRIMARY relay for Base
       maxLatencyMs: 300
-      rateLimit: 200
+      rateLimit: 1  # FREE tier: 1 bundle/sec (more than enough)
     local:
       name: "Local Node"
       url: "http://localhost:8545"

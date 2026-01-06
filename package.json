@@ -19,6 +19,8 @@
     "verify:testnet": "hardhat verify --network base-sepolia ${CONTRACT_ADDRESS} ${CONSTRUCTOR_ARGS:-}",
     "verify:mainnet": "hardhat verify --network base ${CONTRACT_ADDRESS} ${CONSTRUCTOR_ARGS:-}",
     "test:relay": "tsx scripts/test-relay-connectivity.ts",
+    "validate-pools": "tsx src/scripts/validate-pools.ts",
+    "quick-test": "tsx src/scripts/quick-test.ts",
     "dev": "tsx src/dev-menu.ts",
     "dev:direct": "tsx watch src/index.ts",
     "start": "node dist/index.js",

@@ -369,13 +369,57 @@ export class RpcConnectionManager extends EventEmitter {
   }
 
   /**
-   * Get the current active provider
+   * Get the current active provider with intelligent load balancing
    */
   getProvider(): ethers.JsonRpcProvider {
     if (!this.currentProvider) {
       throw new Error('No active RPC provider available');
     }
+
+    // Check if current provider is healthy, if not try to use a fallback
+    const currentHealth = this.connectionHealth.get(this.getProviderUrl(this.currentProvider));
+    if (currentHealth && (!currentHealth.connected || currentHealth.consecutiveFailures >= 2)) {
+      // Try to find a healthy fallback provider
+      const healthyFallback = this.fallbackProviders.find(provider => {
+        const health = this.connectionHealth.get(this.getProviderUrl(provider));
+        return health && health.connected && health.consecutiveFailures < 2;
+      });
+
+      if (healthyFallback) {
+        console.log(`Switching to fallback provider due to rate limiting`);
+        this.currentProvider = healthyFallback;
+      }
+    }
+
     return this.currentProvider;
+  }
+
+  /**
+   * Get provider with automatic rotation to avoid rate limits
+   */
+  getProviderWithRotation(): ethers.JsonRpcProvider {
+    // Simple round-robin rotation through healthy providers
+    const allProviders = [this.primaryProvider, ...this.fallbackProviders].filter(Boolean);
+    const healthyProviders = allProviders.filter(provider => {
+      const health = this.connectionHealth.get(this.getProviderUrl(provider!));
+      return health && health.connected && health.consecutiveFailures < 2;
+    });
+
+    if (healthyProviders.length === 0) {
+      return this.getProvider(); // Fallback to current provider
+    }
+
+    // Rotate to next healthy provider
+    const currentIndex = healthyProviders.findIndex(p => p === this.currentProvider);
+    const nextIndex = (currentIndex + 1) % healthyProviders.length;
+    const nextProvider = healthyProviders[nextIndex];
+
+    if (nextProvider && nextProvider !== this.currentProvider) {
+      console.log(`Rotating to next provider to avoid rate limits`);
+      this.currentProvider = nextProvider;
+    }
+
+    return this.currentProvider!;
   }
 
   /**

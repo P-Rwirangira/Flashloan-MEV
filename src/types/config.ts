@@ -98,6 +98,7 @@ export interface ArbitrageConfig {
   readonly maxPriceImpactBps: number;
   readonly dexPriority: string[];
   readonly competitionThreshold: number;
+  readonly scanIntervalMs?: number;
   // MEV Protection Features
   readonly enableMEVProtection?: boolean;
   readonly enableSandwichDetection?: boolean;

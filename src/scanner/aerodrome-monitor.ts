@@ -12,6 +12,7 @@ import { AerodromeVolatilePoolState, AerodromeStablePoolState, PoolType } from '
 import { PoolAllowlist } from '../types/config';
 import { Address } from '../types/common';
 import { createComponentLogger } from '../utils/logger';
+import type { DiscoveredPool } from './pool-discovery.js';
 
 export interface AerodromeMonitorOptions {
   readonly connectionManager: RpcConnectionManager;
@@ -75,7 +76,8 @@ export class AerodromeMonitor extends EventEmitter {
    */
   private initializePools(allowedPools: PoolAllowlist[]): void {
     for (const poolConfig of allowedPools) {
-      if (poolConfig.enabled && poolConfig.dex === 'aerodrome') {
+      // Accept pools if enabled and dex matches (or no dex specified for backwards compat)
+      if (poolConfig.enabled && (!poolConfig.dex || poolConfig.dex === 'aerodrome')) {
         this.monitoredPools.set(poolConfig.address, poolConfig);
 
         // Create contract instance
@@ -92,6 +94,46 @@ export class AerodromeMonitor extends EventEmitter {
 
     this.logger.info('Aerodrome monitor initialized', {
       poolCount: this.monitoredPools.size,
+    });
+  }
+
+  /**
+   * Add discovered pool dynamically
+   */
+  async addDiscoveredPool(pool: DiscoveredPool): Promise<void> {
+    if (pool.dex !== 'aerodrome') {
+      this.logger.warn('Attempted to add non-Aerodrome pool', { address: pool.address, dex: pool.dex });
+      return;
+    }
+
+    const poolConfig: PoolAllowlist = {
+      address: pool.address,
+      dex: 'aerodrome',
+      enabled: true,
+      priority: Math.floor(pool.score / 20), // Score 0-100 -> Priority 0-5
+      tags: [
+        pool.stable ? 'stable' : 'volatile',
+        pool.tvl >= 1000000 ? 'high-tvl' : 'medium-tvl',
+        'auto-discovered',
+      ],
+      minTvl: 10000,
+      maxSlippage: pool.stable ? 0.005 : 0.02, // 0.5% for stable, 2% for volatile
+    };
+
+    await this.addPool(poolConfig);
+
+    // Create contract instance
+    const provider = this.connectionManager.getProvider();
+    const contract = new ethers.Contract(pool.address, AERODROME_PAIR_ABI, provider);
+    this.poolContracts.set(pool.address, contract);
+
+    this.logger.info('Auto-discovered pool added', {
+      address: pool.address,
+      token0: pool.token0,
+      token1: pool.token1,
+      tvl: pool.tvl,
+      score: pool.score,
+      stable: pool.stable,
     });
   }
 
@@ -155,8 +197,10 @@ export class AerodromeMonitor extends EventEmitter {
    * Add a new pool to monitoring
    */
   async addPool(poolConfig: PoolAllowlist): Promise<void> {
-    if (poolConfig.dex !== 'aerodrome') {
-      throw new Error(`Invalid DEX type for Aerodrome monitor: ${poolConfig.dex}`);
+    // Monitor is already DEX-specific, no need to check dex field
+    if (!poolConfig.enabled) {
+      this.logger.warn('Attempted to add disabled pool', { address: poolConfig.address });
+      return;
     }
 
     this.monitoredPools.set(poolConfig.address, poolConfig);

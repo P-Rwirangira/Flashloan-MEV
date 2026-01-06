@@ -460,7 +460,38 @@ export class BaseMEVPlatform extends EventEmitter {
     if (this.config.phases.arbitrage.enabled) {
       this.platformLogger.info('Initializing Phase 1: Cross-DEX arbitrage');
 
-      // Initialize pool manager
+      // Auto-discovery disabled by default to reduce RPC load
+      // Enable by setting ENABLE_POOL_DISCOVERY=true
+      let discoveredPools: any[] = [];
+      if (process.env['ENABLE_POOL_DISCOVERY'] === 'true') {
+        try {
+          const { PoolDiscoveryService } = await import('./scanner/pool-discovery.js');
+          const discoveryService = new PoolDiscoveryService(this.connectionManager, {
+            minTvlUsd: 10000,
+            minScore: 50,
+            maxPools: 10, // Reduced from 20
+            blockLookback: 10000, // Reduced from 50000 to minimize RPC calls
+            enableUniswapV3: true,
+            enableAerodrome: false, // Disabled - incompatible factory
+          });
+
+          this.platformLogger.info('Starting automated pool discovery...');
+          discoveredPools = await discoveryService.discoverPools();
+          
+          this.platformLogger.info('Pool discovery completed', {
+            totalDiscovered: discoveredPools.length,
+            uniswapV3: discoveredPools.filter(p => p.dex === 'uniswap-v3').length,
+          });
+        } catch (error) {
+          this.platformLogger.warn('Pool auto-discovery failed, using configured pools only', {
+            error,
+          });
+        }
+      } else {
+        this.platformLogger.info('Pool auto-discovery disabled - using configured pools only');
+      }
+
+      // Initialize pool manager with discovered + configured pools
       const { PoolManager } = await import('./scanner/pool-manager');
       const poolManager = new PoolManager({
         connectionManager: this.connectionManager,
@@ -470,7 +501,45 @@ export class BaseMEVPlatform extends EventEmitter {
 
       await poolManager.initialize();
 
-      // Initialize arbitrage scanner with MEV protection
+      // Add discovered pools to monitors BEFORE starting them
+      if (discoveredPools.length > 0) {
+        this.platformLogger.info('Adding auto-discovered pools to monitors', {
+          count: discoveredPools.length,
+        });
+
+        for (const pool of discoveredPools) {
+          try {
+            const monitors = (poolManager as any).getMonitors();
+            if (pool.dex === 'uniswap-v3' && monitors.uniswapV3Monitor) {
+              await monitors.uniswapV3Monitor.addDiscoveredPool(pool);
+            } else if (pool.dex === 'aerodrome' && monitors.aerodromeMonitor) {
+              await monitors.aerodromeMonitor.addDiscoveredPool(pool);
+            }
+          } catch (error) {
+            this.platformLogger.warn('Failed to add discovered pool', {
+              address: pool.address,
+              dex: pool.dex,
+              error,
+            });
+          }
+        }
+
+        this.platformLogger.info('Auto-discovered pools successfully added');
+      }
+
+      // Start monitoring AFTER pools are configured
+      this.platformLogger.info('Starting pool monitors...');
+      await poolManager.startMonitoring();
+      
+      // Wait for initial pool state fetch
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      
+      const poolStates = poolManager.getAllPoolStates();
+      this.platformLogger.info('Pool states loaded', {
+        totalPools: poolStates.size,
+      });
+
+      // Initialize arbitrage scanner with improved rate limiting
       this.arbitrageScanner = new ArbitrageScanner({
         poolManager,
         connectionManager: this.connectionManager,
@@ -483,18 +552,19 @@ export class BaseMEVPlatform extends EventEmitter {
           mempoolMonitoringEnabled: true,
           competitorAnalysisEnabled: true,
           adaptiveGasPricing: true,
-          maxCompetitorGasMultiplier: 1.2, // Max 20% above competitor gas
-          sandwichDetectionThreshold: 0.02, // 2% price impact threshold
-          frontRunningTimeWindow: 3000, // 3 second window for front-run detection
-          enablePrivateMempool: true, // Use private mempool when available
-          enableMultiHop: true,
-          maxHops: 3,
+          maxCompetitorGasMultiplier: 1.2,
+          sandwichDetectionThreshold: 0.02,
+          frontRunningTimeWindow: 3000,
+          enablePrivateMempool: true,
+          enableMultiHop: false, // Disabled for initial testing
+          maxHops: 2,
           multiHopMinProfitMultiplier: 1.5,
-          enableTriangularArbitrage: true,
+          enableTriangularArbitrage: false, // Disabled for initial testing
           enablePathOptimization: true,
           pathOptimizationDepth: 2,
         },
-        scanIntervalMs: 600, // Faster scanning for MEV opportunities
+        scanIntervalMs: rawConfig.strategies.arbitrage.scanIntervalMs || 3000,
+        priceOracle: this.chainlinkOracle,
       });
 
       // Set up event listener for arbitrage opportunities
@@ -560,8 +630,12 @@ export class BaseMEVPlatform extends EventEmitter {
       // Initialize performance optimization features
       this.setupPerformanceOptimization();
 
-      // Initialize mempool monitor for backrun opportunities
-      this.mempoolMonitor = new MempoolMonitor({
+      // Initialize mempool monitor for backrun opportunities (only if enabled)
+      const enableMempoolMonitoring = (rawConfig as any).featureFlags?.enableMempoolMonitoring ?? false;
+      
+      if (enableMempoolMonitoring) {
+        this.platformLogger.info('Mempool monitoring enabled - initializing MempoolMonitor');
+        this.mempoolMonitor = new MempoolMonitor({
         connectionManager: this.connectionManager,
         enabledProtocols: ['uniswap-v3' as any, 'aerodrome' as any],
         minSwapValue: ethers.parseEther('0.1'), // 0.1 ETH minimum
@@ -588,12 +662,15 @@ export class BaseMEVPlatform extends EventEmitter {
           .filter(Boolean),
       });
 
-      // Set up event listener for mempool opportunities
-      this.mempoolMonitor.on('opportunityDetected', async (opportunity: any) => {
-        await this.handleMempoolOpportunity(opportunity);
-      });
+        // Set up event listener for mempool opportunities
+        this.mempoolMonitor.on('opportunityDetected', async (opportunity: any) => {
+          await this.handleMempoolOpportunity(opportunity);
+        });
 
-      this.platformLogger.info('Mempool monitor initialized successfully');
+        this.platformLogger.info('Mempool monitor initialized successfully');
+      } else {
+        this.platformLogger.info('Mempool monitoring disabled - skipping MempoolMonitor initialization');
+      }
     }
 
     // Phase 2: Liquidations
