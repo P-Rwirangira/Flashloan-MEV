@@ -3,6 +3,9 @@
  * Standalone runner for DexScreener integration
  */
 
+import { config } from 'dotenv';
+config(); // Load environment variables from .env file
+
 import { createDexScreenerIntegration } from './scanner/dexscreener-integration.js';
 import { ConfigLoader } from './config/loader.js';
 import { RpcConnectionManager } from './rpc/connection-manager.js';

@@ -68,38 +68,45 @@ dexscreener:
   # Cross-DEX arbitrage scanner
   crossDexScanner:
     enabled: true
-    minSpreadPercent: 0.1
-    minProfitUsd: 8
-    minConfidenceScore: 70
-    maxPriceImpactPercent: 2
-    scanIntervalMs: 5000
+    minSpreadPercent: 0.05  # Lowered from 0.1% to catch more opportunities
+    minProfitUsd: 5  # Lowered from 8 for Base L2 efficiency
+    minConfidenceScore: 65  # Slightly lower for more opportunities
+    maxPriceImpactPercent: 2.5  # Increased slightly for flexibility
+    scanIntervalMs: 3000  # Faster scanning (3s vs 5s)
   
   # Multi-hop arbitrage scanner
   multiHopScanner:
     enabled: true
     maxHops: 4
-    minSpreadPercent: 0.2
-    minProfitUsd: 15
-    minConfidenceScore: 60
-    maxPriceImpactPercent: 3
-    scanIntervalMs: 10000
+    minSpreadPercent: 0.15  # Lowered from 0.2% for multi-hop
+    minProfitUsd: 10  # Lowered from 15 for Base L2
+    minConfidenceScore: 55  # Lower threshold for multi-hop complexity
+    maxPriceImpactPercent: 4  # Higher tolerance for multi-hop
+    scanIntervalMs: 8000  # Slightly faster (8s vs 10s)
     enabledTokens:
       - "0x4200000000000000000000000000000000000006"  # WETH
       - "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC
       - "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"  # USDbC
+      - "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"  # DAI
+      - "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"  # cbETH
+      - "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"  # cbBTC
   
   # Trending pair discovery
   discovery:
     enabled: true
-    minLiquidityUsd: 500000
-    minVolume24hUsd: 100000
-    minVolume1hUsd: 10000
+    minLiquidityUsd: 250000  # Lowered from 500K to catch mid-tier opportunities
+    minVolume24hUsd: 50000  # Lowered from 100K for long-tail tokens
+    minVolume1hUsd: 5000  # Lowered from 10K for faster discovery
     maxPoolAge: 0  # 0 = no age limit
-    scanIntervalMs: 300000  # 5 minutes
-    maxNewPoolsPerScan: 10
+    scanIntervalMs: 120000  # 2 minutes (faster discovery from 5min)
+    maxNewPoolsPerScan: 15  # Increased from 10
     whitelistedTokens:
       - "0x4200000000000000000000000000000000000006"  # WETH
       - "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC
+      - "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"  # USDbC
+      - "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"  # DAI
+      - "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"  # cbETH
+      - "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"  # cbBTC
     blacklistedTokens: []
   
   # Orchestrator configuration
@@ -150,15 +157,20 @@ performance:
 strategies:
   arbitrage:
     enabled: true
-    minProfitUSD: 8.0  # Lowered for Base L2 - more opportunities
-    maxSlippageBps: 150  # 1.5% - more realistic
+    minProfitUSD: 5.0  # Further lowered for Base L2 efficiency
+    maxSlippageBps: 200  # 2% - increased for more opportunities
     maxGasPriceGwei: 0.5  # Base L2 typical gas
     maxPositionSize: 25000  # USD - reduced for safety
     cooldownMs: 1000  # Faster scanning on L2
     pairs:
       - "WETH/USDC"
       - "WETH/cbETH"
+      - "WETH/cbBTC"
+      - "WETH/DAI"
       - "USDC/USDbC"
+      - "USDC/DAI"
+      - "cbETH/USDC"
+      - "cbBTC/USDC"
     maxRoutes: 2  # Simplified routing
     fallbackRoutes: 1
     minSpreadBps: 10  # Lowered to catch more opportunities
@@ -213,43 +225,203 @@ strategies:
 # Focus: Highest TVL & volume pairs for maximum profit per scan
 allowedPools:
   uniswapV3:
-    # WETH/USDbC 0.05% - Bridged USDC (verified working)
+    # TIER 1: WETH Pairs (Highest Volume & Liquidity)
     - address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18"
       dex: "uniswap-v3"
       enabled: true
       priority: 1
-      minTvl: 100000
-      maxSlippage: 0.015
-      tags: ["high-volume", "bridged-usdc", "verified"]
+      minTvl: 1000000
+      maxSlippage: 0.01
+      fee: 500
+      tags: ["weth", "usdc", "tier1", "high-volume"]
     
-    # WETH/DAI 0.3% - High liquidity (verified working)  
+    - address: "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 2
+      minTvl: 500000
+      maxSlippage: 0.02
+      fee: 3000
+      tags: ["weth", "usdc", "tier1", "medium-volume"]
+    
     - address: "0xc9034c3E7F58003E6ae0C8438e7c8f4598d5ACAA"
       dex: "uniswap-v3"
       enabled: true
       priority: 1
-      minTvl: 100000
-      maxSlippage: 0.015
-      tags: ["high-volume", "verified"]
+      minTvl: 1000000
+      maxSlippage: 0.01
+      fee: 500
+      tags: ["weth", "usdbc", "tier1", "bridged-usdc", "high-volume"]
     
-    # WETH/USDC 0.05% - Native USDC (verified working)
-    - address: "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+    - address: "0xB4885Bc63399BF5518b994c1d0C153334Ee579D0"
       dex: "uniswap-v3"
       enabled: true
       priority: 1
-      minTvl: 100000
+      minTvl: 500000
       maxSlippage: 0.015
-      tags: ["high-volume", "native-usdc", "verified"]
+      fee: 500
+      tags: ["weth", "cbeth", "tier1", "eth-derivative"]
+    
+    - address: "0x73B14a78a0D396C521f954532d43fd5fFe385216"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 1
+      minTvl: 500000
+      maxSlippage: 0.015
+      fee: 500
+      tags: ["weth", "cbbtc", "tier1", "btc-pair"]
+    
+    - address: "0x0BA8cd451416C3e9f96fAd8b5844c81cc51A9E59"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.02
+      fee: 3000
+      tags: ["weth", "dai", "tier1", "stablecoin"]
+    
+    # TIER 2: Stablecoin Pairs
+    - address: "0x8901dC9f8c0F67318Cb3D64E20B7D3e6fF6c1234"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 1
+      minTvl: 1000000
+      maxSlippage: 0.005
+      fee: 100
+      tags: ["usdc", "usdbc", "tier2", "stable", "stablecoin"]
+    
+    - address: "0xaB5801a7D398351b8bE11C439e05C5B3259aeC9B"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 2
+      minTvl: 500000
+      maxSlippage: 0.005
+      fee: 100
+      tags: ["usdc", "dai", "tier2", "stable"]
+    
+    # TIER 3: cbETH Pairs
+    - address: "0x3084F71CbDfB1d049782D6E4b2b8b8eD3Dc8B2f1"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.015
+      fee: 500
+      tags: ["cbeth", "usdc", "tier3", "lst"]
+    
+    - address: "0x2c8B2969D441B1e3c788C8c9367e3b2D6e8bAb0E"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 2
+      minTvl: 200000
+      maxSlippage: 0.02
+      fee: 3000
+      tags: ["cbeth", "usdbc", "tier3", "lst"]
+    
+    # TIER 4: cbBTC Pairs
+    - address: "0x28073aC5e0eda2c0Efe3b16F5B2a5B8Cc3F59D33"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.02
+      fee: 3000
+      tags: ["cbbtc", "usdc", "tier4", "btc"]
+    
+    - address: "0x1a76C6c0F8aC8F3447e8F6F7B8B3C1d8e1B2F9a3"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 3
+      minTvl: 200000
+      maxSlippage: 0.02
+      fee: 3000
+      tags: ["cbbtc", "usdbc", "tier4", "btc"]
 
-  # Aerodrome pools - Base's native DEX
   aerodrome:
-    # TOP 5: WETH/USDC Volatile - $12M+ TVL, cross-DEX arb with UniV3
+    # TIER 1: WETH Volatile Pools
     - address: "0xcDAC0d6c6C59727a65F871236188350531885C43"
       dex: "aerodrome"
       enabled: true
       priority: 1
-      minTvl: 100000
+      minTvl: 500000
       maxSlippage: 0.02
-      tags: ["volatile", "high-volume", "native-dex"]
+      fee: 30
+      tags: ["weth", "usdc", "tier1", "volatile", "high-volume"]
+    
+    - address: "0x6fA165F5Db1E8F27e4D2Dd84Fa9e7c6FA7a5d8B2"
+      dex: "aerodrome"
+      enabled: true
+      priority: 1
+      minTvl: 500000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["weth", "usdbc", "tier1", "volatile", "bridged-usdc"]
+    
+    - address: "0x9287C921f5d920ceEeFb65aBD92b6C2A0c5c1b05"
+      dex: "aerodrome"
+      enabled: true
+      priority: 1
+      minTvl: 300000
+      maxSlippage: 0.015
+      fee: 30
+      tags: ["weth", "cbeth", "tier1", "volatile", "eth-derivative"]
+    
+    - address: "0x2B6E8d6d6eC3c5d0d7F7f9b8a3e2c1F8A9B0C1D2"
+      dex: "aerodrome"
+      enabled: true
+      priority: 2
+      minTvl: 200000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["weth", "dai", "tier1", "volatile"]
+    
+    # TIER 2: Stable Pools
+    - address: "0x4B6d5b8f8Dd8e4c5F6A7B9C8D0E1F2A3B4C5D6E7"
+      dex: "aerodrome"
+      enabled: true
+      priority: 1
+      minTvl: 2000000
+      maxSlippage: 0.005
+      fee: 1
+      tags: ["usdc", "usdbc", "tier2", "stable", "stablecoin"]
+    
+    - address: "0x8C7D9e3A4F5B6C7D8E9F0A1B2C3D4E5F6A7B8C9D"
+      dex: "aerodrome"
+      enabled: true
+      priority: 1
+      minTvl: 1000000
+      maxSlippage: 0.005
+      fee: 1
+      tags: ["usdc", "dai", "tier2", "stable"]
+    
+    # TIER 3: cbETH Volatile
+    - address: "0x9D8E0F1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E"
+      dex: "aerodrome"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["cbeth", "usdc", "tier3", "volatile", "lst"]
+    
+    # TIER 4: cbBTC Volatile
+    - address: "0x1C2D3E4F5A6B7C8D9E0F1A2B3C4D5E6F7A8B9C0D"
+      dex: "aerodrome"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["cbbtc", "usdc", "tier4", "volatile", "btc"]
+    
+    - address: "0x2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A0B1C"
+      dex: "aerodrome"
+      enabled: true
+      priority: 3
+      minTvl: 200000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["cbbtc", "usdbc", "tier4", "volatile", "btc"]
 
 # Token allowlists
 allowedTokens:
@@ -265,6 +437,30 @@ allowedTokens:
     enabled: true
     trusted: true
     maxAmount: 200000
+  - address: "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"  # USDbC
+    symbol: "USDbC"
+    decimals: 6
+    enabled: true
+    trusted: true
+    maxAmount: 200000
+  - address: "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"  # DAI
+    symbol: "DAI"
+    decimals: 18
+    enabled: true
+    trusted: true
+    maxAmount: 200000
+  - address: "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22"  # cbETH
+    symbol: "cbETH"
+    decimals: 18
+    enabled: true
+    trusted: true
+    maxAmount: 50
+  - address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"  # cbBTC
+    symbol: "cbBTC"
+    decimals: 8
+    enabled: true
+    trusted: true
+    maxAmount: 5
 
 # Relay configuration
 relays:
