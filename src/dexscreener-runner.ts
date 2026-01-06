@@ -18,7 +18,8 @@ export class DexScreenerRunner {
 
       // Load configuration
       const configLoader = new ConfigLoader({
-        configPath: 'config/default.yaml'
+        configPath: 'config/default.yaml',
+        envPrefix: '' // No prefix - use BASE_RPC_URL directly
       });
       const config = await configLoader.load();
 
