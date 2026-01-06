@@ -356,20 +356,28 @@ export class AerodromeMonitor extends EventEmitter {
         !contract['getReserves'] ||
         !contract['token0'] ||
         !contract['token1'] ||
-        !contract['stable'] ||
-        !contract['totalSupply']
+        !contract['stable']
       ) {
         throw new Error(`Contract missing required methods: ${poolAddress}`);
       }
 
-      // Fetch pool data
-      const [reserves, token0, token1, isStable, totalSupply] = await Promise.all([
-        contract['getReserves'](),
-        contract['token0'](),
-        contract['token1'](),
-        contract['stable'](),
-        contract['totalSupply'](),
+      // Fetch pool data using staticCall for read-only operations
+      const [reserves, token0, token1, isStable] = await Promise.all([
+        contract['getReserves'].staticCall(),
+        contract['token0'].staticCall(),
+        contract['token1'].staticCall(),
+        contract['stable'].staticCall(),
       ]);
+      
+      // Try to fetch totalSupply (optional - some pools may not have it)
+      let totalSupply = BigInt(0);
+      try {
+        if (contract['totalSupply']) {
+          totalSupply = await contract['totalSupply'].staticCall();
+        }
+      } catch (error) {
+        this.logger.debug('totalSupply not available for pool', { pool: poolAddress });
+      }
 
       const poolConfig = this.monitoredPools.get(poolAddress);
       if (!poolConfig) {
@@ -397,8 +405,8 @@ export class AerodromeMonitor extends EventEmitter {
 
         // Fetch additional data for stable pools
         const [decimals0, decimals1] = await Promise.all([
-          contract['decimals0'](),
-          contract['decimals1'](),
+          contract['decimals0'].staticCall(),
+          contract['decimals1'].staticCall(),
         ]);
 
         return {
@@ -415,7 +423,7 @@ export class AerodromeMonitor extends EventEmitter {
         }
 
         // Fetch kLast for volatile pools
-        const kLast = await contract['kLast']();
+        const kLast = await contract['kLast'].staticCall();
 
         return {
           ...baseState,

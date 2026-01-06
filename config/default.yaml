@@ -34,12 +34,83 @@ gracefulDegradation:
 network:
   chainId: 8453  # Base mainnet
   name: "base"
-  rpcUrl: "${BASE_RPC_URL:https://base-rpc.publicnode.com}"
-  wsUrl: "${BASE_WS_URL:wss://base-rpc.publicnode.com}"
+  rpcUrl: "${BASE_RPC_URL:https://base-mainnet.g.alchemy.com/v2/FLUpiiYxfMvm29kJsQZBY}"
+  wsUrl: "${BASE_WS_URL:wss://base-mainnet.g.alchemy.com/v2/FLUpiiYxfMvm29kJsQZBY}"
   fallbackRpcs:
+    - "https://base-rpc.publicnode.com"
     - "https://base.llamarpc.com"
     - "https://base.meowrpc.com"
     - "https://mainnet.base.org"
+    - "https://1rpc.io/base"
+    - "https://rpc.ankr.com/base"
+
+# DexScreener Integration (Zero RPC for monitoring!)
+dexscreener:
+  enabled: true
+  apiUrl: "https://api.dexscreener.com/latest/dex"
+  
+  # Client configuration
+  maxRequestsPerMinute: 250
+  cacheTimeMs: 5000
+  retryDelayMs: 2000
+  maxRetries: 3
+  timeout: 10000
+  
+  # Monitor configuration
+  chain: "base"
+  poolAddresses: []  # Will be populated from allowedPools
+  minLiquidityUsd: 100000
+  minVolume24hUsd: 10000
+  updateIntervalMs: 5000
+  enableAutoDiscovery: false
+  maxStaleDataMs: 30000
+  
+  # Cross-DEX arbitrage scanner
+  crossDexScanner:
+    enabled: true
+    minSpreadPercent: 0.1
+    minProfitUsd: 8
+    minConfidenceScore: 70
+    maxPriceImpactPercent: 2
+    scanIntervalMs: 5000
+  
+  # Multi-hop arbitrage scanner
+  multiHopScanner:
+    enabled: true
+    maxHops: 4
+    minSpreadPercent: 0.2
+    minProfitUsd: 15
+    minConfidenceScore: 60
+    maxPriceImpactPercent: 3
+    scanIntervalMs: 10000
+    enabledTokens:
+      - "0x4200000000000000000000000000000000000006"  # WETH
+      - "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC
+      - "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA"  # USDbC
+  
+  # Trending pair discovery
+  discovery:
+    enabled: true
+    minLiquidityUsd: 500000
+    minVolume24hUsd: 100000
+    minVolume1hUsd: 10000
+    maxPoolAge: 0  # 0 = no age limit
+    scanIntervalMs: 300000  # 5 minutes
+    maxNewPoolsPerScan: 10
+    whitelistedTokens:
+      - "0x4200000000000000000000000000000000000006"  # WETH
+      - "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC
+    blacklistedTokens: []
+  
+  # Orchestrator configuration
+  orchestrator:
+    enableCrossDex: true
+    enableMultiHop: true
+    enableDiscovery: true
+    validateWithRpc: true
+    maxPriceDiscrepancy: 1.0  # 1% max discrepancy
+    executionEnabled: false
+    paperTradingMode: true
 
 # Gas configuration
 gas:
@@ -99,11 +170,11 @@ strategies:
     # Enhanced scanning parameters
     enableMultiHop: false  # Disabled for initial testing
     enableTriangularArbitrage: false  # Disabled for initial testing
-    scanIntervalMs: 3000  # 3 seconds - balanced for Base L2
-    maxConcurrentScans: 3
+    scanIntervalMs: 5000  # 5 seconds - optimized for zero-cost operation
+    maxConcurrentScans: 2
     enablePoolDiscovery: false  # Manual pools only for now
     # Rate limiting protection
-    rpcCallsPerSecond: 10  # Conservative to avoid rate limits
+    rpcCallsPerSecond: 8  # Optimized for free tier
     maxRetries: 2
     retryDelayMs: 1000
 
@@ -137,48 +208,41 @@ strategies:
     maxRebalanceAmount: 20000
     targetUtilization: 0.8
 
-# Pool allowlists - VERIFIED BASE MAINNET POOLS
+# Pool allowlists - OPTIMIZED FOR TOP 5 POOLS (ZERO-COST OPERATION)
+# Reduced from 9 pools → 5 pools = -44% RPC calls
+# Focus: Highest TVL & volume pairs for maximum profit per scan
 allowedPools:
   uniswapV3:
-    # WETH/USDC 0.05% - High volume, most liquid pair on Base
+    # WETH/USDbC 0.05% - Bridged USDC (verified working)
     - address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18"
       dex: "uniswap-v3"
       enabled: true
       priority: 1
-      minTvl: 500000  # Reduced from 1M to catch more opportunities
-      maxSlippage: 0.015  # 1.5% - more realistic for Base L2
-      tags: ["high-volume", "stable", "primary"]
+      minTvl: 100000
+      maxSlippage: 0.015
+      tags: ["high-volume", "bridged-usdc", "verified"]
     
-    # WETH/USDC 0.3% - Alternative fee tier
+    # WETH/DAI 0.3% - High liquidity (verified working)  
+    - address: "0xc9034c3E7F58003E6ae0C8438e7c8f4598d5ACAA"
+      dex: "uniswap-v3"
+      enabled: true
+      priority: 1
+      minTvl: 100000
+      maxSlippage: 0.015
+      tags: ["high-volume", "verified"]
+    
+    # WETH/USDC 0.05% - Native USDC (verified working)
     - address: "0xd0b53D9277642d899DF5C87A3966A349A798F224"
       dex: "uniswap-v3"
       enabled: true
-      priority: 2
-      minTvl: 200000  # Reduced threshold
-      maxSlippage: 0.025  # 2.5%
-      tags: ["medium-volume", "alternative-fee"]
-    
-    # WETH/cbETH 0.05% - ETH derivatives arbitrage
-    - address: "0x7B73644935b8e68019ac6356c40661E1bc315860"
-      dex: "uniswap-v3"
-      enabled: true
-      priority: 3
+      priority: 1
       minTvl: 100000
-      maxSlippage: 0.03
-      tags: ["eth-derivatives", "medium-volume"]
-    
-    # USDC/USDbC 0.01% - Stablecoin arbitrage
-    - address: "0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7b"
-      dex: "uniswap-v3"
-      enabled: true
-      priority: 4
-      minTvl: 50000
-      maxSlippage: 0.005  # Tight for stablecoins
-      tags: ["stablecoin", "low-risk"]
+      maxSlippage: 0.015
+      tags: ["high-volume", "native-usdc", "verified"]
 
   # Aerodrome pools - Base's native DEX
   aerodrome:
-    # WETH/USDC Volatile Pool
+    # TOP 5: WETH/USDC Volatile - $12M+ TVL, cross-DEX arb with UniV3
     - address: "0xcDAC0d6c6C59727a65F871236188350531885C43"
       dex: "aerodrome"
       enabled: true

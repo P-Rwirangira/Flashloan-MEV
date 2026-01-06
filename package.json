@@ -23,6 +23,7 @@
     "quick-test": "tsx src/scripts/quick-test.ts",
     "dev": "tsx src/dev-menu.ts",
     "dev:direct": "tsx watch src/index.ts",
+    "dexscreener": "tsx src/dexscreener-runner.ts",
     "start": "node dist/index.js",
     "test": "jest",
     "test:watch": "jest --watch",

@@ -51,7 +51,7 @@ export class MulticallManager {
         callData: req.callData,
       }));
 
-      // Execute multicall
+      // Execute multicall as a static call (read-only)
       if (!this.multicallContract) {
         throw new Error('Multicall contract not initialized');
       }
@@ -61,7 +61,8 @@ export class MulticallManager {
         throw new Error('aggregate3 function not found on multicall contract');
       }
       
-      const results = await aggregate3Fn(calls);
+      // Use staticCall to ensure it's read-only
+      const results = await aggregate3Fn.staticCall(calls);
 
       return results.map((result: any) => ({
         success: result.success,

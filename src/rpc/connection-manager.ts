@@ -65,7 +65,12 @@ export class RpcConnectionManager extends EventEmitter {
 
       // Initialize WebSocket connection if configured
       if (this.network.wsUrl) {
-        await this.initializeWebSocketConnection();
+        try {
+          await this.initializeWebSocketConnection();
+        } catch (error) {
+          console.warn('Failed to initialize WebSocket, will use polling only:', error instanceof Error ? error.message : 'Unknown error');
+          // Don't throw - WebSocket is optional, continue with HTTP only
+        }
       }
 
       // Initialize fallback providers
