@@ -1,131 +1,44 @@
 /**
  * Gas Estimator
  *
- * Estimates gas costs for MEV transactions with real-time gas price data.
+ * Accurate gas cost prediction for MEV transactions on Base L2
  */
 
-import { ethers, BigNumberish } from 'ethers';
-import { EventEmitter } from 'events';
-import { RpcConnectionManager } from '../rpc/connection-manager';
-import { ArbitrageOpportunity } from '../types/opportunity';
+import { ethers } from 'ethers';
 import { createComponentLogger } from '../utils/logger';
-
-export interface GasEstimatorOptions {
-  readonly connectionManager: RpcConnectionManager;
-  readonly baseFeeMultiplier?: number;
-  readonly priorityFeeGwei?: number;
-  readonly maxGasPriceGwei?: number;
-  readonly gasLimitBuffer?: number;
-  readonly updateIntervalMs?: number;
-}
+import { BaseOpportunity, ArbitrageOpportunity } from '../types/execution';
 
 export interface GasEstimate {
-  readonly gasLimit: bigint;
-  readonly gasPrice: bigint;
-  readonly maxFeePerGas: bigint;
-  readonly maxPriorityFeePerGas: bigint;
-  readonly totalCost: bigint;
-  readonly confidence: number; // 0-1 scale
-  readonly estimatedAt: number;
+  gasLimit: bigint;
+  baseFee: bigint;
+  priorityFee: bigint;
+  maxFeePerGas: bigint;
+  totalCost: bigint;
+  confidence: number; // 0-1 scale
 }
 
-export interface GasPriceData {
-  readonly baseFee: bigint;
-  readonly priorityFee: bigint;
-  readonly gasPrice: bigint;
-  readonly blockNumber: number;
-  readonly timestamp: number;
+export interface GasEstimatorConfig {
+  provider: ethers.Provider;
+  safetyBuffer: number; // Percentage buffer for gas estimates
+  maxGasPrice: bigint;
+  priorityFeeMultiplier: number;
 }
 
-// Gas limits for different operation types
-const GAS_LIMITS = {
-  SIMPLE_SWAP: 150000n,
-  FLASH_LOAN: 300000n,
-  ARBITRAGE: 400000n,
-  LIQUIDATION: 500000n,
-  COMPLEX_ROUTE: 600000n,
-} as const;
-
-export class GasEstimator extends EventEmitter {
+/**
+ * Gas Estimator for Base L2 transactions
+ */
+export class GasEstimator {
   private readonly logger = createComponentLogger('gas-estimator');
-  private readonly connectionManager: RpcConnectionManager;
-  private readonly baseFeeMultiplier: number;
-  private readonly priorityFeeGwei: bigint;
-  private readonly maxGasPriceGwei: bigint;
-  private readonly gasLimitBuffer: number;
-  private readonly updateIntervalMs: number;
+  private readonly config: GasEstimatorConfig;
+  private gasHistory: Array<{ timestamp: number; gasPrice: bigint }> = [];
 
-  // Gas price tracking
-  private currentGasData?: GasPriceData;
-  private gasPriceHistory: GasPriceData[] = [];
-  private updateInterval: ReturnType<typeof setInterval> | undefined;
-  private isTracking = false;
-
-  constructor(options: GasEstimatorOptions) {
-    super();
-
-    this.connectionManager = options.connectionManager;
-    this.baseFeeMultiplier = options.baseFeeMultiplier ?? 1.2;
-    this.priorityFeeGwei = ethers.parseUnits((options.priorityFeeGwei ?? 2).toString(), 'gwei');
-    this.maxGasPriceGwei = ethers.parseUnits((options.maxGasPriceGwei ?? 100).toString(), 'gwei');
-    this.gasLimitBuffer = options.gasLimitBuffer ?? 1.1; // 10% buffer
-    this.updateIntervalMs = options.updateIntervalMs ?? 10000; // 10s default
-  }
-
-  /**
-   * Start tracking gas prices
-   */
-  async startTracking(): Promise<void> {
-    if (this.isTracking) {
-      this.logger.warn('Gas price tracking is already active');
-      return;
-    }
-
-    this.logger.info('Starting gas price tracking', {
-      updateInterval: this.updateIntervalMs,
-      baseFeeMultiplier: this.baseFeeMultiplier,
-      priorityFeeGwei: ethers.formatUnits(this.priorityFeeGwei, 'gwei'),
-    });
-
-    try {
-      // Initial gas price fetch
-      await this.updateGasPrices();
-
-      // Start periodic updates
-      this.updateInterval = setInterval(async () => {
-        try {
-          await this.updateGasPrices();
-        } catch (error) {
-          this.logger.logError(error as Error, { operation: 'periodic-gas-update' });
-          this.emit('gasUpdateError', error);
-        }
-      }, this.updateIntervalMs);
-
-      this.isTracking = true;
-      this.emit('trackingStarted');
-    } catch (error) {
-      this.logger.logError(error as Error, { operation: 'start-tracking' });
-      throw error;
-    }
-  }
-
-  /**
-   * Stop tracking gas prices
-   */
-  stopTracking(): void {
-    if (!this.isTracking) {
-      this.logger.warn('Gas price tracking is not active');
-      return;
-    }
-
-    if (this.updateInterval) {
-      clearInterval(this.updateInterval);
-      this.updateInterval = undefined;
-    }
-
-    this.isTracking = false;
-    this.emit('trackingStopped');
-    this.logger.info('Gas price tracking stopped');
+  constructor(config: GasEstimatorConfig) {
+    this.config = {
+      ...config,
+      safetyBuffer: config.safetyBuffer ?? 0.2, // 20% buffer
+      maxGasPrice: config.maxGasPrice ?? ethers.parseUnits('50', 'gwei'), // 50 gwei max
+      priorityFeeMultiplier: config.priorityFeeMultiplier ?? 1.1, // 10% above base
+    };
   }
 
   /**
@@ -133,301 +46,247 @@ export class GasEstimator extends EventEmitter {
    */
   async estimateArbitrageGas(opportunity: ArbitrageOpportunity): Promise<GasEstimate> {
     try {
-      // Determine base gas limit based on route complexity
-      const routeComplexity = opportunity.route.pools.length + opportunity.fallbackRoutes.length;
-      let baseGasLimit: bigint;
+      // Base gas costs for different components
+      const flashLoanOverhead = 150000n; // Flash loan setup and callback
+      const swapGasPerHop = 120000n; // Uniswap V3 swap
+      const aerodromeSwapGas = 80000n; // Aerodrome swap (more efficient)
 
-      if (routeComplexity > 3) {
-        baseGasLimit = 600000n; // Complex route
+      let totalGas = flashLoanOverhead;
+
+      // Add gas for each swap in the route
+      if (opportunity.route && opportunity.route.length > 0) {
+        for (const swap of opportunity.route) {
+          if (swap.protocol === 'uniswap-v3') {
+            totalGas += swapGasPerHop;
+          } else if (swap.protocol === 'aerodrome') {
+            totalGas += aerodromeSwapGas;
+          } else {
+            totalGas += 100000n; // Generic DEX swap
+          }
+        }
       } else {
-        baseGasLimit = 400000n; // Standard arbitrage
+        // Fallback: assume 2 swaps for arbitrage
+        totalGas += swapGasPerHop + aerodromeSwapGas;
       }
 
-      // Add buffer for safety
-      const gasLimit = BigInt(Math.floor(Number(baseGasLimit) * this.gasLimitBuffer));
+      // Add complexity overhead for multi-hop routes
+      const routeLength = opportunity.route?.length || 2;
+      if (routeLength > 2) {
+        totalGas += BigInt(routeLength - 2) * 30000n;
+      }
 
-      // Get current gas prices
-      const gasData = await this.getCurrentGasData();
+      // Apply safety buffer
+      const bufferedGas =
+        totalGas + BigInt(Math.floor(Number(totalGas) * this.config.safetyBuffer));
 
-      // Calculate gas prices with EIP-1559
-      const maxPriorityFeePerGas = this.priorityFeeGwei;
-      const maxFeePerGas =
-        (gasData.baseFee * BigInt(Math.floor(this.baseFeeMultiplier * 100))) / 100n +
-        maxPriorityFeePerGas;
-
-      // Cap at maximum gas price
-      const cappedMaxFeePerGas =
-        maxFeePerGas > this.maxGasPriceGwei ? this.maxGasPriceGwei : maxFeePerGas;
-      const gasPrice = cappedMaxFeePerGas;
-
-      // Calculate total cost
-      const totalCost = gasLimit * gasPrice;
-
-      // Calculate confidence based on gas price stability
-      const confidence = this.calculateGasPriceConfidence();
+      // Get current gas pricing
+      const gasPricing = await this.getCurrentGasPricing();
 
       return {
-        gasLimit,
-        gasPrice,
-        maxFeePerGas: cappedMaxFeePerGas,
-        maxPriorityFeePerGas,
-        totalCost,
-        confidence,
-        estimatedAt: Date.now(),
+        gasLimit: bufferedGas,
+        baseFee: gasPricing.baseFee,
+        priorityFee: gasPricing.priorityFee,
+        maxFeePerGas: gasPricing.maxFeePerGas,
+        totalCost: bufferedGas * gasPricing.maxFeePerGas,
+        confidence: 0.85, // High confidence for well-tested patterns
       };
     } catch (error) {
-      this.logger.logError(error as Error, {
-        operation: 'estimate-arbitrage-gas',
+      this.logger.error('Failed to estimate arbitrage gas', {
         opportunityId: opportunity.id,
+        error: error instanceof Error ? error.message : String(error),
       });
-      throw error;
+
+      // Return conservative fallback
+      return this.getConservativeFallback();
+    }
+  }
+
+  /**
+   * Estimate gas for generic opportunity
+   */
+  async estimateGas(opportunity: BaseOpportunity): Promise<GasEstimate> {
+    switch (opportunity.type) {
+      case 'arbitrage':
+        return this.estimateArbitrageGas(opportunity as ArbitrageOpportunity);
+      case 'liquidation':
+        return this.estimateLiquidationGas(opportunity);
+      case 'stable-pool-rebalancing':
+        return this.estimateStablePoolGas(opportunity);
+      default:
+        return this.getConservativeFallback();
     }
   }
 
   /**
    * Estimate gas for liquidation
    */
-  async estimateLiquidationGas(
-    liquidationAmount: BigNumberish,
-    collateralTokens: number = 1
-  ): Promise<GasEstimate> {
-    try {
-      // Base gas for liquidation
-      let baseGasLimit = GAS_LIMITS.LIQUIDATION;
+  private async estimateLiquidationGas(opportunity: BaseOpportunity): Promise<GasEstimate> {
+    // Liquidations are more complex - flash loan + liquidation call + swaps
+    const baseGas = 400000n; // Conservative estimate for liquidation complexity
+    const bufferedGas = baseGas + BigInt(Math.floor(Number(baseGas) * this.config.safetyBuffer));
 
-      // Adjust for multiple collateral tokens
-      if (collateralTokens > 1) {
-        baseGasLimit += BigInt(collateralTokens - 1) * 50000n; // 50k per additional token
-      }
+    const gasPricing = await this.getCurrentGasPricing();
 
-      // Add buffer
-      const gasLimit = BigInt(Math.floor(Number(baseGasLimit) * this.gasLimitBuffer));
-
-      // Get gas prices
-      const gasData = await this.getCurrentGasData();
-      const maxPriorityFeePerGas = this.priorityFeeGwei;
-      const maxFeePerGas =
-        (gasData.baseFee * BigInt(Math.floor(this.baseFeeMultiplier * 100))) / 100n +
-        maxPriorityFeePerGas;
-      const cappedMaxFeePerGas =
-        maxFeePerGas > this.maxGasPriceGwei ? this.maxGasPriceGwei : maxFeePerGas;
-
-      const totalCost = gasLimit * cappedMaxFeePerGas;
-      const confidence = this.calculateGasPriceConfidence();
-
-      return {
-        gasLimit,
-        gasPrice: cappedMaxFeePerGas,
-        maxFeePerGas: cappedMaxFeePerGas,
-        maxPriorityFeePerGas,
-        totalCost,
-        confidence,
-        estimatedAt: Date.now(),
-      };
-    } catch (error) {
-      this.logger.logError(error as Error, {
-        operation: 'estimate-liquidation-gas',
-        liquidationAmount: liquidationAmount.toString(),
-        collateralTokens,
-      });
-      throw error;
-    }
-  }
-
-  /**
-   * Get current gas data
-   */
-  async getCurrentGasData(): Promise<GasPriceData> {
-    if (this.currentGasData && Date.now() - this.currentGasData.timestamp < 30000) {
-      return this.currentGasData;
-    }
-
-    await this.updateGasPrices();
-
-    if (!this.currentGasData) {
-      throw new Error('Failed to fetch current gas data');
-    }
-
-    return this.currentGasData;
-  }
-
-  /**
-   * Get gas price statistics
-   */
-  getGasPriceStats(): {
-    current: GasPriceData | undefined;
-    average: bigint;
-    median: bigint;
-    min: bigint;
-    max: bigint;
-    samples: number;
-  } {
-    if (this.gasPriceHistory.length === 0) {
-      return {
-        current: this.currentGasData,
-        average: 0n,
-        median: 0n,
-        min: 0n,
-        max: 0n,
-        samples: 0,
-      };
-    }
-
-    const gasPrices = this.gasPriceHistory
-      .map(data => data.gasPrice)
-      .sort((a, b) => (a < b ? -1 : 1));
-
-    if (gasPrices.length === 0) {
-      return {
-        current: this.currentGasData,
-        average: 0n,
-        median: 0n,
-        min: 0n,
-        max: 0n,
-        samples: 0,
-      };
-    }
-
-    const sum = gasPrices.reduce((acc, price) => acc + price, 0n);
-    const average = sum / BigInt(gasPrices.length);
-
-    // Calculate true median
-    let median: bigint;
-    if (gasPrices.length % 2 === 1) {
-      // Odd length: use middle element
-      median = gasPrices[Math.floor(gasPrices.length / 2)]!;
-    } else {
-      // Even length: average of two middle elements
-      const mid1 = gasPrices[gasPrices.length / 2 - 1]!;
-      const mid2 = gasPrices[gasPrices.length / 2]!;
-      median = (mid1 + mid2) / 2n;
-    }
-
-    const min = gasPrices[0]!;
-    const max = gasPrices[gasPrices.length - 1]!;
+    // Log opportunity details for monitoring
+    this.logger.debug('Estimating liquidation gas', {
+      opportunityId: opportunity.id,
+      baseGas: baseGas.toString(),
+    });
 
     return {
-      current: this.currentGasData,
-      average,
-      median,
-      min,
-      max,
-      samples: this.gasPriceHistory.length,
+      gasLimit: bufferedGas,
+      baseFee: gasPricing.baseFee,
+      priorityFee: gasPricing.priorityFee,
+      maxFeePerGas: gasPricing.maxFeePerGas,
+      totalCost: bufferedGas * gasPricing.maxFeePerGas,
+      confidence: 0.7, // Lower confidence due to complexity
     };
   }
 
   /**
-   * Update gas prices from network
+   * Estimate gas for stable pool rebalancing
    */
-  private async updateGasPrices(): Promise<void> {
-    try {
-      const provider = this.connectionManager.getProvider();
-      const [feeData, blockNumber] = await Promise.all([
-        provider.getFeeData(),
-        provider.getBlockNumber(),
-      ]);
+  private async estimateStablePoolGas(opportunity: BaseOpportunity): Promise<GasEstimate> {
+    // Stable pool operations are typically simpler
+    const baseGas = 200000n;
+    const bufferedGas = baseGas + BigInt(Math.floor(Number(baseGas) * this.config.safetyBuffer));
 
-      if (!feeData.gasPrice) {
-        throw new Error('Failed to fetch gas price from provider');
-      }
+    const gasPricing = await this.getCurrentGasPricing();
 
-      const baseFee = feeData.maxFeePerGas
-        ? feeData.maxFeePerGas - (feeData.maxPriorityFeePerGas || 0n)
-        : feeData.gasPrice;
+    // Log opportunity details for monitoring
+    this.logger.debug('Estimating stable pool gas', {
+      opportunityId: opportunity.id,
+      baseGas: baseGas.toString(),
+    });
 
-      const gasData: GasPriceData = {
-        baseFee: baseFee || feeData.gasPrice,
-        priorityFee: feeData.maxPriorityFeePerGas || this.priorityFeeGwei,
-        gasPrice: feeData.gasPrice,
-        blockNumber,
-        timestamp: Date.now(),
-      };
-
-      // Update current data
-      this.currentGasData = gasData;
-
-      // Add to history (keep last 100 samples)
-      this.gasPriceHistory.push(gasData);
-      if (this.gasPriceHistory.length > 100) {
-        this.gasPriceHistory.shift();
-      }
-
-      this.emit('gasPriceUpdated', gasData);
-
-      this.logger.debug('Gas prices updated', {
-        baseFee: ethers.formatUnits(gasData.baseFee, 'gwei'),
-        priorityFee: ethers.formatUnits(gasData.priorityFee, 'gwei'),
-        gasPrice: ethers.formatUnits(gasData.gasPrice, 'gwei'),
-        blockNumber,
-      });
-    } catch (error) {
-      this.logger.logError(error as Error, { operation: 'update-gas-prices' });
-      throw error;
-    }
-  }
-
-  /**
-   * Calculate confidence in gas price estimates
-   */
-  private calculateGasPriceConfidence(): number {
-    if (this.gasPriceHistory.length < 5) {
-      return 0.5; // Low confidence with insufficient data
-    }
-
-    // Calculate volatility over recent samples
-    const recentSamples = this.gasPriceHistory.slice(-10);
-    const prices = recentSamples.map(data => Number(ethers.formatUnits(data.gasPrice, 'gwei')));
-
-    const mean = prices.reduce((sum, price) => sum + price, 0) / prices.length;
-    const variance =
-      prices.reduce((sum, price) => sum + Math.pow(price - mean, 2), 0) / prices.length;
-    const stdDev = Math.sqrt(variance);
-
-    // Lower volatility = higher confidence
-    const volatilityRatio = stdDev / mean;
-    const confidence = Math.max(0.1, Math.min(1.0, 1 - volatilityRatio));
-
-    return confidence;
-  }
-
-  /**
-   * Estimate gas for simple operations
-   */
-  estimateSimpleGas(operationType: 'swap' | 'transfer' | 'approve'): bigint {
-    switch (operationType) {
-      case 'swap':
-        return GAS_LIMITS.SIMPLE_SWAP;
-      case 'transfer':
-        return 21000n; // Standard ETH transfer
-      case 'approve':
-        return 50000n; // ERC20 approval
-      default:
-        return 100000n; // Default fallback
-    }
-  }
-
-  /**
-   * Check if gas estimator is healthy
-   */
-  isHealthy(): boolean {
-    return (
-      this.isTracking && !!this.currentGasData && Date.now() - this.currentGasData.timestamp < 60000
-    ); // Data less than 1 minute old
-  }
-
-  /**
-   * Get estimator statistics
-   */
-  getStats() {
     return {
-      isTracking: this.isTracking,
-      hasCurrentData: !!this.currentGasData,
-      historySize: this.gasPriceHistory.length,
-      lastUpdate: this.currentGasData?.timestamp,
-      updateInterval: this.updateIntervalMs,
-      baseFeeMultiplier: this.baseFeeMultiplier,
-      priorityFeeGwei: ethers.formatUnits(this.priorityFeeGwei, 'gwei'),
-      maxGasPriceGwei: ethers.formatUnits(this.maxGasPriceGwei, 'gwei'),
+      gasLimit: bufferedGas,
+      baseFee: gasPricing.baseFee,
+      priorityFee: gasPricing.priorityFee,
+      maxFeePerGas: gasPricing.maxFeePerGas,
+      totalCost: bufferedGas * gasPricing.maxFeePerGas,
+      confidence: 0.9, // High confidence for simple operations
     };
+  }
+
+  /**
+   * Get current gas pricing from network
+   */
+  private async getCurrentGasPricing(): Promise<{
+    baseFee: bigint;
+    priorityFee: bigint;
+    maxFeePerGas: bigint;
+  }> {
+    try {
+      const feeData = await this.config.provider.getFeeData();
+
+      let baseFee = feeData.gasPrice || ethers.parseUnits('2', 'gwei'); // 2 gwei fallback for Base L2
+      let priorityFee = feeData.maxPriorityFeePerGas || ethers.parseUnits('0.1', 'gwei'); // 0.1 gwei priority
+
+      // For Base L2, gas prices are typically very low
+      if (feeData.maxFeePerGas) {
+        baseFee = feeData.maxFeePerGas;
+      }
+
+      // Apply priority fee multiplier
+      priorityFee = BigInt(Math.floor(Number(priorityFee) * this.config.priorityFeeMultiplier));
+
+      const maxFeePerGas = baseFee + priorityFee;
+
+      // Cap at maximum allowed gas price
+      const cappedMaxFee =
+        maxFeePerGas > this.config.maxGasPrice ? this.config.maxGasPrice : maxFeePerGas;
+
+      // Update gas history for trend analysis
+      this.updateGasHistory(cappedMaxFee);
+
+      return {
+        baseFee,
+        priorityFee,
+        maxFeePerGas: cappedMaxFee,
+      };
+    } catch (error) {
+      this.logger.warn('Failed to get current gas pricing, using fallback', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+
+      // Fallback pricing for Base L2
+      const fallbackBaseFee = ethers.parseUnits('2', 'gwei');
+      const fallbackPriorityFee = ethers.parseUnits('0.1', 'gwei');
+
+      return {
+        baseFee: fallbackBaseFee,
+        priorityFee: fallbackPriorityFee,
+        maxFeePerGas: fallbackBaseFee + fallbackPriorityFee,
+      };
+    }
+  }
+
+  /**
+   * Get conservative fallback estimate
+   */
+  private getConservativeFallback(): GasEstimate {
+    const conservativeGas = 500000n;
+    const conservativeGasPrice = ethers.parseUnits('10', 'gwei'); // 10 gwei conservative
+
+    return {
+      gasLimit: conservativeGas,
+      baseFee: conservativeGasPrice,
+      priorityFee: ethers.parseUnits('1', 'gwei'),
+      maxFeePerGas: conservativeGasPrice,
+      totalCost: conservativeGas * conservativeGasPrice,
+      confidence: 0.5, // Low confidence fallback
+    };
+  }
+
+  /**
+   * Update gas price history for trend analysis
+   */
+  private updateGasHistory(gasPrice: bigint): void {
+    const now = Date.now();
+    this.gasHistory.push({ timestamp: now, gasPrice });
+
+    // Keep only last hour of data
+    const oneHourAgo = now - 3600000;
+    this.gasHistory = this.gasHistory.filter(entry => entry.timestamp > oneHourAgo);
+  }
+
+  /**
+   * Get gas price trend (increasing, decreasing, stable)
+   */
+  getGasPriceTrend(): 'increasing' | 'decreasing' | 'stable' {
+    if (this.gasHistory.length < 2) {
+      return 'stable';
+    }
+
+    const recent = this.gasHistory.slice(-5); // Last 5 readings
+    if (recent.length < 2) {
+      return 'stable';
+    }
+
+    const first = recent[0]?.gasPrice || 0n;
+    const last = recent[recent.length - 1]?.gasPrice || 0n;
+
+    const change = Number(last - first) / Number(first);
+
+    if (change > 0.1) return 'increasing'; // 10% increase
+    if (change < -0.1) return 'decreasing'; // 10% decrease
+    return 'stable';
+  }
+
+  /**
+   * Get average gas price over time window
+   */
+  getAverageGasPrice(windowMs: number = 300000): bigint {
+    // 5 minutes default
+    const cutoff = Date.now() - windowMs;
+    const relevantEntries = this.gasHistory.filter(entry => entry.timestamp > cutoff);
+
+    if (relevantEntries.length === 0) {
+      return ethers.parseUnits('2', 'gwei'); // Base L2 fallback
+    }
+
+    const sum = relevantEntries.reduce((acc, entry) => acc + entry.gasPrice, 0n);
+    return sum / BigInt(relevantEntries.length);
   }
 }

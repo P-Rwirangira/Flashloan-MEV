@@ -191,6 +191,7 @@ export const configSchema = z.object({
   environment: z.enum(['development', 'staging', 'production']),
   debug: z.boolean(),
   dryRun: z.boolean(),
+  paperTrading: z.boolean().optional(),
 });
 
 export type ConfigSchema = z.infer<typeof configSchema>;

@@ -168,13 +168,13 @@ export const PoolTypeUtils = {
   getDefaultFee: (type: PoolType): number => {
     switch (type) {
       case PoolType.UNISWAP_V3:
-        return 3000; // 0.3%
+        throw new Error('Fee bps not configured for pool type');
       case PoolType.AERODROME_VOLATILE:
-        return 2000; // 0.2%
+        throw new Error('Fee bps not configured for pool type');
       case PoolType.AERODROME_STABLE:
         return 200; // 0.02%
       default:
-        return 3000;
+        throw new Error('Fee bps not configured for pool type');
     }
   },
 

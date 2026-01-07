@@ -7,7 +7,23 @@
   "scripts": {
     "build": "tsc",
     "build:contracts": "hardhat compile",
-    "dev": "tsx watch src/index.ts",
+    "deploy:testnet": "tsx scripts/automated-deployment.ts base-sepolia",
+    "deploy:mainnet": "hardhat run scripts/automated-deployment.ts --network base",
+    "deploy:setup": "tsx scripts/setup-deployment-env.ts",
+    "deploy:test": "tsx scripts/test-contract-deployment.ts",
+    "relay:configure": "tsx scripts/configure-relays.ts",
+    "relay:test": "tsx scripts/test-relay-connectivity.ts",
+    "testing:dry-run": "tsx scripts/dry-run-monitor.ts",
+    "testing:enable-paper": "tsx scripts/enable-paper-trading.ts",
+    "testing:enable-live": "tsx scripts/enable-micro-live.ts",
+    "verify:testnet": "hardhat verify --network base-sepolia ${CONTRACT_ADDRESS} ${CONSTRUCTOR_ARGS:-}",
+    "verify:mainnet": "hardhat verify --network base ${CONTRACT_ADDRESS} ${CONSTRUCTOR_ARGS:-}",
+    "test:relay": "tsx scripts/test-relay-connectivity.ts",
+    "validate-pools": "tsx src/scripts/validate-pools.ts",
+    "quick-test": "tsx src/scripts/quick-test.ts",
+    "dev": "tsx src/dev-menu.ts",
+    "dev:direct": "tsx watch src/index.ts",
+    "dexscreener": "tsx src/dexscreener-runner.ts",
     "start": "node dist/index.js",
     "test": "jest",
     "test:watch": "jest --watch",
@@ -34,12 +50,16 @@
     "@eslint/js": "^9.39.2",
     "@nomicfoundation/hardhat-chai-matchers": "^2.1.0",
     "@nomicfoundation/hardhat-ethers": "^3.1.0",
+    "@nomicfoundation/hardhat-ignition": "^3.0.2",
+    "@nomicfoundation/hardhat-ignition-ethers": "^3.0.2",
     "@nomicfoundation/hardhat-network-helpers": "^1.0.0",
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
     "@nomicfoundation/hardhat-verify": "^2.0.0",
+    "@nomicfoundation/ignition-core": "^3.0.2",
     "@typechain/ethers-v6": "^0.5.1",
     "@typechain/hardhat": "^9.1.0",
     "@types/jest": "^29.5.8",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^20.9.0",
     "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^6.12.0",
@@ -63,7 +83,12 @@
     "typescript": "^5.3.2"
   },
   "dependencies": {
+    "@flashbots/ethers-provider-bundle": "^1.0.0",
     "@openzeppelin/contracts": "^5.4.0",
+    "@uniswap/v3-core": "^1.0.1",
+    "@uniswap/v3-periphery": "^1.4.4",
+    "chalk": "^5.6.2",
+    "dotenv": "^17.2.3",
     "ethers": "^6.8.1",
     "winston": "^3.11.0",
     "ws": "^8.14.2",
@@ -72,7 +97,7 @@
   },
   "lint-staged": {
     "*.ts": [
-      "prettier --write"
+      "bash -c 'npm run typecheck'"
     ]
   },
   "engines": {

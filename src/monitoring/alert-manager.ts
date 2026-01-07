@@ -296,13 +296,13 @@ export class AlertManager extends EventEmitter {
 
     switch (alert.severity) {
       case AlertSeverity.CRITICAL:
-        console.error(`${prefix} ${alert.title}: ${alert.message}`);
+        this.logger.error(`${prefix} ${alert.title}: ${alert.message}`);
         break;
       case AlertSeverity.HIGH:
-        console.warn(`${prefix} ${alert.title}: ${alert.message}`);
+        this.logger.warn(`${prefix} ${alert.title}: ${alert.message}`);
         break;
       default:
-        console.log(`${prefix} ${alert.title}: ${alert.message}`);
+        this.logger.info(`${prefix} ${alert.title}: ${alert.message}`);
     }
   }
 

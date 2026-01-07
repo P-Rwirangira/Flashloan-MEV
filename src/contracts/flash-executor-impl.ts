@@ -16,10 +16,10 @@ import {
   ArbitrageParams,
 } from './flash-executor';
 import { Address, AsyncResult } from '../types/common';
+import { createComponentLogger } from '../utils/logger';
 
 /**
- * Flash Executor contract ABI (simplified for TypeScript interaction)
- * In production, this would be generated from the Solidity contract
+ * Flash Executor contract ABI - matches the deployed Solidity contract
  */
 const FLASH_EXECUTOR_ABI = [
   // Main execution function
@@ -31,7 +31,7 @@ const FLASH_EXECUTOR_ABI = [
   // View functions
   'function isAuthorizedPool(address pool) external view returns (bool)',
   'function getMinProfit() external view returns (uint256)',
-  'function isPaused() external view returns (bool)',
+  'function paused() external view returns (bool)',
   'function owner() external view returns (address)',
 
   // Admin functions
@@ -41,14 +41,16 @@ const FLASH_EXECUTOR_ABI = [
   'function pause() external',
   'function unpause() external',
   'function emergencyWithdraw(address token, uint256 amount) external',
+  'function emergencyWithdrawAll(address token) external',
 
   // Events
   'event ArbitrageExecuted(address indexed caller, address indexed tokenIn, address indexed tokenOut, uint256 amountIn, uint256 profit, uint256 gasUsed)',
   'event ArbitrageFailed(address indexed caller, string reason, uint256 gasUsed)',
-  'event UnauthorizedCallback(address indexed caller, address indexed pool)',
-  'event InsufficientProfit(uint256 actualProfit, uint256 minProfit)',
-  'event PauseStateChanged(bool isPaused, address indexed caller)',
+  'event UnauthorizedCallbackAttempt(address indexed caller, address indexed pool)',
+  'event InsufficientProfitEvent(uint256 actualProfit, uint256 minProfit)',
   'event PoolAuthorizationChanged(address indexed pool, bool isAuthorized)',
+  'event Paused(address account)',
+  'event Unpaused(address account)',
 ];
 
 /**
@@ -56,6 +58,7 @@ const FLASH_EXECUTOR_ABI = [
  * Provides TypeScript interface for interacting with deployed Flash Executor contract
  */
 export class FlashExecutorContract extends EventEmitter implements IFlashExecutor {
+  private readonly logger = createComponentLogger('flash-executor-contract');
   private contract: Contract;
   private readonly signer?: ethers.Signer;
   private readonly config: FlashExecutorConfig;
@@ -68,7 +71,7 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
   private totalProfit = 0n;
 
   constructor(
-    contractAddress: Address,
+    contractAddress: string,
     provider: ethers.Provider,
     config: FlashExecutorConfig,
     safetyConfig: SafetyGuardConfig,
@@ -93,7 +96,10 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
    * Get the contract instance (guaranteed to be defined)
    */
   private getContract(): Contract {
-    return this.contract as Contract;
+    if (!this.contract) {
+      throw new Error('Contract not initialized');
+    }
+    return this.contract;
   }
 
   /**
@@ -106,8 +112,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
 
     try {
       // Verify contract is deployed and accessible
-      // @ts-ignore - Contract is guaranteed to be initialized in constructor
-      await this.getContract()['owner']();
+      const contract = this.getContract();
+      await contract['owner']!();
 
       // Verify configuration matches contract state
       await this.validateConfiguration();
@@ -150,8 +156,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
       const encodedRouteData = this.encodeRouteData(routeData);
 
       // Execute transaction
-      // @ts-ignore - Contract is guaranteed to be initialized
-      const tx = await this.getContract()['executeArbitrage'](
+      const contract = this.getContract();
+      const tx = await contract['executeArbitrage']!(
         flashPool,
         amount0,
         amount1,
@@ -195,7 +201,7 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     // This method should only be called by the contract itself during flash loan execution
     // It's included here for interface compliance but should not be called directly
     // Log the parameters for debugging purposes
-    console.warn('uniswapV3FlashCallback called directly with:', { fee0, fee1, data });
+    this.logger.warn('uniswapV3FlashCallback called directly with:', { fee0, fee1, data });
     throw new Error('uniswapV3FlashCallback should not be called directly');
   }
 
@@ -204,8 +210,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
    */
   async isAuthorizedPool(pool: Address): Promise<boolean> {
     try {
-      // @ts-ignore - Contract is guaranteed to be initialized
-      return await this.getContract()['isAuthorizedPool'](pool);
+      const contract = this.getContract();
+      return await contract['isAuthorizedPool']!(pool);
     } catch (error) {
       return false;
     }
@@ -215,8 +221,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
    * Get minimum profit requirement
    */
   async getMinProfit(): Promise<BigNumberish> {
-    // @ts-ignore - Contract is guaranteed to be initialized
-    return await this.getContract()['getMinProfit']();
+    const contract = this.getContract();
+    return await contract['getMinProfit']!();
   }
 
   /**
@@ -224,8 +230,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
    */
   async isPaused(): Promise<boolean> {
     try {
-      // @ts-ignore - Contract is guaranteed to be initialized
-      return await this.getContract()['isPaused']();
+      const contract = this.getContract();
+      return await contract['paused']!();
     } catch (error) {
       return true; // Assume paused if contract not available
     }
@@ -235,8 +241,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
    * Get contract owner address
    */
   async owner(): Promise<Address> {
-    // @ts-ignore - Contract is guaranteed to be initialized
-    return await this.getContract()['owner']();
+    const contract = this.getContract();
+    return await contract['owner']!();
   }
 
   /**
@@ -248,8 +254,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     }
 
     try {
-      // @ts-ignore - Contract is guaranteed to be initialized
-      const tx = await this.getContract()['addAuthorizedPool'](pool);
+      const contract = this.getContract();
+      const tx = await contract['addAuthorizedPool']!(pool);
       await tx.wait();
       return { success: true, data: undefined };
     } catch (error) {
@@ -269,8 +275,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     }
 
     try {
-      // @ts-ignore - Contract is guaranteed to be initialized
-      const tx = await this.getContract()['removeAuthorizedPool'](pool);
+      const contract = this.getContract();
+      const tx = await contract['removeAuthorizedPool']!(pool);
       await tx.wait();
       return { success: true, data: undefined };
     } catch (error) {
@@ -290,8 +296,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     }
 
     try {
-      // @ts-ignore - Contract is guaranteed to be initialized
-      const tx = await this.getContract()['setMinProfit'](minProfit);
+      const contract = this.getContract();
+      const tx = await contract['setMinProfit']!(minProfit);
       await tx.wait();
       return { success: true, data: undefined };
     } catch (error) {
@@ -311,8 +317,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     }
 
     try {
-      // @ts-ignore - Contract is guaranteed to be initialized
-      const tx = await this.getContract()['pause']();
+      const contract = this.getContract();
+      const tx = await contract['pause']!();
       await tx.wait();
       return { success: true, data: undefined };
     } catch (error) {
@@ -332,8 +338,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     }
 
     try {
-      // @ts-ignore - Contract is guaranteed to be initialized
-      const tx = await this.getContract()['unpause']();
+      const contract = this.getContract();
+      const tx = await contract['unpause']!();
       await tx.wait();
       return { success: true, data: undefined };
     } catch (error) {
@@ -353,8 +359,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
     }
 
     try {
-      // @ts-ignore - Contract is guaranteed to be initialized
-      const tx = await this.getContract()['emergencyWithdraw'](token, amount);
+      const contract = this.getContract();
+      const tx = await contract['emergencyWithdraw']!(token, amount);
       await tx.wait();
       return { success: true, data: undefined };
     } catch (error) {
@@ -414,7 +420,7 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
    */
   private encodeRouteData(routeData: RouteData): string {
     // Encode route data as bytes for contract call
-    // This would typically use ethers.js ABI encoding
+    // This matches the SwapRoute struct in the Solidity contract
     const abiCoder = ethers.AbiCoder.defaultAbiCoder();
 
     return abiCoder.encode(
@@ -433,14 +439,17 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
       const configMinProfit = BigInt(this.config.minProfitWei.toString());
 
       if (BigInt(contractMinProfit.toString()) !== configMinProfit) {
-        console.warn('Configuration minimum profit does not match contract state');
+        this.logger.warn('Configuration minimum profit does not match contract state', {
+          contractMinProfit: contractMinProfit.toString(),
+          configMinProfit: configMinProfit.toString(),
+        });
       }
 
       // Validate authorized pools
       for (const pool of this.config.authorizedPools) {
         const isAuthorized = await this.isAuthorizedPool(pool);
         if (!isAuthorized) {
-          console.warn(`Pool ${pool} is not authorized in contract`);
+          this.logger.warn('Pool not authorized in contract', { pool });
         }
       }
     } catch (error) {
@@ -484,8 +493,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
       });
     });
 
-    // Listen for UnauthorizedCallback events
-    contract.on('UnauthorizedCallback', (caller, pool, event) => {
+    // Listen for UnauthorizedCallbackAttempt events
+    contract.on('UnauthorizedCallbackAttempt', (caller, pool, event) => {
       this.emit('UnauthorizedCallback', {
         caller,
         pool,
@@ -494,8 +503,8 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
       });
     });
 
-    // Listen for InsufficientProfit events
-    contract.on('InsufficientProfit', (actualProfit, minProfit, event) => {
+    // Listen for InsufficientProfitEvent events
+    contract.on('InsufficientProfitEvent', (actualProfit, minProfit, event) => {
       this.emit('InsufficientProfit', {
         actualProfit,
         minProfit,
@@ -504,11 +513,20 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
       });
     });
 
-    // Listen for PauseStateChanged events
-    contract.on('PauseStateChanged', (isPaused, caller, event) => {
+    // Listen for Paused/Unpaused events
+    contract.on('Paused', (account, event) => {
       this.emit('PauseStateChanged', {
-        isPaused,
-        caller,
+        isPaused: true,
+        caller: account,
+        blockNumber: event.blockNumber,
+        transactionHash: event.transactionHash,
+      });
+    });
+
+    contract.on('Unpaused', (account, event) => {
+      this.emit('PauseStateChanged', {
+        isPaused: false,
+        caller: account,
         blockNumber: event.blockNumber,
         transactionHash: event.transactionHash,
       });
@@ -584,19 +602,21 @@ export class FlashExecutorContract extends EventEmitter implements IFlashExecuto
 export class FlashExecutorFactory {
   private readonly provider: ethers.Provider;
   private readonly signer?: ethers.Signer;
+  private readonly bytecode?: string | undefined;
 
-  constructor(provider: ethers.Provider, signer?: ethers.Signer) {
+  constructor(provider: ethers.Provider, signer?: ethers.Signer, bytecode?: string | undefined) {
     this.provider = provider;
     if (signer) {
       this.signer = signer;
     }
+    this.bytecode = bytecode;
   }
 
   /**
    * Create Flash Executor contract instance
    */
   create(
-    contractAddress: Address,
+    contractAddress: string,
     config: FlashExecutorConfig,
     safetyConfig: SafetyGuardConfig
   ): FlashExecutorContract {
@@ -611,7 +631,6 @@ export class FlashExecutorFactory {
 
   /**
    * Deploy new Flash Executor contract
-   * Note: This would require the actual contract bytecode and constructor parameters
    */
   async deploy(
     config: FlashExecutorConfig,
@@ -621,20 +640,78 @@ export class FlashExecutorFactory {
       throw new Error('Signer required for contract deployment');
     }
 
-    // Log configuration for debugging
-    console.log('Deploying Flash Executor with config:', { config, safetyConfig });
+    try {
+      // Deploy the contract using ethers ContractFactory
+      const contractFactory = new ethers.ContractFactory(
+        FLASH_EXECUTOR_ABI,
+        await this.getBytecode(),
+        this.signer
+      );
 
-    // In a real implementation, this would deploy the actual Solidity contract
-    // For now, we'll throw an error indicating this needs to be implemented
-    throw new Error('Contract deployment not implemented - requires Solidity contract bytecode');
+      const contract = await contractFactory.deploy(config.minProfitWei);
+      await contract.waitForDeployment();
+
+      const contractAddress = await contract.getAddress();
+
+      // Create wrapper instance
+      const flashExecutor = new FlashExecutorContract(
+        contractAddress,
+        this.provider,
+        config,
+        safetyConfig,
+        this.signer
+      );
+
+      // Initialize and configure
+      await flashExecutor.initialize();
+
+      // Add authorized pools
+      for (const pool of config.authorizedPools) {
+        await flashExecutor.addAuthorizedPool(pool);
+      }
+
+      return flashExecutor;
+    } catch (error) {
+      throw new Error(`Contract deployment failed: ${error}`);
+    }
   }
 
   /**
-   * Get contract bytecode (placeholder)
+   * Get contract bytecode (loaded from compiled artifacts)
    */
-  getBytecode(): string {
-    // This would return the actual compiled contract bytecode
-    throw new Error('Contract bytecode not available - requires compiled Solidity contract');
+  async getBytecode(): Promise<string> {
+    // Use provided bytecode first
+    if (this.bytecode) {
+      return this.bytecode;
+    }
+
+    try {
+      // Try environment variable path first
+      const artifactPath = process.env['FLASH_EXECUTOR_ARTIFACT_PATH'];
+      if (artifactPath) {
+        const fs = await import('fs');
+        const path = await import('path');
+        const fullPath = path.resolve(artifactPath);
+        const artifactContent = fs.readFileSync(fullPath, 'utf8');
+        const artifact = JSON.parse(artifactContent);
+        return artifact.bytecode;
+      }
+
+      // Fallback to default path
+      const path = await import('path');
+      const fs = await import('fs');
+      const defaultPath = path.join(
+        process.cwd(),
+        'artifacts/contracts/FlashExecutor.sol/FlashExecutor.json'
+      );
+      const artifactContent = fs.readFileSync(defaultPath, 'utf8');
+      const artifact = JSON.parse(artifactContent);
+      return artifact.bytecode;
+    } catch (error) {
+      throw new Error(
+        `Contract bytecode not available - run \"npm run build:contracts\" first or provide bytecode via constructor. Root cause: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   /**

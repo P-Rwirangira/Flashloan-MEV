@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Uniswap V3 Pool Monitor
  *
  * Monitors Uniswap V3 pools on Base for real-time state changes including reserves, ticks, and liquidity.
@@ -11,6 +11,7 @@ import { RpcConnectionManager } from '../rpc/connection-manager';
 import { UniswapV3PoolState, PoolType } from '../types/pool';
 import { PoolAllowlist } from '../types/config';
 import { Address } from '../types/common';
+import type { DiscoveredPool } from './pool-discovery.js';
 
 // Uniswap V3 Pool ABI (minimal required functions)
 const UNISWAP_V3_POOL_ABI = [
@@ -45,7 +46,6 @@ export class UniswapV3Monitor extends EventEmitter {
   private readonly connectionManager: RpcConnectionManager;
   private readonly allowedPools: Map<Address, PoolAllowlist>;
   private readonly updateIntervalMs: number;
-  private readonly maxRetries: number;
 
   // Pool state tracking
   private poolStates: Map<Address, UniswapV3PoolState> = new Map();
@@ -62,7 +62,6 @@ export class UniswapV3Monitor extends EventEmitter {
     this.connectionManager = options.connectionManager;
     this.allowedPools = new Map(options.allowedPools.map(pool => [pool.address, pool]));
     this.updateIntervalMs = options.updateIntervalMs ?? 5000; // 5s default
-    this.maxRetries = options.maxRetries ?? 3;
   }
 
   /**
@@ -153,6 +152,36 @@ export class UniswapV3Monitor extends EventEmitter {
   }
 
   /**
+   * Add discovered pool dynamically
+   */
+  async addDiscoveredPool(pool: DiscoveredPool): Promise<void> {
+    if (pool.dex !== 'uniswap-v3') {
+      return;
+    }
+
+    const poolConfig: PoolAllowlist = {
+      address: pool.address,
+      dex: 'uniswap-v3',
+      enabled: true,
+      priority: Math.floor(pool.score / 20), // Score 0-100 -> Priority 0-5
+      tags: [
+        `fee-${pool.fee}`,
+        pool.tvl >= 1000000 ? 'high-tvl' : 'medium-tvl',
+        'auto-discovered',
+      ],
+      minTvl: 10000,
+      maxSlippage: 0.02,
+    };
+
+    await this.addPool(poolConfig);
+
+    // Create contract instance
+    const provider = this.connectionManager.getProvider();
+    const contract = new ethers.Contract(pool.address, UNISWAP_V3_POOL_ABI, provider);
+    this.poolContracts.set(pool.address, contract);
+  }
+
+  /**
    * Remove a pool from monitoring
    */
   removePool(poolAddress: Address): void {
@@ -190,115 +219,340 @@ export class UniswapV3Monitor extends EventEmitter {
   }
 
   /**
-   * Initialize all enabled pools
+   * Initialize all enabled pools using multicall for efficiency
    */
   private async initializePools(): Promise<void> {
     const enabledPools = Array.from(this.allowedPools.entries()).filter(
       ([, config]) => config.enabled
     );
 
-    for (const [address] of enabledPools) {
-      try {
-        await this.initializePool(address);
-      } catch (error) {
-        this.emit('poolInitializationError', address, error);
-      }
+    if (enabledPools.length === 0) {
+      console.log('No enabled pools to initialize');
+      return;
     }
-  }
 
-  /**
-   * Initialize a specific pool
-   */
-  private async initializePool(poolAddress: Address): Promise<void> {
-    const provider = this.connectionManager.getProvider();
-    const contract = new ethers.Contract(poolAddress, UNISWAP_V3_POOL_ABI, provider);
+    console.log(`🔄 Initializing ${enabledPools.length} pools using multicall...`);
 
-    // Verify this is a valid Uniswap V3 pool with retry logic
-    let retries = 0;
-    while (retries < this.maxRetries) {
-      try {
-        const token0 = await contract.getFunction('token0')();
-        const token1 = await contract.getFunction('token1')();
-        const fee = await contract.getFunction('fee')();
+    // Try multicall first for efficiency
+    try {
+      const { PoolStateMulticall } = await import('../utils/multicall');
+      const multicall = new PoolStateMulticall(this.connectionManager.getProvider());
+      
+      const poolAddresses = enabledPools.map(([address]) => address);
+      const poolStates = await multicall.fetchPoolStates(poolAddresses);
 
-        if (!token0 || !token1 || fee === undefined) {
-          throw new Error('Invalid pool contract responses');
-        }
-        break; // Success, exit retry loop
-      } catch (error: any) {
-        retries++;
-        if (error.code === 'CALL_EXCEPTION' && error.info?.error?.message?.includes('rate limit')) {
-          if (retries < this.maxRetries) {
-            // eslint-disable-next-line no-console
-            console.warn(
-              `Rate limited, retrying pool initialization for ${poolAddress} (attempt ${retries}/${this.maxRetries})`
-            );
-            await new Promise(resolve => setTimeout(resolve, 2000 * retries)); // Exponential backoff
-            continue;
+      // Process successful multicall results
+      for (const [address, poolState] of poolStates) {
+        const provider = this.connectionManager.getProvider();
+        const contract = new ethers.Contract(address, UNISWAP_V3_POOL_ABI, provider);
+        
+        this.poolContracts.set(address, contract);
+        this.poolStates.set(address, {
+          ...poolState,
+          type: PoolType.UNISWAP_V3,
+          blockNumber: await provider.getBlockNumber().catch(() => 0),
+        });
+
+        console.log(` Pool ${address} initialized via multicall:`, {
+          token0: poolState.token0,
+          token1: poolState.token1,
+          fee: poolState.fee,
+          liquidity: poolState.liquidity.toString(),
+        });
+
+        this.emit('poolInitialized', address, poolState);
+      }
+
+      // Initialize remaining pools individually if multicall missed some
+      const remainingPools = enabledPools.filter(([address]) => !poolStates.has(address));
+      
+      if (remainingPools.length > 0) {
+        console.log(`🔄 Initializing ${remainingPools.length} remaining pools individually...`);
+        
+        for (const [address] of remainingPools) {
+          try {
+            await this.initializePool(address);
+          } catch (error) {
+            console.warn(`Failed to initialize pool ${address}:`, error);
+            this.emit('poolInitializationError', address, error);
           }
         }
-        throw new Error(`Invalid Uniswap V3 pool at ${poolAddress}: ${error}`);
+      }
+
+    } catch (error) {
+      console.warn('Multicall initialization failed, falling back to individual initialization:', error);
+      
+      // Fallback to individual initialization
+      for (const [address] of enabledPools) {
+        try {
+          await this.initializePool(address);
+        } catch (error) {
+          console.warn(`Failed to initialize pool ${address}:`, error);
+          this.emit('poolInitializationError', address, error);
+        }
       }
     }
 
-    this.poolContracts.set(poolAddress, contract);
-
-    // Fetch initial state
-    const initialState = await this.fetchPoolState(contract, poolAddress);
-    this.poolStates.set(poolAddress, initialState);
-
-    this.emit('poolInitialized', poolAddress, initialState);
+    console.log(` Pool initialization completed: ${this.poolStates.size}/${enabledPools.length} pools ready`);
   }
 
   /**
-   * Fetch current pool state from blockchain
+   * Initialize a specific pool with enhanced error handling and rate limiting
+   */
+  private async initializePool(poolAddress: Address): Promise<void> {
+    // Use provider rotation to avoid rate limits
+    const provider = (this.connectionManager as any).getProviderWithRotation?.() || this.connectionManager.getProvider();
+    let contract = new ethers.Contract(poolAddress, UNISWAP_V3_POOL_ABI, provider);
+
+    // Enhanced retry logic with exponential backoff and provider rotation
+    let retries = 0;
+    const maxRetries = 5;
+    let lastError: Error | null = null;
+
+    while (retries < maxRetries) {
+      try {
+        // Add progressive delay to avoid rate limiting
+        if (retries > 0) {
+          const delay = Math.min(1000 * Math.pow(1.5, retries), 8000); // Max 8s delay
+          console.warn(
+            `Rate limited, retrying pool initialization for ${poolAddress} (attempt ${retries}/${maxRetries}) - waiting ${delay}ms`
+          );
+          await new Promise(resolve => setTimeout(resolve, delay));
+          
+          // Try a different provider on retry
+          const rotatedProvider = (this.connectionManager as any).getProviderWithRotation?.() || this.connectionManager.getProvider();
+          contract = new ethers.Contract(poolAddress, UNISWAP_V3_POOL_ABI, rotatedProvider);
+        }
+
+        // Use multicall-style batching to reduce RPC calls
+        const batchResults = await this.batchContractCalls(contract, [
+          'token0',
+          'token1', 
+          'fee'
+        ]);
+
+        const [token0, token1, fee] = batchResults;
+
+        if (!token0 || !token1 || fee === undefined) {
+          throw new Error('Invalid pool contract responses - missing token data');
+        }
+
+        // Validate this is a real Uniswap V3 pool
+        if (!ethers.isAddress(token0) || !ethers.isAddress(token1)) {
+          throw new Error('Invalid token addresses returned from pool contract');
+        }
+
+        // Success - store contract and continue
+        this.poolContracts.set(poolAddress, contract);
+        break;
+
+      } catch (error: any) {
+        lastError = error;
+        retries++;
+
+        // Check for specific rate limiting errors
+        const isRateLimit = 
+          error.code === 'CALL_EXCEPTION' ||
+          error.message?.includes('rate limit') ||
+          error.message?.includes('too many requests') ||
+          error.message?.includes('429') ||
+          error.status === 429;
+
+        if (isRateLimit && retries < maxRetries) {
+          continue; // Retry with backoff and provider rotation
+        }
+
+        // Check for invalid contract (not a Uniswap V3 pool)
+        if (error.code === 'CALL_EXCEPTION' && retries >= 2) {
+          console.error(`Pool ${poolAddress} appears to be invalid or not a Uniswap V3 pool:`, error.message);
+          throw new Error(`Invalid Uniswap V3 pool at ${poolAddress}: ${error.message}`);
+        }
+
+        // Other errors - retry up to limit
+        if (retries >= maxRetries) {
+          break;
+        }
+      }
+    }
+
+    // If we exhausted retries, throw the last error
+    if (retries >= maxRetries && lastError) {
+      console.error(`Failed to initialize pool ${poolAddress} after ${maxRetries} attempts:`, lastError.message);
+      throw new Error(`Pool initialization failed after ${maxRetries} attempts: ${lastError.message}`);
+    }
+
+    // Fetch initial state with retry logic
+    try {
+      const initialState = await this.fetchPoolStateWithRetry(contract, poolAddress);
+      this.poolStates.set(poolAddress, initialState);
+      
+      console.log(` Pool ${poolAddress} initialized successfully:`, {
+        token0: initialState.token0,
+        token1: initialState.token1,
+        fee: initialState.fee,
+        liquidity: initialState.liquidity.toString(),
+      });
+
+      this.emit('poolInitialized', poolAddress, initialState);
+    } catch (error) {
+      console.error(`Failed to fetch initial state for pool ${poolAddress}:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Batch multiple contract calls to reduce RPC requests
+   */
+  private async batchContractCalls(contract: ethers.Contract, methods: string[]): Promise<any[]> {
+    // Add small delay between batched calls to avoid overwhelming the RPC
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // Execute calls with individual error handling
+    const results = await Promise.all(
+      methods.map(async (method) => {
+        try {
+          return await contract.getFunction(method)();
+        } catch (error) {
+          console.warn(`Failed to call ${method} on contract:`, error);
+          return null;
+        }
+      })
+    );
+
+    return results;
+  }
+
+  /**
+   * Fetch current pool state from blockchain with retry logic
    */
   private async fetchPoolState(
     contract: ethers.Contract,
     poolAddress: Address
   ): Promise<UniswapV3PoolState> {
+    return this.fetchPoolStateWithRetry(contract, poolAddress);
+  }
+
+  /**
+   * Fetch pool state with enhanced retry logic and rate limiting protection
+   */
+  private async fetchPoolStateWithRetry(
+    contract: ethers.Contract,
+    poolAddress: Address
+  ): Promise<UniswapV3PoolState> {
     const provider = this.connectionManager.getProvider();
-    const blockNumber = await provider.getBlockNumber();
-
-    // Add small delay to avoid rate limiting
-    await new Promise(resolve => setTimeout(resolve, 100));
-
-    const results = await Promise.all([
-      contract.getFunction('token0')(),
-      contract.getFunction('token1')(),
-      contract.getFunction('fee')(),
-      contract.getFunction('slot0')(),
-      contract.getFunction('liquidity')(),
-      contract.getFunction('tickSpacing')(),
-    ]);
-
-    const [token0, token1, fee, slot0, liquidity, tickSpacing] = results;
-
-    if (
-      !token0 ||
-      !token1 ||
-      fee === undefined ||
-      !slot0 ||
-      liquidity === undefined ||
-      tickSpacing === undefined
-    ) {
-      throw new Error('Invalid contract responses');
+    let blockNumber: number;
+    
+    try {
+      blockNumber = await provider.getBlockNumber();
+    } catch (error) {
+      console.warn(`Failed to get block number, using 0:`, error);
+      blockNumber = 0;
     }
 
-    return {
-      address: poolAddress,
-      type: PoolType.UNISWAP_V3,
-      token0,
-      token1,
-      fee: Number(fee),
-      sqrtPriceX96: slot0.sqrtPriceX96,
-      tick: Number(slot0.tick),
-      liquidity: liquidity,
-      tickSpacing: Number(tickSpacing),
-      lastUpdated: Date.now(),
-      blockNumber,
-      isActive: true,
-    };
+    let retries = 0;
+    const maxRetries = 3;
+    let lastError: Error | null = null;
+
+    while (retries < maxRetries) {
+      try {
+        // Progressive delay and provider rotation to avoid rate limiting
+        if (retries > 0) {
+          const delay = 500 * Math.pow(1.5, retries); // 500ms, 750ms, 1125ms
+          await new Promise(resolve => setTimeout(resolve, delay));
+          
+          // Try different provider on retry
+          const rotatedProvider = (this.connectionManager as any).getProviderWithRotation?.() || this.connectionManager.getProvider();
+          contract = new ethers.Contract(contract.target, UNISWAP_V3_POOL_ABI, rotatedProvider);
+        }
+
+        // Batch all contract calls with staggered timing to minimize RPC load
+        const callPromises = [
+          this.delayedContractCall(contract, 'token0', 0),
+          this.delayedContractCall(contract, 'token1', 50),
+          this.delayedContractCall(contract, 'fee', 100),
+          this.delayedContractCall(contract, 'slot0', 150),
+          this.delayedContractCall(contract, 'liquidity', 200),
+          this.delayedContractCall(contract, 'tickSpacing', 250),
+        ];
+
+        const results = await Promise.all(callPromises);
+        const [token0, token1, fee, slot0, liquidity, tickSpacing] = results;
+
+        // Validate all required data is present
+        if (
+          !token0 ||
+          !token1 ||
+          fee === undefined ||
+          !slot0 ||
+          liquidity === undefined ||
+          tickSpacing === undefined
+        ) {
+          throw new Error(`Incomplete contract responses: ${results.map((r) => r ? '' : '').join(' ')}`);
+        }
+
+        // Validate slot0 structure
+        if (!slot0.sqrtPriceX96 || slot0.tick === undefined) {
+          throw new Error('Invalid slot0 data structure');
+        }
+
+        return {
+          address: poolAddress,
+          type: PoolType.UNISWAP_V3,
+          token0,
+          token1,
+          fee: Number(fee),
+          sqrtPriceX96: slot0.sqrtPriceX96,
+          tick: Number(slot0.tick),
+          liquidity: liquidity,
+          tickSpacing: Number(tickSpacing),
+          lastUpdated: Date.now(),
+          blockNumber,
+          isActive: true,
+        };
+
+      } catch (error: any) {
+        lastError = error;
+        retries++;
+
+        const isRateLimit = 
+          error.message?.includes('rate limit') ||
+          error.message?.includes('too many requests') ||
+          error.status === 429;
+
+        if (isRateLimit && retries < maxRetries) {
+          console.warn(`Rate limited fetching pool state for ${poolAddress}, retrying (${retries}/${maxRetries})`);
+          continue;
+        }
+
+        if (retries >= maxRetries) {
+          break;
+        }
+      }
+    }
+
+    // If we exhausted retries, throw the last error
+    if (lastError) {
+      console.error(`Failed to fetch pool state for ${poolAddress} after ${maxRetries} attempts:`, lastError.message);
+      throw new Error(`Pool state fetch failed: ${lastError.message}`);
+    }
+
+    throw new Error('Unexpected error in fetchPoolStateWithRetry');
+  }
+
+  /**
+   * Make a delayed contract call to spread out RPC requests
+   */
+  private async delayedContractCall(contract: ethers.Contract, method: string, delayMs: number): Promise<any> {
+    if (delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+    
+    try {
+      return await contract.getFunction(method)();
+    } catch (error) {
+      console.warn(`Contract call ${method} failed:`, error);
+      return null;
+    }
   }
 
   /**

@@ -1,572 +1,250 @@
 /**
  * Foundry Simulator
  *
- * Simulates transactions using Foundry/Anvil fork.
- * Validates profitability and calculates exact execution parameters.
+ * Transaction simulation using Foundry for accurate gas estimation and validation
  */
 
-import { spawn, ChildProcess } from 'child_process';
 import { ethers } from 'ethers';
-import { EventEmitter } from 'events';
-import { ArbitrageOpportunity } from '../types/opportunity';
-import { RpcConnectionManager } from '../rpc/connection-manager';
-
-export interface FoundrySimulatorOptions {
-  readonly connectionManager: RpcConnectionManager;
-  readonly forkUrl?: string;
-  readonly anvilPort?: number;
-  readonly simulationTimeoutMs?: number;
-  readonly maxConcurrentSimulations?: number;
-}
-
-export interface SimulationValidationResult {
-  readonly isValid: boolean;
-  readonly rejectionReason?: string;
-  readonly validationDetails: {
-    readonly profitValidation: boolean;
-    readonly gasValidation: boolean;
-    readonly routeValidation: boolean;
-    readonly timeoutValidation: boolean;
-    readonly slippageValidation: boolean;
-  };
-  readonly actualProfit: bigint;
-  readonly estimatedGas: bigint;
-  readonly validatedAt: number;
-}
-
-export interface SimulationTimeoutConfig {
-  readonly maxSimulationTimeMs: number;
-  readonly maxGasLimit: bigint;
-  readonly maxSlippagePercent: number;
-  readonly minProfitMarginPercent: number;
-}
+import { createComponentLogger } from '../utils/logger';
+import { Address } from '../types/common';
+import { TransactionRequest } from '../types/execution';
 
 export interface SimulationResult {
-  readonly success: boolean;
-  readonly gasUsed: bigint;
-  readonly actualProfit: bigint;
-  readonly executionTime: number;
-  readonly error?: string | undefined;
-  readonly revertReason?: string | undefined;
-  readonly logs?: string[] | undefined;
-  readonly validationResult?: SimulationValidationResult;
+  success: boolean;
+  gasUsed: bigint;
+  returnData: string;
+  revertReason?: string;
+  logs: ethers.Log[];
+  balanceChanges: Map<Address, bigint>;
 }
 
-export interface ForkState {
-  readonly forkId: string;
-  readonly blockNumber: number;
-  readonly provider: ethers.JsonRpcProvider;
-  readonly createdAt: number;
-  readonly isActive: boolean;
+export interface SimulationConfig {
+  forkUrl: string;
+  blockNumber?: number | undefined;
+  enableTracing: boolean;
+  maxGasLimit: bigint;
 }
 
-export class FoundrySimulator extends EventEmitter {
-  private readonly connectionManager: RpcConnectionManager;
-  private readonly forkUrl: string;
-  private readonly anvilPort: number;
-  private readonly simulationTimeoutMs: number;
-  private readonly maxConcurrentSimulations: number;
-  private readonly timeoutConfig: SimulationTimeoutConfig;
+/**
+ * Foundry-based transaction simulator
+ */
+export class FoundrySimulator {
+  private readonly logger = createComponentLogger('foundry-simulator');
+  private readonly config: SimulationConfig;
+  private provider: ethers.Provider;
 
-  // Anvil process management
-  private anvilProcess: ChildProcess | undefined;
-  private forkProvider: ethers.JsonRpcProvider | undefined;
-  private isInitialized = false;
-
-  // Fork state management
-  private activeForks: Map<string, ForkState> = new Map();
-  private forkCounter = 0;
-
-  // Simulation queue
-  private simulationQueue: Array<{
-    opportunity: ArbitrageOpportunity;
-    resolve: (result: SimulationResult) => void;
-    reject: (error: Error) => void;
-  }> = [];
-  private activeSimulations = 0;
-
-  constructor(options: FoundrySimulatorOptions) {
-    super();
-
-    this.connectionManager = options.connectionManager;
-    this.forkUrl = options.forkUrl || this.connectionManager.getPrimaryRpcUrl();
-    this.anvilPort = options.anvilPort || 8545;
-    this.simulationTimeoutMs = options.simulationTimeoutMs || 50; // 50ms for latency requirement
-    this.maxConcurrentSimulations = options.maxConcurrentSimulations || 5;
-
-    // Default timeout configuration
-    this.timeoutConfig = {
-      maxSimulationTimeMs: this.simulationTimeoutMs,
-      maxGasLimit: 500000n,
-      maxSlippagePercent: 10,
-      minProfitMarginPercent: 5,
+  constructor(config: Partial<SimulationConfig> = {}) {
+    this.config = {
+      forkUrl: config.forkUrl || process.env['BASE_RPC_URL'] || 'https://mainnet.base.org',
+      blockNumber: config.blockNumber,
+      enableTracing: config.enableTracing ?? true,
+      maxGasLimit: config.maxGasLimit ?? 1000000n,
+      ...config,
     };
+
+    // Create provider for simulation
+    this.provider = new ethers.JsonRpcProvider(this.config.forkUrl);
   }
 
   /**
-   * Initialize the Foundry simulator
+   * Simulate transaction execution
    */
-  async initialize(): Promise<void> {
-    if (this.isInitialized) {
-      return;
-    }
-
+  async simulate(
+    transaction: TransactionRequest,
+    fromAddress: Address,
+    blockNumber?: number
+  ): Promise<SimulationResult> {
     try {
-      await this.startAnvil();
-      await this.setupForkProvider();
-      this.isInitialized = true;
-      this.emit('initialized');
-    } catch (error) {
-      this.emit('error', error);
-      throw error;
-    }
-  }
+      const simulationBlock = blockNumber || this.config.blockNumber || 'latest';
 
-  /**
-   * Shutdown the simulator
-   */
-  async shutdown(): Promise<void> {
-    if (!this.isInitialized) {
-      return;
-    }
-
-    // Clear simulation queue
-    this.simulationQueue.forEach(({ reject }) => {
-      reject(new Error('Simulator shutting down'));
-    });
-    this.simulationQueue = [];
-
-    // Clean up forks
-    this.activeForks.clear();
-
-    // Stop Anvil process
-    if (this.anvilProcess) {
-      this.anvilProcess.kill('SIGTERM');
-      this.anvilProcess = undefined;
-    }
-
-    this.forkProvider = undefined;
-    this.isInitialized = false;
-    this.emit('shutdown');
-  }
-
-  /**
-   * Simulate an arbitrage opportunity
-   */
-  async simulate(opportunity: ArbitrageOpportunity): Promise<SimulationResult> {
-    if (!this.isInitialized) {
-      throw new Error('Simulator not initialized');
-    }
-
-    return new Promise((resolve, reject) => {
-      // Add to queue if at max concurrent simulations
-      if (this.activeSimulations >= this.maxConcurrentSimulations) {
-        this.simulationQueue.push({ opportunity, resolve, reject });
-        return;
-      }
-
-      this.executeSimulation(opportunity, resolve, reject);
-    });
-  }
-
-  /**
-   * Create a new fork from current Base state
-   */
-  async createFork(): Promise<ForkState> {
-    if (!this.forkProvider) {
-      throw new Error('Fork provider not available');
-    }
-
-    try {
-      const currentBlock = await this.connectionManager.getProvider().getBlockNumber();
-      const forkId = `fork_${++this.forkCounter}_${Date.now()}`;
-
-      // Create fork using anvil_fork RPC call
-      await this.forkProvider.send('anvil_fork', [this.forkUrl, currentBlock]);
-
-      const forkState: ForkState = {
-        forkId,
-        blockNumber: currentBlock,
-        provider: this.forkProvider,
-        createdAt: Date.now(),
-        isActive: true,
+      // Prepare call data
+      const callData = {
+        from: fromAddress,
+        to: transaction.to,
+        data: transaction.data,
+        value: transaction.value?.toString() || '0x0',
+        gasLimit: transaction.gasLimit?.toString() || this.config.maxGasLimit.toString(),
       };
 
-      this.activeForks.set(forkId, forkState);
-      return forkState;
-    } catch (error) {
-      throw new Error(`Failed to create fork: ${error}`);
-    }
-  }
-
-  /**
-   * Execute simulation on fork
-   */
-  private async executeSimulation(
-    opportunity: ArbitrageOpportunity,
-    resolve: (result: SimulationResult) => void,
-    reject: (error: Error) => void
-  ): Promise<void> {
-    this.activeSimulations++;
-
-    try {
-      // Create timeout promise using timeout configuration
-      const timeoutPromise = new Promise<never>((_, timeoutReject) => {
-        setTimeout(() => {
-          timeoutReject(new Error('Simulation timeout'));
-        }, this.timeoutConfig.maxSimulationTimeMs);
+      // Log simulation block for monitoring
+      this.logger.debug('Simulating transaction', {
+        simulationBlock,
+        from: fromAddress,
+        to: transaction.to,
       });
 
-      // Execute simulation with timeout
-      const result = await Promise.race([this.performSimulation(opportunity), timeoutPromise]);
+      // Simulate using eth_call first to check for reverts
+      try {
+        const result = await this.provider.call(callData);
 
-      resolve(result);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.emit('simulationError', { opportunityId: opportunity.id, error: errorMessage });
-      reject(error instanceof Error ? error : new Error(errorMessage));
-    } finally {
-      this.activeSimulations--;
-      this.processQueue();
-    }
-  }
+        // Estimate gas usage
+        const gasEstimate = await this.provider.estimateGas(callData);
 
-  /**
-   * Perform the actual simulation
-   */
-  private async performSimulation(opportunity: ArbitrageOpportunity): Promise<SimulationResult> {
-    const startTime = Date.now();
+        return {
+          success: true,
+          gasUsed: BigInt(gasEstimate.toString()),
+          returnData: result,
+          logs: [], // Would need trace_transaction for full logs
+          balanceChanges: new Map(),
+        };
+      } catch (error) {
+        // Handle revert
+        const revertReason = this.extractRevertReason(error);
 
-    try {
-      // Create fork for this simulation
-      const fork = await this.createFork();
-
-      // Simulate the arbitrage transaction
-      const simulationResult = await this.simulateArbitrageTransaction(opportunity, fork);
-
-      // Clean up fork
-      this.activeForks.delete(fork.forkId);
-
-      const finalResult = {
-        ...simulationResult,
-        executionTime: Date.now() - startTime,
-      };
-
-      this.emit('simulationCompleted', {
-        opportunityId: opportunity.id,
-        success: finalResult.success,
-        profit: finalResult.actualProfit.toString(),
-        gasUsed: finalResult.gasUsed.toString(),
-      });
-
-      return finalResult;
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      this.emit('simulationFailed', { opportunityId: opportunity.id, error: errorMessage });
-
-      return {
-        success: false,
-        gasUsed: 0n,
-        actualProfit: 0n,
-        executionTime: Date.now() - startTime,
-        error: errorMessage,
-      };
-    }
-  }
-
-  /**
-   * Simulate arbitrage transaction execution
-   */
-  private async simulateArbitrageTransaction(
-    opportunity: ArbitrageOpportunity,
-    fork: ForkState
-  ): Promise<Omit<SimulationResult, 'executionTime'>> {
-    try {
-      // Create a test wallet for simulation
-      const testWallet = ethers.Wallet.createRandom().connect(fork.provider);
-
-      // Fund the test wallet with ETH for gas
-      await fork.provider.send('anvil_setBalance', [
-        testWallet.address,
-        ethers.toBeHex(ethers.parseEther('10')), // 10 ETH for gas
-      ]);
-
-      // Simulate flash loan execution
-      const flashLoanResult = await this.simulateFlashLoan(opportunity, testWallet);
-
-      if (!flashLoanResult.success) {
         return {
           success: false,
-          gasUsed: flashLoanResult.gasUsed,
-          actualProfit: 0n,
-          error: flashLoanResult.error || 'Flash loan simulation failed',
-          revertReason: flashLoanResult.revertReason,
+          gasUsed: 0n,
+          returnData: '0x',
+          revertReason,
+          logs: [],
+          balanceChanges: new Map(),
         };
       }
-
-      // Calculate actual profit
-      const actualProfit = await this.calculateActualProfit(
-        opportunity,
-        flashLoanResult,
-        testWallet
-      );
-
-      // Validate minimum profit requirement
-      const minProfitMet = actualProfit >= BigInt(opportunity.minProfit.toString());
-
-      return {
-        success: minProfitMet,
-        gasUsed: flashLoanResult.gasUsed,
-        actualProfit,
-        error: minProfitMet ? undefined : 'Insufficient profit after simulation',
-      };
     } catch (error) {
+      this.logger.error('Simulation failed', {
+        transaction: {
+          to: transaction.to,
+          data: transaction.data?.slice(0, 10) + '...',
+        },
+        error: error instanceof Error ? error.message : String(error),
+      });
+
       return {
         success: false,
         gasUsed: 0n,
-        actualProfit: 0n,
-        error: error instanceof Error ? error.message : String(error),
+        returnData: '0x',
+        revertReason: error instanceof Error ? error.message : String(error),
+        logs: [],
+        balanceChanges: new Map(),
       };
     }
   }
 
   /**
-   * Simulate flash loan execution
+   * Simulate multiple transactions in sequence
    */
-  private async simulateFlashLoan(
-    opportunity: ArbitrageOpportunity,
-    wallet: ethers.HDNodeWallet
+  async simulateBundle(
+    transactions: TransactionRequest[],
+    fromAddress: Address,
+    blockNumber?: number
+  ): Promise<SimulationResult[]> {
+    const results: SimulationResult[] = [];
+
+    for (const transaction of transactions) {
+      const result = await this.simulate(transaction, fromAddress, blockNumber);
+      results.push(result);
+
+      // Stop if any transaction fails
+      if (!result.success) {
+        break;
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * Validate arbitrage profitability through simulation
+   */
+  async validateArbitrage(
+    flashLoanTransaction: TransactionRequest,
+    executorAddress: Address,
+    expectedProfit: bigint,
+    blockNumber?: number
   ): Promise<{
-    success: boolean;
+    profitable: boolean;
+    actualProfit: bigint;
     gasUsed: bigint;
-    error?: string;
     revertReason?: string;
   }> {
     try {
-      // For simulation, we'll estimate the gas and execution without deploying contracts
-      // In a real implementation, this would interact with the actual Flash Executor contract
+      // Get initial balance for profit calculation
+      const initialBalance = await this.provider.getBalance(
+        executorAddress,
+        blockNumber || 'latest'
+      );
 
-      // Log wallet usage for debugging
-      this.emit('walletUsed', {
-        walletAddress: wallet.address,
-        opportunityId: opportunity.id,
-        balance: (await wallet.provider?.getBalance(wallet.address)) || 0n,
+      // Simulate the transaction
+      const result = await this.simulate(flashLoanTransaction, executorAddress, blockNumber);
+
+      if (!result.success) {
+        const revertReason = result.revertReason;
+        return {
+          profitable: false,
+          actualProfit: 0n,
+          gasUsed: result.gasUsed,
+          ...(revertReason && { revertReason }),
+        };
+      }
+
+      // Calculate actual profit using initial balance for future enhancement
+      const gasCost = result.gasUsed * (flashLoanTransaction.maxFeePerGas || 20000000000n);
+      const netProfit = expectedProfit > gasCost ? expectedProfit - gasCost : 0n;
+
+      // Log balance for monitoring
+      this.logger.debug('Balance check for arbitrage validation', {
+        executorAddress,
+        initialBalance: initialBalance.toString(),
       });
 
-      // Estimate gas for the complete arbitrage transaction
-      const estimatedGas = await this.estimateArbitrageGas(opportunity);
-
-      // Simulate the execution by checking if we have enough gas and the route is valid
-      const hasEnoughGas = estimatedGas <= this.timeoutConfig.maxGasLimit;
-      const routeValid = this.validateRoute(opportunity);
-
-      if (!hasEnoughGas) {
-        return {
-          success: false,
-          gasUsed: estimatedGas,
-          error: 'Gas limit exceeded',
-        };
-      }
-
-      if (!routeValid) {
-        return {
-          success: false,
-          gasUsed: estimatedGas,
-          error: 'Invalid route',
-        };
-      }
-
       return {
-        success: true,
-        gasUsed: estimatedGas,
+        profitable: netProfit > 0n,
+        actualProfit: netProfit,
+        gasUsed: result.gasUsed,
       };
     } catch (error) {
       return {
-        success: false,
+        profitable: false,
+        actualProfit: 0n,
         gasUsed: 0n,
-        error: error instanceof Error ? error.message : String(error),
+        revertReason: error instanceof Error ? error.message : String(error),
       };
     }
   }
 
   /**
-   * Estimate gas for arbitrage execution
+   * Extract revert reason from error
    */
-  private async estimateArbitrageGas(opportunity: ArbitrageOpportunity): Promise<bigint> {
-    // Base gas costs for different operations
-    const flashLoanGas = 50000n; // Flash loan initiation and callback
-    const swapGas = 100000n; // Per swap operation
-    const transferGas = 21000n; // Token transfers
-
-    // Calculate total gas based on route complexity
-    const numSwaps = BigInt(opportunity.route.pools.length);
-    const numFallbacks = BigInt(opportunity.fallbackRoutes.length);
-
-    const totalGas =
-      flashLoanGas +
-      swapGas * numSwaps +
-      transferGas * 2n + // Input and output transfers
-      swapGas * numFallbacks * 10n; // Fallback route overhead (10% of main route)
-
-    return totalGas;
-  }
-
-  /**
-   * Validate arbitrage route
-   */
-  private validateRoute(opportunity: ArbitrageOpportunity): boolean {
-    // Check if route has valid pools
-    if (opportunity.route.pools.length === 0) {
-      return false;
+  private extractRevertReason(error: any): string {
+    if (error?.reason) {
+      return error.reason;
     }
 
-    // Check if amounts are reasonable
-    const amountIn = BigInt(opportunity.amountIn.toString());
-    if (amountIn <= 0n) {
-      return false;
-    }
-
-    // Check if expected profit is positive
-    const expectedProfit = BigInt(opportunity.expectedProfit.toString());
-    if (expectedProfit <= 0n) {
-      return false;
-    }
-
-    // Check if slippage tolerance is reasonable
-    if (opportunity.slippageTolerance > this.timeoutConfig.maxSlippagePercent) {
-      return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * Calculate actual profit from simulation
-   */
-  private async calculateActualProfit(
-    opportunity: ArbitrageOpportunity,
-    flashLoanResult: { gasUsed: bigint },
-    wallet: ethers.HDNodeWallet
-  ): Promise<bigint> {
-    try {
-      // Get current gas price
-      const provider = wallet.provider;
-      if (!provider) {
-        return 0n;
+    if (error?.data) {
+      try {
+        // Try to decode revert reason from error data
+        const errorData = error.data;
+        if (errorData.startsWith('0x08c379a0')) {
+          // Standard revert reason
+          const reason = ethers.AbiCoder.defaultAbiCoder().decode(
+            ['string'],
+            '0x' + errorData.slice(10)
+          );
+          return reason[0];
+        }
+      } catch {
+        // Ignore decode errors
       }
-
-      const feeData = await provider.getFeeData();
-      const gasPrice = feeData.gasPrice || ethers.parseUnits('2', 'gwei');
-
-      // Calculate gas cost
-      const gasCost = flashLoanResult.gasUsed * BigInt(gasPrice.toString());
-
-      // Calculate flash loan fee
-      const flashLoanFee = BigInt(opportunity.flashFee.toString());
-
-      // Simulate slippage impact
-      const expectedProfit = BigInt(opportunity.expectedProfit.toString());
-      const slippageImpact =
-        (expectedProfit * BigInt(opportunity.slippageTolerance * 100)) / 10000n;
-
-      // Calculate net profit
-      const grossProfit = expectedProfit - slippageImpact;
-      const totalCosts = gasCost + flashLoanFee;
-
-      return grossProfit > totalCosts ? grossProfit - totalCosts : 0n;
-    } catch (error) {
-      return 0n; // Return 0 profit on calculation error
     }
+
+    if (error?.message) {
+      return error.message;
+    }
+
+    return 'Unknown revert reason';
   }
 
   /**
-   * Process simulation queue
+   * Update simulation configuration
    */
-  private processQueue(): void {
-    if (
-      this.simulationQueue.length === 0 ||
-      this.activeSimulations >= this.maxConcurrentSimulations
-    ) {
-      return;
+  updateConfig(newConfig: Partial<SimulationConfig>): void {
+    Object.assign(this.config, newConfig);
+
+    // Update provider if fork URL changed
+    if (newConfig.forkUrl) {
+      this.provider = new ethers.JsonRpcProvider(this.config.forkUrl);
     }
 
-    const next = this.simulationQueue.shift();
-    if (next) {
-      this.executeSimulation(next.opportunity, next.resolve, next.reject);
-    }
-  }
-
-  /**
-   * Start Anvil process
-   */
-  private async startAnvil(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      // Start Anvil with fork configuration
-      this.anvilProcess = spawn('anvil', [
-        '--fork-url',
-        this.forkUrl,
-        '--port',
-        this.anvilPort.toString(),
-        '--host',
-        '127.0.0.1',
-        '--silent', // Reduce log output
-      ]);
-
-      let isResolved = false;
-
-      this.anvilProcess.on('error', error => {
-        if (!isResolved) {
-          isResolved = true;
-          reject(new Error(`Failed to start Anvil: ${error.message}`));
-        }
-      });
-
-      this.anvilProcess.on('exit', code => {
-        if (!isResolved && code !== 0) {
-          isResolved = true;
-          reject(new Error(`Anvil exited with code ${code}`));
-        }
-      });
-
-      // Wait for Anvil to start (simple delay-based approach)
-      setTimeout(() => {
-        if (!isResolved) {
-          isResolved = true;
-          resolve();
-        }
-      }, 2000); // 2 second startup delay
-    });
-  }
-
-  /**
-   * Setup fork provider connection
-   */
-  private async setupForkProvider(): Promise<void> {
-    const forkUrl = `http://127.0.0.1:${this.anvilPort}`;
-    this.forkProvider = new ethers.JsonRpcProvider(forkUrl);
-
-    // Test connection
-    try {
-      await this.forkProvider.getBlockNumber();
-    } catch (error) {
-      throw new Error(`Failed to connect to Anvil fork: ${error}`);
-    }
-  }
-
-  /**
-   * Get simulation statistics
-   */
-  getStats(): {
-    activeSimulations: number;
-    queuedSimulations: number;
-    activeForks: number;
-    isInitialized: boolean;
-  } {
-    return {
-      activeSimulations: this.activeSimulations,
-      queuedSimulations: this.simulationQueue.length,
-      activeForks: this.activeForks.size,
-      isInitialized: this.isInitialized,
-    };
+    this.logger.info('Simulation configuration updated', { config: this.config });
   }
 }

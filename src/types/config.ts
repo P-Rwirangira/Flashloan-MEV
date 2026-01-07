@@ -98,6 +98,25 @@ export interface ArbitrageConfig {
   readonly maxPriceImpactBps: number;
   readonly dexPriority: string[];
   readonly competitionThreshold: number;
+  readonly scanIntervalMs?: number;
+  // MEV Protection Features
+  readonly enableMEVProtection?: boolean;
+  readonly enableSandwichDetection?: boolean;
+  readonly enableFrontRunningProtection?: boolean;
+  readonly mempoolMonitoringEnabled?: boolean;
+  readonly competitorAnalysisEnabled?: boolean;
+  readonly adaptiveGasPricing?: boolean;
+  readonly maxCompetitorGasMultiplier?: number;
+  readonly sandwichDetectionThreshold?: number;
+  readonly frontRunningTimeWindow?: number;
+  readonly enablePrivateMempool?: boolean;
+  // Multi-hop Arbitrage Features
+  readonly enableMultiHop?: boolean;
+  readonly maxHops?: number;
+  readonly multiHopMinProfitMultiplier?: number;
+  readonly enableTriangularArbitrage?: boolean;
+  readonly enablePathOptimization?: boolean;
+  readonly pathOptimizationDepth?: number;
 }
 
 // Liquidation strategy configuration
@@ -219,6 +238,7 @@ export interface Config {
   readonly environment: string;
   readonly debug: boolean;
   readonly dryRun: boolean;
+  readonly paperTrading?: boolean;
 }
 
 // Configuration validation result

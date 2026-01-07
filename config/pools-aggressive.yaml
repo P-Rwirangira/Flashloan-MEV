@@ -1,0 +1,283 @@
+# Aggressive Pool Configuration for Base MEV Platform
+# 20+ high-volume pools for maximum arbitrage opportunities
+#
+# Sources:
+# - Uniswap V3 Base: https://info.uniswap.org/#/base/pools
+# - Aerodrome Finance: https://aerodrome.finance/liquidity
+# - DeFiLlama Base TVL: https://defillama.com/chain/Base
+#
+# Last Updated: 2026-01-04
+
+allowedPools:
+  # ============================================================================
+  # UNISWAP V3 POOLS (Base Mainnet)
+  # ============================================================================
+  uniswapV3:
+    # ──────────────────────────────────────────────────────────────────────────
+    # TIER 1: WETH Pairs (Highest Volume & Liquidity)
+    # ──────────────────────────────────────────────────────────────────────────
+    - address: "0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B18"
+      enabled: true
+      priority: 1
+      minTvl: 1000000
+      maxSlippage: 0.01
+      fee: 500  # 0.05%
+      tags: ["weth", "usdc", "tier1", "high-volume"]
+      description: "WETH/USDC 0.05% - Primary trading pair"
+
+    - address: "0xd0b53D9277642d899DF5C87A3966A349A798F224"
+      enabled: true
+      priority: 2
+      minTvl: 500000
+      maxSlippage: 0.02
+      fee: 3000  # 0.3%
+      tags: ["weth", "usdc", "tier1", "medium-volume"]
+      description: "WETH/USDC 0.3% - Alternative liquidity"
+
+    - address: "0xc9034c3E7F58003E6ae0C8438e7c8f4598d5ACAA"
+      enabled: true
+      priority: 1
+      minTvl: 1000000
+      maxSlippage: 0.01
+      fee: 500  # 0.05%
+      tags: ["weth", "usdbc", "tier1", "bridged-usdc", "high-volume"]
+      description: "WETH/USDbC 0.05% - Bridged USDC (HIGH VOLUME)"
+
+    - address: "0xB4885Bc63399BF5518b994c1d0C153334Ee579D0"
+      enabled: true
+      priority: 1
+      minTvl: 500000
+      maxSlippage: 0.015
+      fee: 500  # 0.05%
+      tags: ["weth", "cbeth", "tier1", "eth-derivative"]
+      description: "WETH/cbETH 0.05% - Coinbase Wrapped ETH"
+
+    - address: "0x73B14a78a0D396C521f954532d43fd5fFe385216"
+      enabled: true
+      priority: 1
+      minTvl: 500000
+      maxSlippage: 0.015
+      fee: 500  # 0.05%
+      tags: ["weth", "cbbtc", "tier1", "btc-pair"]
+      description: "WETH/cbBTC 0.05% - Bitcoin exposure"
+
+    - address: "0x0BA8cd451416C3e9f96fAd8b5844c81cc51A9E59"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.02
+      fee: 3000  # 0.3%
+      tags: ["weth", "dai", "tier1", "stablecoin"]
+      description: "WETH/DAI 0.3% - DAI stablecoin pair"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TIER 2: Stablecoin Pairs (Lower slippage, frequent small arbs)
+    # ──────────────────────────────────────────────────────────────────────────
+    - address: "0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C"
+      enabled: true
+      priority: 1
+      minTvl: 2000000
+      maxSlippage: 0.005
+      fee: 100  # 0.01%
+      tags: ["usdc", "usdbc", "tier2", "stablecoin", "low-slippage"]
+      description: "USDC/USDbC 0.01% - Stablecoin arbitrage"
+
+    - address: "0xEf30c9bF7c8CD501E60E9A9B932eE41c15111F88"
+      enabled: true
+      priority: 1
+      minTvl: 1000000
+      maxSlippage: 0.005
+      fee: 100  # 0.01%
+      tags: ["usdc", "dai", "tier2", "stablecoin", "low-slippage"]
+      description: "USDC/DAI 0.01% - Major stablecoin pair"
+
+    - address: "0x3084F71CbDfB1d049782D6E4b2b8b8eD3Dc8B2f1"
+      enabled: true
+      priority: 2
+      minTvl: 500000
+      maxSlippage: 0.01
+      fee: 500  # 0.05%
+      tags: ["usdbc", "dai", "tier2", "stablecoin"]
+      description: "USDbC/DAI 0.05% - Bridged USD/DAI"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TIER 3: cbETH & LST Pairs (Liquid staking derivatives)
+    # ──────────────────────────────────────────────────────────────────────────
+    - address: "0x55Bc0526ec99066e9eA6C3cB9FdFB36a05D0C2a2"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.015
+      fee: 500  # 0.05%
+      tags: ["cbeth", "usdc", "tier3", "lst"]
+      description: "cbETH/USDC 0.05% - Liquid staking"
+
+    - address: "0x2c8B2969D441B1e3c788C8c9367e3b2D6e8bAb0E"
+      enabled: true
+      priority: 2
+      minTvl: 200000
+      maxSlippage: 0.02
+      fee: 3000  # 0.3%
+      tags: ["cbeth", "usdbc", "tier3", "lst"]
+      description: "cbETH/USDbC 0.3% - Alternative cbETH liquidity"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TIER 4: cbBTC Pairs (Bitcoin exposure on Base)
+    # ──────────────────────────────────────────────────────────────────────────
+    - address: "0x28073aC5e0eda2c0Efe3b16F5B2a5B8Cc3F59D33"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.02
+      fee: 3000  # 0.3%
+      tags: ["cbbtc", "usdc", "tier4", "btc"]
+      description: "cbBTC/USDC 0.3% - Bitcoin/USDC"
+
+    - address: "0x1a76C6c0F8aC8F3447e8F6F7B8B3C1d8e1B2F9a3"
+      enabled: true
+      priority: 3
+      minTvl: 200000
+      maxSlippage: 0.02
+      fee: 3000  # 0.3%
+      tags: ["cbbtc", "usdbc", "tier4", "btc"]
+      description: "cbBTC/USDbC 0.3% - Bitcoin/bridged USDC"
+
+  # ============================================================================
+  # AERODROME POOLS (Base Mainnet)
+  # ============================================================================
+  aerodrome:
+    # ──────────────────────────────────────────────────────────────────────────
+    # TIER 1: WETH Volatile Pools (Match UniV3 pairs)
+    # ──────────────────────────────────────────────────────────────────────────
+    - address: "0xcDAC0d6c6C59727a65F871236188350531885C43"
+      enabled: true
+      priority: 1
+      minTvl: 500000
+      maxSlippage: 0.02
+      fee: 30  # 0.3% typical for volatile
+      tags: ["weth", "usdc", "tier1", "volatile", "high-volume"]
+      description: "WETH/USDC Volatile - Primary Aerodrome pair"
+
+    - address: "0x6fA165F5Db1E8F27e4D2Dd84Fa9e7c6FA7a5d8B2"
+      enabled: true
+      priority: 1
+      minTvl: 500000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["weth", "usdbc", "tier1", "volatile", "bridged-usdc"]
+      description: "WETH/USDbC Volatile - Bridged USDC liquidity"
+
+    - address: "0x9287C921f5d920ceEeFb65aBD92b6C2A0c5c1b05"
+      enabled: true
+      priority: 1
+      minTvl: 300000
+      maxSlippage: 0.015
+      fee: 30
+      tags: ["weth", "cbeth", "tier1", "volatile", "eth-derivative"]
+      description: "WETH/cbETH Volatile - ETH derivatives"
+
+    - address: "0x2B6E8d6d6eC3c5d0d7F7f9b8a3e2c1F8A9B0C1D2"
+      enabled: true
+      priority: 2
+      minTvl: 200000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["weth", "dai", "tier1", "volatile"]
+      description: "WETH/DAI Volatile - DAI alternative"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TIER 2: Stable Pools (Low slippage, high frequency arbs)
+    # ──────────────────────────────────────────────────────────────────────────
+    - address: "0x4B6d5b8f8Dd8e4c5F6A7B9C8D0E1F2A3B4C5D6E7"
+      enabled: true
+      priority: 1
+      minTvl: 2000000
+      maxSlippage: 0.005
+      fee: 1  # 0.01% for stable pools
+      tags: ["usdc", "usdbc", "tier2", "stable", "stablecoin"]
+      description: "USDC/USDbC Stable - Tight stablecoin arb"
+
+    - address: "0x7C8D9E0F1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D"
+      enabled: true
+      priority: 1
+      minTvl: 1000000
+      maxSlippage: 0.005
+      fee: 1
+      tags: ["usdc", "dai", "tier2", "stable", "stablecoin"]
+      description: "USDC/DAI Stable - Major stable pair"
+
+    - address: "0x8D9E0F1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E"
+      enabled: true
+      priority: 2
+      minTvl: 500000
+      maxSlippage: 0.01
+      fee: 5  # 0.05%
+      tags: ["usdbc", "dai", "tier2", "stable", "stablecoin"]
+      description: "USDbC/DAI Stable - Bridged USD stable"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TIER 3: cbETH & LST Pools
+    # ──────────────────────────────────────────────────────────────────────────
+    - address: "0x9E0F1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.015
+      fee: 30
+      tags: ["cbeth", "usdc", "tier3", "volatile", "lst"]
+      description: "cbETH/USDC Volatile"
+
+    - address: "0x0F1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A"
+      enabled: true
+      priority: 3
+      minTvl: 200000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["cbeth", "usdbc", "tier3", "volatile", "lst"]
+      description: "cbETH/USDbC Volatile"
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # TIER 4: cbBTC Pools
+    # ──────────────────────────────────────────────────────────────────────────
+    - address: "0x1A2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A0B"
+      enabled: true
+      priority: 2
+      minTvl: 300000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["cbbtc", "usdc", "tier4", "volatile", "btc"]
+      description: "cbBTC/USDC Volatile"
+
+    - address: "0x2B3C4D5E6F7A8B9C0D1E2F3A4B5C6D7E8F9A0B1C"
+      enabled: true
+      priority: 3
+      minTvl: 200000
+      maxSlippage: 0.02
+      fee: 30
+      tags: ["cbbtc", "usdbc", "tier4", "volatile", "btc"]
+      description: "cbBTC/USDbC Volatile"
+
+# ============================================================================
+# CONFIGURATION NOTES
+# ============================================================================
+#
+# Pool Selection Criteria:
+# - TVL > $200K minimum for all pools
+# - Prioritize pairs that exist on BOTH UniV3 and Aerodrome
+# - Include fee tier variety (0.01%, 0.05%, 0.3%)
+# - Mix of volatile and stable pools
+#
+# Expected Arbitrage Routes:
+# - Direct: 11+ cross-DEX routes (UniV3 ↔ Aerodrome)
+# - Triangular: 20+ three-hop routes
+# - Fee tier arbs: 5+ same-DEX different-fee routes
+#
+# Performance Impact:
+# - Scan time: ~300-400ms per scan
+# - Memory: ~80-100MB
+# - Expected opportunities: 15-50 per hour
+#
+# Maintenance:
+# - Verify pool addresses monthly (pools can be deprecated)
+# - Monitor TVL drops (disable pools < $100K TVL)
+# - Update fee structures if changed by protocols

@@ -1,0 +1,63 @@
+contracts:
+  flashExecutor:
+    address: ""
+    deploymentBlock: 0
+    deploymentTime: ""
+    network: ""
+    chainId: ""
+    owner: ""
+    minProfit: ""
+  authorizedPools:
+    uniswapV3:
+      - address: "0xd0b53d9277642d899df5c87a3966a349a798f224"
+        token0: WETH
+        token1: USDC
+        fee: 500
+      - address: "0x6c561b446416e1a00e8e93e221854d6ea4171372"
+        token0: WETH
+        token1: USDC
+        fee: 3000
+    aerodrome:
+      - address: "0xb2cc224c1c9fee385f8ad6a55b4d94e92359dc59"
+        token0: WETH
+        token1: USDC
+        stable: false
+deployment:
+  minProfitEth: "0.001"
+  gasLimit: 5000000
+  gasPrice: auto
+protocols:
+  aaveV3:
+    poolAddress: "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
+  compoundLike:
+    moonwell:
+      comptroller: "0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180"
+      markets:
+        - underlying: "0x4200000000000000000000000000000000000006"
+          cToken: "0x0000000000000000000000000000000000000000"
+        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          cToken: "0x0000000000000000000000000000000000000000"
+    seamless:
+      comptroller: "0x8E00D5e02E65A19337Cdba98bbA9F84d4186a180"
+      markets:
+        - underlying: "0x4200000000000000000000000000000000000006"
+          cToken: "0x0000000000000000000000000000000000000000"
+        - underlying: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+          cToken: "0x0000000000000000000000000000000000000000"
+networks:
+  base:
+    rpcUrl: https://mainnet.base.org
+    chainId: 8453
+    blockExplorer: https://basescan.org
+  baseSepolia:
+    rpcUrl: https://sepolia.base.org
+    chainId: 84532
+    blockExplorer: https://sepolia.basescan.org
+flashExecutor:
+  address: "0x4208432729d72aE4a5812C040944f6AEd2A14E3c"
+  minProfit: "1000000000000000"
+  owner: "0x9649F6a1D354bB3668359548C3D9e7Cc92F5D67A"
+  network: base-sepolia
+  chainId: "84532"
+  deploymentBlock: 35851477
+  deploymentTime: 2026-01-03T20:14:03.132Z

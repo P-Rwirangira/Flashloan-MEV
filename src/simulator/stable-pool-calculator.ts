@@ -1,481 +1,294 @@
 /**
- * Stable Pool Rebalancing Calculator
+ * Stable Pool Calculator
  *
- * Calculates optimal rebalancing strategies for Aerodrome stable pools
- * and estimates profitability including incentives and costs.
+ * Mathematical calculations for stable pool rebalancing opportunities
  */
 
 import { createComponentLogger } from '../utils/logger';
-import { StablePoolOpportunity } from '../scanner/stable-pool-monitor';
+import { RebalancingOpportunity } from '../types/opportunity';
 
-// Rebalancing calculation result
-export interface RebalancingCalculationResult {
+export interface StablePoolCalculationResult {
+  optimalTradeAmount: bigint;
+  expectedOutput: bigint;
+  priceImpact: number;
+  estimatedProfit: bigint;
+  gasEstimate: bigint;
+  profitAfterGas: bigint;
   profitable: boolean;
-  netProfit: bigint;
-  grossProfit: bigint;
-  totalCosts: bigint;
-  gasEstimate: bigint;
-  gasCost: bigint;
-  slippageCost: bigint;
-  incentiveReward: bigint;
-  optimalSwapAmount: bigint;
-  expectedOutputAmount: bigint;
-  priceImpact: number; // Percentage
-  executionRoute: RebalancingRoute;
-  riskScore: number; // 0-100, higher is riskier
+  newRatio: number;
+  efficiencyScore: number;
 }
 
-// Rebalancing execution route
-export interface RebalancingRoute {
-  steps: RebalancingStep[];
-  totalGasEstimate: bigint;
-  estimatedExecutionTime: number; // milliseconds
-  complexity: 'simple' | 'medium' | 'complex';
-}
-
-// Individual rebalancing step
-export interface RebalancingStep {
-  type: 'swap' | 'claim_incentive' | 'add_liquidity' | 'remove_liquidity';
-  poolAddress?: string;
-  tokenIn?: string;
-  tokenOut?: string;
-  amountIn?: bigint;
-  amountOut?: bigint;
-  gasEstimate: bigint;
-  description: string;
-}
-
-// Calculator options
-export interface StablePoolCalculatorOptions {
-  maxSlippage: number; // Maximum acceptable slippage (e.g., 0.005 = 0.5%)
-  gasPrice: bigint; // Current gas price in wei
-  minProfitMargin: number; // Minimum profit margin required (e.g., 0.05 = 5%)
-  maxPriceImpact: number; // Maximum acceptable price impact (e.g., 0.01 = 1%)
-  incentiveMultiplier: number; // Multiplier for incentive calculations (e.g., 1.0 = 100%)
+export interface StablePoolCalculatorConfig {
+  maxPriceImpact: number; // Maximum acceptable price impact (%)
+  minProfitThreshold: bigint;
+  gasPrice: bigint;
+  targetEfficiencyScore: number;
 }
 
 /**
- * Stable Pool Rebalancing Calculator
+ * Calculator for stable pool rebalancing math
  */
-export class StablePoolRebalancingCalculator {
+export class StablePoolCalculator {
   private readonly logger = createComponentLogger('stable-pool-calculator');
-  private readonly options: StablePoolCalculatorOptions;
+  private readonly config: StablePoolCalculatorConfig;
 
-  constructor(options: StablePoolCalculatorOptions) {
-    this.options = options;
-
-    this.logger.info('Stable pool calculator initialized', {
-      maxSlippage: `${(options.maxSlippage * 100).toFixed(2)}%`,
-      maxPriceImpact: `${(options.maxPriceImpact * 100).toFixed(2)}%`,
-      minProfitMargin: `${(options.minProfitMargin * 100).toFixed(1)}%`,
-      incentiveMultiplier: `${(options.incentiveMultiplier * 100).toFixed(0)}%`,
-    });
+  constructor(config: Partial<StablePoolCalculatorConfig> = {}) {
+    this.config = {
+      maxPriceImpact: config.maxPriceImpact ?? 0.5, // 0.5%
+      minProfitThreshold: config.minProfitThreshold ?? BigInt(1e16), // 0.01 ETH
+      gasPrice: config.gasPrice ?? 2000000000n, // 2 gwei
+      targetEfficiencyScore: config.targetEfficiencyScore ?? 80,
+      ...config,
+    };
   }
 
   /**
-   * Calculate rebalancing profitability
+   * Calculate optimal rebalancing trade
    */
-  async calculateRebalancingProfit(
-    opportunity: StablePoolOpportunity
-  ): Promise<RebalancingCalculationResult> {
-    const operationId = `rebalancing-calc-${opportunity.id}`;
-    this.logger.startPerformanceTracking(operationId);
-
+  calculateRebalancing(opportunity: RebalancingOpportunity): StablePoolCalculationResult {
     try {
-      this.logger.debug('Calculating rebalancing profitability', {
-        opportunityId: opportunity.id,
-        poolAddress: opportunity.poolAddress,
-        imbalanceRatio: `${(opportunity.imbalanceRatio * 100).toFixed(2)}%`,
-        direction: opportunity.rebalanceDirection,
-        estimatedAmount: opportunity.optimalRebalanceAmount.toString(),
-      });
+      // Calculate optimal trade amount using stable swap math
+      const optimalTradeAmount = this.calculateOptimalTradeAmount(opportunity);
 
-      // Step 1: Calculate optimal swap amount and expected output
-      this.logger.markPerformance(operationId, 'swap-calculation');
-      const { optimalSwapAmount, expectedOutputAmount, priceImpact } =
-        await this.calculateOptimalSwap(opportunity);
+      // Calculate expected output using StableSwap invariant
+      const expectedOutput = this.calculateStableSwapOutput(opportunity, optimalTradeAmount);
 
-      // Step 2: Estimate gas costs
-      this.logger.markPerformance(operationId, 'gas-estimation');
-      const executionRoute = await this.planExecutionRoute(opportunity, optimalSwapAmount);
-      const gasCost = executionRoute.totalGasEstimate * this.options.gasPrice;
-
-      // Step 3: Calculate slippage costs
-      this.logger.markPerformance(operationId, 'slippage-calculation');
-      const slippageCost = await this.estimateSlippageCost(
+      // Calculate price impact
+      const priceImpact = this.calculatePriceImpact(
         opportunity,
-        optimalSwapAmount,
-        expectedOutputAmount
+        optimalTradeAmount,
+        expectedOutput
       );
 
-      // Step 4: Calculate incentive rewards
-      this.logger.markPerformance(operationId, 'incentive-calculation');
-      const incentiveReward = this.calculateIncentiveReward(opportunity, optimalSwapAmount);
+      // Estimate gas costs
+      const gasEstimate = this.estimateRebalancingGas();
+      const gasCost = gasEstimate * this.config.gasPrice;
 
-      // Step 5: Calculate net profit
-      this.logger.markPerformance(operationId, 'profit-calculation');
-      const grossProfit = incentiveReward;
-      const totalCosts = gasCost + slippageCost;
-      const netProfit = grossProfit - totalCosts;
+      // Calculate profit from rebalancing incentives
+      const estimatedProfit = this.calculateRebalancingProfit(opportunity, optimalTradeAmount);
 
-      // Step 6: Calculate risk score
-      this.logger.markPerformance(operationId, 'risk-assessment');
-      const riskScore = this.calculateRiskScore(opportunity, priceImpact, executionRoute);
+      const profitAfterGas = estimatedProfit > gasCost ? estimatedProfit - gasCost : 0n;
 
-      const result: RebalancingCalculationResult = {
-        profitable: netProfit > 0n && this.meetsMinimumProfitMargin(netProfit, grossProfit),
-        netProfit,
-        grossProfit,
-        totalCosts,
-        gasEstimate: executionRoute.totalGasEstimate,
-        gasCost,
-        slippageCost,
-        incentiveReward,
-        optimalSwapAmount,
-        expectedOutputAmount,
-        priceImpact,
-        executionRoute,
-        riskScore,
-      };
+      // Calculate new pool ratio after trade
+      const newRatio = this.calculateNewRatio(opportunity, optimalTradeAmount, expectedOutput);
 
-      this.logger.info('Rebalancing calculation completed', {
-        opportunityId: opportunity.id,
-        profitable: result.profitable,
-        netProfit: result.netProfit.toString(),
-        priceImpact: `${(result.priceImpact * 100).toFixed(3)}%`,
-        riskScore: result.riskScore,
-      });
-
-      return result;
-    } catch (error) {
-      this.logger.logError(error as Error, {
-        opportunityId: opportunity.id,
-        operation: 'rebalancing-calculation',
-      });
-      throw error;
-    } finally {
-      this.logger.endPerformanceTracking(operationId);
-    }
-  }
-
-  /**
-   * Calculate optimal swap parameters
-   */
-  private async calculateOptimalSwap(opportunity: StablePoolOpportunity): Promise<{
-    optimalSwapAmount: bigint;
-    expectedOutputAmount: bigint;
-    priceImpact: number;
-  }> {
-    // Use the opportunity's suggested amount as starting point
-    let optimalSwapAmount = opportunity.optimalRebalanceAmount;
-
-    // Calculate expected output using stable swap formula
-    const expectedOutputAmount = this.calculateStableSwapOutput(opportunity, optimalSwapAmount);
-
-    // Calculate price impact
-    const priceImpact = this.calculatePriceImpact(
-      opportunity,
-      optimalSwapAmount,
-      expectedOutputAmount
-    );
-
-    // If price impact is too high, reduce swap amount
-    if (priceImpact > this.options.maxPriceImpact) {
-      const adjustmentFactor = this.options.maxPriceImpact / priceImpact;
-      optimalSwapAmount = BigInt(Math.floor(Number(optimalSwapAmount) * adjustmentFactor));
-
-      // Recalculate with adjusted amount
-      const adjustedOutput = this.calculateStableSwapOutput(opportunity, optimalSwapAmount);
-      const adjustedPriceImpact = this.calculatePriceImpact(
-        opportunity,
-        optimalSwapAmount,
-        adjustedOutput
+      // Calculate efficiency score
+      const efficiencyScore = this.calculateEfficiencyScore(
+        opportunity.currentRatio[0] || 0.5,
+        newRatio,
+        opportunity.targetRatio[0] || 0.5
       );
+
+      const profitable =
+        profitAfterGas >= this.config.minProfitThreshold &&
+        priceImpact <= this.config.maxPriceImpact &&
+        efficiencyScore >= this.config.targetEfficiencyScore;
 
       return {
-        optimalSwapAmount,
-        expectedOutputAmount: adjustedOutput,
-        priceImpact: adjustedPriceImpact,
+        optimalTradeAmount,
+        expectedOutput,
+        priceImpact,
+        estimatedProfit,
+        gasEstimate,
+        profitAfterGas,
+        profitable,
+        newRatio,
+        efficiencyScore,
       };
-    }
+    } catch (error) {
+      this.logger.error('Failed to calculate stable pool rebalancing', {
+        opportunityId: opportunity.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
 
-    return {
-      optimalSwapAmount,
-      expectedOutputAmount,
-      priceImpact,
-    };
+      return this.getFailsafeResult();
+    }
   }
 
   /**
-   * Calculate stable swap output using Aerodrome stable formula
+   * Calculate optimal trade amount for rebalancing
    */
-  private calculateStableSwapOutput(opportunity: StablePoolOpportunity, amountIn: bigint): bigint {
-    // Simplified stable swap calculation
-    // Real implementation would use Aerodrome's exact stable swap math
+  private calculateOptimalTradeAmount(opportunity: RebalancingOpportunity): bigint {
+    // Use the amountIn from the opportunity as base trade amount
+    const baseAmount = BigInt(opportunity.amountIn.toString());
 
-    const { reserve0, reserve1 } = opportunity;
-    const fee = 0.0005; // 0.05% fee for stable pools
+    // Calculate imbalance based on current vs target ratios
+    const currentRatio = opportunity.currentRatio[0] || 0.5;
+    const targetRatio = opportunity.targetRatio[0] || 0.5;
+    const imbalancePercent = Math.abs(currentRatio - targetRatio);
 
-    let reserveIn: bigint;
-    let reserveOut: bigint;
+    // Use a fraction of the base amount based on imbalance severity
+    const tradeFraction = Math.min(0.5, imbalancePercent * 2); // Max 50% of base amount
 
-    if (opportunity.rebalanceDirection === 'token0_to_token1') {
-      reserveIn = reserve0;
-      reserveOut = reserve1;
-    } else {
-      reserveIn = reserve1;
-      reserveOut = reserve0;
-    }
+    // Log calculation details for monitoring
+    this.logger.debug('Calculating optimal trade amount', {
+      opportunityId: opportunity.id,
+      currentRatio,
+      targetRatio,
+      imbalancePercent,
+      tradeFraction,
+    });
 
-    // Apply fee
-    const amountInWithFee = BigInt(Math.floor(Number(amountIn) * (1 - fee)));
-
-    // Stable swap formula (simplified)
-    // Real formula: x^3*y + y^3*x >= k
-    // Approximation for small swaps: constant product with lower slippage
-    const numerator = amountInWithFee * reserveOut;
-    const denominator = reserveIn + amountInWithFee;
-
-    return numerator / denominator;
+    return BigInt(Math.floor(Number(baseAmount) * tradeFraction));
   }
 
   /**
-   * Calculate price impact
+   * Calculate StableSwap output using simplified curve math
+   */
+  private calculateStableSwapOutput(
+    opportunity: RebalancingOpportunity,
+    inputAmount: bigint
+  ): bigint {
+    // Simplified StableSwap calculation (actual implementation would use curve invariant)
+    // For stable pairs, output is approximately 1:1 minus fees
+    const fee = 20; // 0.02% fee in basis points
+    const feeAmount = (inputAmount * BigInt(fee)) / 10000n;
+
+    // Log calculation for monitoring
+    this.logger.debug('Calculating stable swap output', {
+      opportunityId: opportunity.id,
+      inputAmount: inputAmount.toString(),
+      poolType: opportunity.poolType,
+      pool: opportunity.pool.toString(),
+    });
+
+    // For stable pools, output is approximately 1:1 minus fees
+    const outputAmount = inputAmount - feeAmount;
+    return outputAmount;
+  }
+
+  /**
+   * Calculate price impact of the trade
    */
   private calculatePriceImpact(
-    opportunity: StablePoolOpportunity,
-    amountIn: bigint,
-    amountOut: bigint
+    opportunity: RebalancingOpportunity,
+    inputAmount: bigint,
+    outputAmount: bigint
   ): number {
-    const { reserve0, reserve1 } = opportunity;
+    // For stable pools, price impact should be minimal
+    const expectedOutput = inputAmount; // 1:1 expected for stable pairs
+    const actualSlippage = Number(expectedOutput - outputAmount) / Number(expectedOutput);
 
-    let reserveIn: bigint;
-    let reserveOut: bigint;
+    // Log price impact calculation
+    this.logger.debug('Calculating price impact', {
+      opportunityId: opportunity.id,
+      inputAmount: inputAmount.toString(),
+      outputAmount: outputAmount.toString(),
+      actualSlippage,
+    });
 
-    if (opportunity.rebalanceDirection === 'token0_to_token1') {
-      reserveIn = reserve0;
-      reserveOut = reserve1;
-    } else {
-      reserveIn = reserve1;
-      reserveOut = reserve0;
-    }
-
-    // Calculate current price (reserve ratio)
-    const currentPrice = Number(reserveOut) / Number(reserveIn);
-
-    // Calculate execution price
-    const executionPrice = Number(amountOut) / Number(amountIn);
-
-    // Price impact = (execution_price - current_price) / current_price
-    return Math.abs((executionPrice - currentPrice) / currentPrice);
+    return actualSlippage * 100; // Convert to percentage
   }
 
   /**
-   * Plan execution route for rebalancing
+   * Calculate profit from rebalancing incentives
    */
-  private async planExecutionRoute(
-    opportunity: StablePoolOpportunity,
-    swapAmount: bigint
-  ): Promise<RebalancingRoute> {
-    const steps: RebalancingStep[] = [];
+  private calculateRebalancingProfit(
+    opportunity: RebalancingOpportunity,
+    tradeAmount: bigint
+  ): bigint {
+    // Use the incentive rate from the opportunity
+    const incentiveRate = opportunity.incentiveRate;
+    const incentiveAmount = BigInt(Math.floor(Number(tradeAmount) * incentiveRate));
 
-    // Step 1: Swap to rebalance pool
-    steps.push({
-      type: 'swap',
-      poolAddress: opportunity.poolAddress,
-      tokenIn:
-        opportunity.rebalanceDirection === 'token0_to_token1'
-          ? opportunity.token0
-          : opportunity.token1,
-      tokenOut:
-        opportunity.rebalanceDirection === 'token0_to_token1'
-          ? opportunity.token1
-          : opportunity.token0,
-      amountIn: swapAmount,
-      gasEstimate: 180000n, // Estimated gas for stable pool swap
-      description: `Swap ${swapAmount.toString()} to rebalance pool`,
+    // Log profit calculation for monitoring
+    this.logger.debug('Calculating rebalancing profit', {
+      opportunityId: opportunity.id,
+      tradeAmount: tradeAmount.toString(),
+      incentiveRate,
+      incentiveAmount: incentiveAmount.toString(),
     });
 
-    // Step 2: Claim incentive (if applicable)
-    steps.push({
-      type: 'claim_incentive',
-      poolAddress: opportunity.poolAddress,
-      gasEstimate: 120000n, // Estimated gas for incentive claim
-      description: 'Claim rebalancing incentive reward',
+    return incentiveAmount;
+  }
+
+  /**
+   * Calculate new pool ratio after trade
+   */
+  private calculateNewRatio(
+    opportunity: RebalancingOpportunity,
+    inputAmount: bigint,
+    outputAmount: bigint
+  ): number {
+    // Simplified calculation - in reality would need pool reserves
+    const currentRatio = opportunity.currentRatio[0] || 0.5;
+    const targetRatio = opportunity.targetRatio[0] || 0.5;
+
+    // Estimate how much closer we get to target ratio
+    const improvement = 0.1; // Assume 10% improvement toward target
+    const newRatio = currentRatio + (targetRatio - currentRatio) * improvement;
+
+    // Log calculation for monitoring
+    this.logger.debug('Calculating new ratio', {
+      opportunityId: opportunity.id,
+      currentRatio,
+      targetRatio,
+      newRatio,
+      inputAmount: inputAmount.toString(),
+      outputAmount: outputAmount.toString(),
     });
 
-    const totalGasEstimate = steps.reduce((sum, step) => sum + step.gasEstimate, 0n);
-    const complexity = this.determineComplexity(steps);
+    return newRatio;
+  }
 
+  /**
+   * Calculate efficiency score (how much closer to target ratio)
+   */
+  private calculateEfficiencyScore(
+    currentRatio: number,
+    newRatio: number,
+    targetRatio: number
+  ): number {
+    const currentDistance = Math.abs(currentRatio - targetRatio);
+    const newDistance = Math.abs(newRatio - targetRatio);
+
+    if (currentDistance === 0) return 100; // Already at target
+
+    const improvement = (currentDistance - newDistance) / currentDistance;
+    return Math.max(0, Math.min(100, improvement * 100));
+  }
+
+  /**
+   * Estimate gas for rebalancing transaction
+   */
+  private estimateRebalancingGas(): bigint {
+    // Stable pool rebalancing is typically simpler than arbitrage
+    const baseSwapGas = 80000n; // Aerodrome stable swap
+    const incentiveClaimGas = 50000n; // Claim rebalancing rewards
+
+    return baseSwapGas + incentiveClaimGas;
+  }
+
+  /**
+   * Get failsafe result for error cases
+   */
+  private getFailsafeResult(): StablePoolCalculationResult {
     return {
-      steps,
-      totalGasEstimate,
-      estimatedExecutionTime: this.estimateExecutionTime(complexity),
-      complexity,
+      optimalTradeAmount: 0n,
+      expectedOutput: 0n,
+      priceImpact: 100, // Maximum price impact
+      estimatedProfit: 0n,
+      gasEstimate: 200000n,
+      profitAfterGas: 0n,
+      profitable: false,
+      newRatio: 0,
+      efficiencyScore: 0,
     };
   }
 
   /**
-   * Estimate slippage cost
+   * Update calculator configuration
    */
-  private async estimateSlippageCost(
-    opportunity: StablePoolOpportunity,
-    swapAmount: bigint,
-    expectedOutput: bigint
-  ): Promise<bigint> {
-    // Calculate slippage as percentage of expected output
-    const slippageAmount = BigInt(Math.floor(Number(expectedOutput) * this.options.maxSlippage));
-
-    this.logger.debug('Estimated slippage cost', {
-      poolAddress: opportunity.poolAddress,
-      swapAmount: swapAmount.toString(),
-      expectedOutput: expectedOutput.toString(),
-      slippageCost: slippageAmount.toString(),
-      slippagePercentage: `${(this.options.maxSlippage * 100).toFixed(2)}%`,
-    });
-
-    return slippageAmount;
+  updateConfig(newConfig: Partial<StablePoolCalculatorConfig>): void {
+    Object.assign(this.config, newConfig);
+    this.logger.info('Stable pool calculator configuration updated', { config: this.config });
   }
 
   /**
-   * Calculate incentive reward
+   * Get current configuration
    */
-  private calculateIncentiveReward(opportunity: StablePoolOpportunity, swapAmount: bigint): bigint {
-    // Use the estimated incentive from the opportunity, adjusted by multiplier
-    const baseIncentive = opportunity.estimatedIncentive;
-    const adjustedIncentive = BigInt(
-      Math.floor(Number(baseIncentive) * this.options.incentiveMultiplier)
-    );
-
-    this.logger.debug('Calculated incentive reward', {
-      poolAddress: opportunity.poolAddress,
-      swapAmount: swapAmount.toString(),
-      baseIncentive: baseIncentive.toString(),
-      adjustedIncentive: adjustedIncentive.toString(),
-      multiplier: this.options.incentiveMultiplier,
-    });
-
-    return adjustedIncentive;
-  }
-
-  /**
-   * Calculate risk score for rebalancing opportunity
-   */
-  private calculateRiskScore(
-    opportunity: StablePoolOpportunity,
-    priceImpact: number,
-    route: RebalancingRoute
-  ): number {
-    let riskScore = 0;
-
-    // Price impact risk
-    if (priceImpact > 0.005) {
-      // > 0.5%
-      riskScore += 20;
-    } else if (priceImpact > 0.002) {
-      // > 0.2%
-      riskScore += 10;
-    } else if (priceImpact > 0.001) {
-      // > 0.1%
-      riskScore += 5;
-    }
-
-    // Imbalance severity risk (higher imbalance = higher risk of competition)
-    const imbalanceSeverity = Math.abs(opportunity.imbalanceRatio);
-    if (imbalanceSeverity > 0.15) {
-      // > 15%
-      riskScore += 25;
-    } else if (imbalanceSeverity > 0.1) {
-      // > 10%
-      riskScore += 15;
-    } else if (imbalanceSeverity > 0.05) {
-      // > 5%
-      riskScore += 5;
-    }
-
-    // Execution complexity risk
-    switch (route.complexity) {
-      case 'complex':
-        riskScore += 20;
-        break;
-      case 'medium':
-        riskScore += 10;
-        break;
-      case 'simple':
-        riskScore += 2;
-        break;
-    }
-
-    // Time sensitivity risk
-    const timeToDeadline = opportunity.deadline - Date.now();
-    if (timeToDeadline < 60000) {
-      // Less than 1 minute
-      riskScore += 20;
-    } else if (timeToDeadline < 180000) {
-      // Less than 3 minutes
-      riskScore += 10;
-    } else if (timeToDeadline < 300000) {
-      // Less than 5 minutes
-      riskScore += 5;
-    }
-
-    // Pool priority adjustment
-    switch (opportunity.priority) {
-      case 'high':
-        riskScore -= 5; // Lower risk for high priority pools
-        break;
-      case 'low':
-        riskScore += 5; // Higher risk for low priority pools
-        break;
-    }
-
-    return Math.max(0, Math.min(riskScore, 100)); // Clamp between 0-100
-  }
-
-  /**
-   * Check if profit meets minimum margin requirement
-   */
-  private meetsMinimumProfitMargin(netProfit: bigint, grossProfit: bigint): boolean {
-    if (grossProfit === 0n) return false;
-
-    const profitMargin = Number(netProfit) / Number(grossProfit);
-    return profitMargin >= this.options.minProfitMargin;
-  }
-
-  /**
-   * Determine execution complexity
-   */
-  private determineComplexity(steps: RebalancingStep[]): 'simple' | 'medium' | 'complex' {
-    if (steps.length <= 2) return 'simple';
-    if (steps.length <= 4) return 'medium';
-    return 'complex';
-  }
-
-  /**
-   * Estimate execution time based on complexity
-   */
-  private estimateExecutionTime(complexity: 'simple' | 'medium' | 'complex'): number {
-    switch (complexity) {
-      case 'simple':
-        return 10000; // 10 seconds
-      case 'medium':
-        return 20000; // 20 seconds
-      case 'complex':
-        return 40000; // 40 seconds
-    }
-  }
-
-  /**
-   * Update calculator options
-   */
-  updateOptions(newOptions: Partial<StablePoolCalculatorOptions>): void {
-    Object.assign(this.options, newOptions);
-
-    this.logger.info('Calculator options updated', {
-      maxSlippage: `${(this.options.maxSlippage * 100).toFixed(2)}%`,
-      gasPrice: this.options.gasPrice.toString(),
-      maxPriceImpact: `${(this.options.maxPriceImpact * 100).toFixed(2)}%`,
-      minProfitMargin: `${(this.options.minProfitMargin * 100).toFixed(1)}%`,
-    });
+  getConfig(): StablePoolCalculatorConfig {
+    return { ...this.config };
   }
 }
