@@ -23,8 +23,14 @@ jobs:
     - name: Install dependencies
       run: npm ci
     
+    - name: Compile smart contracts
+      run: npm run build:contracts
+
     - name: Type check
       run: npm run typecheck
     
     - name: Build project
       run: npm run build
+
+    - name: Run automated test suite
+      run: npm test
