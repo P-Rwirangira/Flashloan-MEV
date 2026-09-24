@@ -135,6 +135,8 @@ export class BaseMEVPlatform extends EventEmitter {
   // Performance monitoring intervals
   private gcInterval?: NodeJS.Timeout | undefined;
   private cpuMonitorInterval?: NodeJS.Timeout | undefined;
+  private metricsLogInterval?: NodeJS.Timeout | undefined;
+  private perfOptInterval?: NodeJS.Timeout | undefined;
   private eventLoopMonitorRunning = false;
 
   constructor() {
@@ -228,7 +230,7 @@ export class BaseMEVPlatform extends EventEmitter {
     });
 
     // Log metrics periodically with enhanced formatting
-    setInterval(() => {
+    this.metricsLogInterval = setInterval(() => {
       const metrics = this.getMetrics();
       this.platformLogger.debug('Platform metrics update', {
         opportunities: metrics.opportunities.totalOpportunities,
@@ -240,7 +242,7 @@ export class BaseMEVPlatform extends EventEmitter {
     }, 30000); // Every 30 seconds
 
     // Performance optimization monitoring
-    setInterval(() => {
+    this.perfOptInterval = setInterval(() => {
       const memUsage = process.memoryUsage();
       const memUsageMB = Math.round(memUsage.heapUsed / 1024 / 1024);
 
@@ -477,7 +479,7 @@ export class BaseMEVPlatform extends EventEmitter {
 
           this.platformLogger.info('Starting automated pool discovery...');
           discoveredPools = await discoveryService.discoverPools();
-          
+
           this.platformLogger.info('Pool discovery completed', {
             totalDiscovered: discoveredPools.length,
             uniswapV3: discoveredPools.filter(p => p.dex === 'uniswap-v3').length,
@@ -530,10 +532,10 @@ export class BaseMEVPlatform extends EventEmitter {
       // Start monitoring AFTER pools are configured
       this.platformLogger.info('Starting pool monitors...');
       await poolManager.startMonitoring();
-      
+
       // Wait for initial pool state fetch
       await new Promise(resolve => setTimeout(resolve, 2000));
-      
+
       const poolStates = poolManager.getAllPoolStates();
       this.platformLogger.info('Pool states loaded', {
         totalPools: poolStates.size,
@@ -631,36 +633,37 @@ export class BaseMEVPlatform extends EventEmitter {
       this.setupPerformanceOptimization();
 
       // Initialize mempool monitor for backrun opportunities (only if enabled)
-      const enableMempoolMonitoring = (rawConfig as any).featureFlags?.enableMempoolMonitoring ?? false;
-      
+      const enableMempoolMonitoring =
+        (rawConfig as any).featureFlags?.enableMempoolMonitoring ?? false;
+
       if (enableMempoolMonitoring) {
         this.platformLogger.info('Mempool monitoring enabled - initializing MempoolMonitor');
         this.mempoolMonitor = new MempoolMonitor({
-        connectionManager: this.connectionManager,
-        enabledProtocols: ['uniswap-v3' as any, 'aerodrome' as any],
-        minSwapValue: ethers.parseEther('0.1'), // 0.1 ETH minimum
-        maxPendingTxs: 500,
-        filterSpam: true,
-        enableBackrun: true,
-        enableFrontrun: false, // Disabled for ethical reasons
-        enableSandwich: false, // Disabled for ethical reasons
-        // Fallback external streams (feature-flagged)
-        enableExternalStreams:
-          (process.env['ENABLE_EXTERNAL_MEMPOOL_STREAMS'] || 'false') === 'true',
-        flashbotsStreamUrl: process.env['FLASHBOTS_STREAM_URL'],
-        bloxrouteStreamUrl: process.env['BLOXROUTE_STREAM_URL'],
-        flashbotsAuth: process.env['FLASHBOTS_STREAM_AUTH'],
-        bloxrouteAuth: process.env['BLOXROUTE_STREAM_AUTH'],
-        // Allowlist filtering to reduce noise
-        allowedTokens: (process.env['ALLOWED_TOKENS'] || '')
-          .split(',')
-          .map(s => s.trim())
-          .filter(Boolean),
-        allowedPools: (process.env['ALLOWED_POOLS'] || '')
-          .split(',')
-          .map(s => s.trim())
-          .filter(Boolean),
-      });
+          connectionManager: this.connectionManager,
+          enabledProtocols: ['uniswap-v3' as any, 'aerodrome' as any],
+          minSwapValue: ethers.parseEther('0.1'), // 0.1 ETH minimum
+          maxPendingTxs: 500,
+          filterSpam: true,
+          enableBackrun: true,
+          enableFrontrun: false, // Disabled for ethical reasons
+          enableSandwich: false, // Disabled for ethical reasons
+          // Fallback external streams (feature-flagged)
+          enableExternalStreams:
+            (process.env['ENABLE_EXTERNAL_MEMPOOL_STREAMS'] || 'false') === 'true',
+          flashbotsStreamUrl: process.env['FLASHBOTS_STREAM_URL'],
+          bloxrouteStreamUrl: process.env['BLOXROUTE_STREAM_URL'],
+          flashbotsAuth: process.env['FLASHBOTS_STREAM_AUTH'],
+          bloxrouteAuth: process.env['BLOXROUTE_STREAM_AUTH'],
+          // Allowlist filtering to reduce noise
+          allowedTokens: (process.env['ALLOWED_TOKENS'] || '')
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean),
+          allowedPools: (process.env['ALLOWED_POOLS'] || '')
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean),
+        });
 
         // Set up event listener for mempool opportunities
         this.mempoolMonitor.on('opportunityDetected', async (opportunity: any) => {
@@ -669,7 +672,9 @@ export class BaseMEVPlatform extends EventEmitter {
 
         this.platformLogger.info('Mempool monitor initialized successfully');
       } else {
-        this.platformLogger.info('Mempool monitoring disabled - skipping MempoolMonitor initialization');
+        this.platformLogger.info(
+          'Mempool monitoring disabled - skipping MempoolMonitor initialization'
+        );
       }
     }
 
@@ -766,14 +771,17 @@ export class BaseMEVPlatform extends EventEmitter {
       );
 
       // Initialize real stable pool calculator
-      this.stablePoolCalculator = new RealStablePoolRebalancingCalculator({
-        connectionManager: this.connectionManager,
-        maxSlippage: 0.005,
-        gasPrice: 20000000000n,
-        minProfitMargin: 0.05,
-        maxPriceImpact: 0.01,
-        incentiveMultiplier: 1.0,
-      }, this.oracleAdapter!);
+      this.stablePoolCalculator = new RealStablePoolRebalancingCalculator(
+        {
+          connectionManager: this.connectionManager,
+          maxSlippage: 0.005,
+          gasPrice: 20000000000n,
+          minProfitMargin: 0.05,
+          maxPriceImpact: 0.01,
+          incentiveMultiplier: 1.0,
+        },
+        this.oracleAdapter!
+      );
 
       // Set up stable pool event handlers
       this.stablePoolMonitor.on('stablePoolOpportunityDetected', async opportunity => {
@@ -2274,6 +2282,16 @@ export class BaseMEVPlatform extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    // Unconditionally clear global monitoring intervals created in constructor
+    if (this.metricsLogInterval) {
+      clearInterval(this.metricsLogInterval);
+      this.metricsLogInterval = undefined;
+    }
+    if (this.perfOptInterval) {
+      clearInterval(this.perfOptInterval);
+      this.perfOptInterval = undefined;
+    }
+
     if (!this.isRunning) {
       this.platformLogger.warn('Platform is not running');
       return;
@@ -2358,6 +2376,14 @@ export class BaseMEVPlatform extends EventEmitter {
       if (this.cpuMonitorInterval) {
         clearInterval(this.cpuMonitorInterval);
         this.cpuMonitorInterval = undefined;
+      }
+      if (this.metricsLogInterval) {
+        clearInterval(this.metricsLogInterval);
+        this.metricsLogInterval = undefined;
+      }
+      if (this.perfOptInterval) {
+        clearInterval(this.perfOptInterval);
+        this.perfOptInterval = undefined;
       }
 
       // Stop health check server
@@ -2501,8 +2527,10 @@ async function main(): Promise<void> {
   }
 }
 
-// Start the application
-main().catch(error => {
-  logger.error('Unhandled error in main:', error);
-  process.exit(1);
-});
+// Start the application only when not running in test environment
+if (process.env['NODE_ENV'] !== 'test') {
+  main().catch(error => {
+    logger.error('Unhandled error in main:', error);
+    process.exit(1);
+  });
+}
