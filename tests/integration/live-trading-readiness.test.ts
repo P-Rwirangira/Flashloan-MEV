@@ -1,15 +1,49 @@
+import { ethers } from 'ethers';
 import { BaseMEVPlatform } from '../../src/index';
-import { ConfigLoader } from '../../src/config/loader';
+import { CircuitBreakerState } from '../../src/monitoring/circuit-breaker';
+import { ChainlinkPriceOracleImpl } from '../../src/oracles/chainlink-oracle';
 
 describe('Live Trading Readiness Integration Tests', () => {
   let platform: BaseMEVPlatform;
 
   beforeAll(async () => {
-    // Use test environment variables
-    process.env['PRIVATE_KEY'] = '0x' + '1'.repeat(64); // Test private key
+    // Ensure execution engine remains dormant in readiness test to avoid unconfigured live contracts
+    delete process.env['PRIVATE_KEY'];
+    delete process.env['EXECUTION_PRIVATE_KEY'];
     process.env['BASE_RPC_URL'] = 'http://localhost:8545'; // Local test node
 
+    // Mock oracle price feed to avoid reliance on external RPCs during integration tests
+    jest.spyOn(ChainlinkPriceOracleImpl.prototype, 'getEthUsdPrice').mockResolvedValue(2500);
+
     platform = new BaseMEVPlatform();
+
+    const mockProvider = {
+      _getConnection: () => ({ url: 'http://localhost:8545' }),
+      getBlockNumber: jest.fn().mockResolvedValue(1000000),
+      getFeeData: jest.fn().mockResolvedValue({
+        gasPrice: 100000000n,
+        maxFeePerGas: 200000000n,
+        maxPriorityFeePerGas: 1000000n,
+      }),
+      getBalance: jest.fn().mockResolvedValue(1000000000000000000n),
+      on: jest.fn(),
+      removeAllListeners: jest.fn(),
+      destroy: jest.fn(),
+    } as unknown as ethers.JsonRpcProvider;
+
+    jest.spyOn(platform['connectionManager'], 'initialize').mockImplementation(async () => {
+      (platform['connectionManager'] as any).primaryProvider = mockProvider;
+      (platform['connectionManager'] as any).currentProvider = mockProvider;
+      (platform['connectionManager'] as any).connectionHealth.set('http://localhost:8545', {
+        endpoint: 'http://localhost:8545',
+        type: 'http',
+        connected: true,
+        latencyMs: 10,
+        lastSuccessfulRequest: Date.now(),
+        consecutiveFailures: 0,
+      });
+      platform['connectionManager'].emit('initialized');
+    });
   });
 
   afterAll(async () => {
@@ -107,8 +141,10 @@ describe('Live Trading Readiness Integration Tests', () => {
       // Test cleanup functionality
       metricsCollector.cleanupOldData();
 
-      // Should not throw errors
-      expect(true).toBe(true);
+      // Verify metrics collector remains healthy and tracks memory metrics
+      const healthMetrics = metricsCollector.getSystemHealthMetrics();
+      expect(healthMetrics).toBeDefined();
+      expect(healthMetrics.memoryUsage).toBeGreaterThan(0);
     });
   });
 
@@ -124,8 +160,12 @@ describe('Live Trading Readiness Integration Tests', () => {
   });
 
   describe('Circuit Breaker Integration', () => {
-    test('should activate circuit breaker on failures', async () => {
+    test('should activate circuit breaker on failures and block requests', async () => {
       const circuitBreaker = platform['circuitBreaker'];
+
+      // Configure explicit thresholds for integration test
+      (circuitBreaker as any).config.minimumRequests = 5;
+      (circuitBreaker as any).config.failureThreshold = 5;
 
       // Simulate failures to trigger circuit breaker
       for (let i = 0; i < 6; i++) {
@@ -133,13 +173,23 @@ describe('Live Trading Readiness Integration Tests', () => {
           await circuitBreaker.execute(async () => {
             throw new Error('Simulated failure');
           });
-        } catch (error) {
+        } catch {
           // Expected to fail
         }
       }
 
-      // Circuit breaker should be affected by failures
-      expect(circuitBreaker).toBeDefined();
+      // Circuit breaker must transition to OPEN
+      expect(circuitBreaker.getState()).toBe(CircuitBreakerState.OPEN);
+      expect(circuitBreaker.isRequestAllowed()).toBe(false);
+
+      // Subsequent requests must be rejected immediately while OPEN
+      await expect(circuitBreaker.execute(async () => 'should not execute')).rejects.toThrow(
+        'Circuit breaker is OPEN'
+      );
+
+      // Reset circuit breaker to clean state for subsequent tests
+      circuitBreaker.reset();
+      expect(circuitBreaker.getState()).toBe(CircuitBreakerState.CLOSED);
     });
   });
 
