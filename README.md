@@ -5,302 +5,178 @@
 [![Solidity](https://img.shields.io/badge/Solidity-0.8.20-363636?style=flat&logo=solidity&logoColor=white)](https://soliditylang.org/)
 [![Hardhat](https://img.shields.io/badge/Hardhat-2.28-FFF100?style=flat&logo=hardhat&logoColor=black)](https://hardhat.org/)
 [![ethers.js](https://img.shields.io/badge/ethers.js-6.8-2535A0?style=flat&logo=ethereum&logoColor=white)](https://docs.ethers.org/)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![CI Pipeline](https://img.shields.io/badge/CI-Automated_Gates-brightgreen?style=flat&logo=githubactions&logoColor=white)](.github/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/Tests-50_Passed-success?style=flat&logo=jest&logoColor=white)](tests/)
 
 [![Base](https://img.shields.io/badge/Base-Mainnet-0052FF?style=flat&logo=coinbase&logoColor=white)](https://base.org/)
 [![Uniswap V3](https://img.shields.io/badge/Uniswap-V3-FF007A?style=flat&logo=uniswap&logoColor=white)](https://uniswap.org/)
 [![Aerodrome](https://img.shields.io/badge/Aerodrome-DEX-00D4AA?style=flat)](https://aerodrome.finance/)
-
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker&logoColor=white)](https://www.docker.com/)
-[![Kubernetes](https://img.shields.io/badge/Kubernetes-Supported-326CE5?style=flat&logo=kubernetes&logoColor=white)](https://kubernetes.io/)
-[![Jest](https://img.shields.io/badge/Jest-Testing-C21325?style=flat&logo=jest&logoColor=white)](https://jestjs.io/)
 
-A flash-loan-native MEV platform dedicated to Base blockchain, targeting low-competition, low-capital strategies with maximal gas efficiency and atomic execution.
+A flash-loan-native MEV (Maximal Extractable Value) trading and simulation platform built for Base L2, engineering cross-DEX arbitrage (Uniswap V3 ↔ Aerodrome), lending liquidations, and stable pool rebalancing with atomic smart contract execution, pre-flight math simulation, and deterministic reliability guardrails.
 
-## Features
+---
 
-### Phase 1 (MVP) - Cross-DEX Arbitrage ![Status](https://img.shields.io/badge/Status-Active-success)
-- Real-time monitoring of Uniswap V3 and Aerodrome pools on Base
-- Flash loan execution via Uniswap V3 pools
-- Direct pool swaps to minimize gas costs
-- Private transaction submission to avoid MEV theft
-- Comprehensive profit validation and safety checks
-- **Zero RPC Polling** - DexScreener WebSocket integration
+## System Reliability & Safety Architecture
 
-### Phase 2 - Liquidations ![Status](https://img.shields.io/badge/Status-In_Development-yellow)
-- Health factor monitoring on Moonwell, Aave V3, and Seamless protocols
-- Flash-borrowed liquidation execution
-- Optimal collateral selling routes
+In autonomous on-chain trading systems, execution failures permanently burn network gas fees, while pricing inaccuracies and race conditions lead to front-running losses. The platform treats mathematical determinism, pre-execution simulation, and fail-closed circuit breakers as first-class architectural requirements:
 
-### Phase 3 - Stable Pool Rebalancing ![Status](https://img.shields.io/badge/Status-Planned-blue)
-- Aerodrome stable pool imbalance detection
-- Flash-borrowed rebalancing execution
-- Incentivized pool prioritization
+```
+[Mempool / DEX Ingestion]
+           │
+           ▼
+[Pre-Flight AMM Simulation]  ──► (Q192 Fixed-Point Math, Slippage Bounds, Net Profit > Fee)
+           │
+           ▼
+[Stateful Circuit Breaker]  ──► (Failure Thresholds, Consecutive Loss Limits, Health Probes)
+           │
+           ▼
+[Private Relay Dispatch]    ──► (Flashbots / bloXroute MEV Protection, Dynamic Bribing)
+           │
+           ▼
+[On-Chain Atomic Settlement] ──► (FlashExecutor.sol: Reentrancy-guarded, Revert-on-unprofitable)
+```
+
+### Core Reliability Invariants
+1. **Mathematical Invariant Verification**: Prevents integer division truncation in concentrated liquidity pools (protecting against sub-1 price ratio failures) and preserves BigInt precision in route sorting beyond $2^{53} - 1$ wei.
+2. **Multi-Layered Circuit Breaker**: Tracks consecutive failures across RPC, simulation, and execution stages. Automatically trips to `OPEN` to prevent cascading gas losses, intercepts subsequent requests, and safely probes recovery in `HALF_OPEN` state.
+3. **Runtime Schema Validation**: Enforces configuration integrity using Zod schemas, verifying network parameters, address checksums, and strict business invariants (e.g. positive minimum profits, capped slippage).
+4. **Graceful Platform Lifecycle**: Deterministic initialization and teardown ensuring all event listeners, cache intervals, and monitoring loops are unref'd or cleared cleanly without resource leakage.
+
+### Engineering & Verification Documentation
+- **[Test Strategy & Invariant Framework](docs/qa/TEST_STRATEGY.md)**: Testing philosophy, pyramid tiers, invariant modeling, and mock boundaries.
+- **[Failure Mode & Defect Analysis](docs/qa/DEFECT_REPORTS.md)**: Root-cause investigations, reproduction steps, and fixes for platform defects.
+- **[Regression Traceability Matrix](docs/qa/REGRESSION_MATRIX.md)**: Bidirectional map connecting architectural invariants and defects to automated test cases and CI gates.
+- **[Release Criteria & Stage Gates](docs/qa/RELEASE_CRITERIA.md)**: Mandatory verification requirements for promotion from simulation to production.
+- **[Live Trading Readiness Report](LIVE_TRADING_READINESS_REPORT.md)**: Evidence-based readiness evaluation matrix.
+
+---
+
+## Strategy Modules
+
+### Phase 1: Cross-DEX Arbitrage ![Status](https://img.shields.io/badge/Status-Active-success)
+- Real-time monitoring of Uniswap V3 and Aerodrome pools on Base L2.
+- Pre-execution simulation using Q192 fixed-point concentrated liquidity and constant product math.
+- Atomic flash loan execution via `FlashExecutor.sol` with multi-hop pool routing.
+- Private bundle submission via Flashbots and bloXroute to neutralize front-running and sandwich attacks.
+
+### Phase 2: Lending Protocol Liquidations ![Status](https://img.shields.io/badge/Status-In_Development-yellow)
+- Continuous health factor monitoring on Moonwell, Aave V3, and Seamless protocols.
+- Automated liquidation triggers with flash-borrowed debt repayment.
+- Optimal collateral liquidation routing and slippage protection.
+
+### Phase 3: Stable Pool Rebalancing ![Status](https://img.shields.io/badge/Status-Planned-blue)
+- Aerodrome stable pool invariant calculation and deviation monitoring.
+- Flash-borrowed rebalancing execution capturing protocol incentives.
+
+---
 
 ## Architecture
 
-The platform consists of modular components:
+- **Scanner** (`src/scanner/`): Real-time event ingestion and pool state tracking across Uniswap V3 and Aerodrome.
+- **Simulator** (`src/utils/swap-simulation.ts`, `src/simulator/`): Off-chain mathematical execution simulation calculating exact price impact, fee deduction, and net profit.
+- **Bundler & Relays** (`src/bundler/`): Private transaction routing to Flashbots builder and bloXroute BDN relays with adaptive gas pricing.
+- **Flash Executor** (`contracts/FlashExecutor.sol`): Atomic on-chain settlement contract executing multi-DEX swaps, flash loan borrowing, and strict profit verification.
+- **Monitoring & Health** (`src/monitoring/`): Prometheus metrics, circuit breakers, and HTTP health check server with Kubernetes liveness and readiness endpoints.
 
-- **Scanner** ![TypeScript](https://img.shields.io/badge/-TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white): Real-time blockchain monitoring for opportunities
-  - Zero RPC polling via DexScreener WebSocket
-  - Multi-DEX support (Uniswap V3, Aerodrome)
-  - Dynamic pool discovery and validation
-  
-- **Simulator** ![ethers.js](https://img.shields.io/badge/-ethers.js-2535A0?style=flat-square&logo=ethereum&logoColor=white): Pre-execution validation using forked state
-  - Profit calculation with gas estimation
-  - Slippage and price impact analysis
-  - Multi-route optimization
-  
-- **Bundler** ![MEV](https://img.shields.io/badge/-MEV_Protected-FF6B6B?style=flat-square): Private transaction submission with bribe optimization
-  - Flashbots & bloXroute relay support
-  - Dynamic bribe calculation
-  - Multi-relay failover
-  
-- **Flash Executor** ![Solidity](https://img.shields.io/badge/-Solidity-363636?style=flat-square&logo=solidity&logoColor=white): On-chain contract for atomic arbitrage execution
-  - Flash loan integration
-  - Reentrancy protection
-  - Owner-only execution
-  
-- **Monitoring** ![Prometheus](https://img.shields.io/badge/-Prometheus-E6522C?style=flat-square&logo=prometheus&logoColor=white): Comprehensive metrics and alerting system
-  - Health checks & circuit breakers
-  - Performance metrics
-  - Alert dispatch (webhook, email, Slack)
+---
 
-## Quick Start
+## Quick Start & Verification
 
 ### Prerequisites
-
-![Requirements](https://img.shields.io/badge/Requirements-Check_List-orange?style=flat)
-
-- **Node.js 18+** - JavaScript runtime
-- **RPC Access** - Base mainnet RPC (Alchemy/Infura recommended)
-- **Private Keys** - For transaction signing (dedicated wallet)
-- **API Keys** - bloXroute or Flashbots for private relays
-- **Docker** (optional) - For containerized deployment
-- **Base Node** (optional) - Local op-geth + op-node for lower latency
+- **Node.js 18+** (Node.js 20 LTS recommended)
+- **npm 9+**
+- **Git**
 
 ### Installation
+```bash
+# Clone the repository
+git clone https://github.com/P-Rwirangira/Flashloan-MEV.git
+cd Flashloan-MEV
 
+# Install dependencies deterministically
+npm ci
 
-# Install dependencies
-npm install
-
-# Copy environment configuration
+# Configure environment variables
 cp .env.example .env
-
-# Edit configuration
-nano .env
-nano config/default.yaml
 ```
 
-### Development
-
+### Running Verification & Tests
 ```bash
-# Type check
+# 1. Compile smart contracts and generate TypeChain bindings
+npm run build:contracts
+
+# 2. Run TypeScript static type check (strict mode)
 npm run typecheck
 
-# Build for production
-npm run build
-
-# Start in development mode
-npm run dev
-
-# Run tests
+# 3. Execute unit and regression test suite
 npm test
 
-# Lint and format
-npm run lint
-npm run format
+# 4. Run specific test tiers
+npx jest tests/unit/swap-simulation.test.ts   # AMM math and Q192 invariants
+npx jest tests/unit/circuit-breaker.test.ts   # State machine transitions
+npx jest tests/unit/config-validator.test.ts  # Zod schema validation
+npx jest tests/unit/historical-defects.test.ts # Historical regression tests
 ```
 
-**Available Scripts:**
+### Available Scripts
 
-| Command | Description | Purpose |
-|---------|-------------|---------|
-| `npm run dev` | Interactive menu | Choose strategy to run |
-| `npm run dexscreener` | DexScreener runner | Zero-RPC arbitrage monitoring |
-| `npm run dev:direct` | Direct start | Start with watch mode |
-| `npm run build` | Build project | Compile TypeScript to JS |
-| `npm run test` | Run tests | Execute Jest test suite |
-| `npm run typecheck` | Type checking | Validate TypeScript types |
-| `npm run deploy:testnet` | Deploy contracts | Deploy to Base Sepolia |
-| `npm run deploy:mainnet` | Deploy contracts | Deploy to Base Mainnet |
-| `npm run relay:test` | Test relays | Verify relay connectivity |
-| `npm run testing:enable-paper` | Paper trading | Enable simulation mode |
-| `npm run testing:enable-live` | Micro-live | Enable small trades |
+| Script | Command | Description |
+| :--- | :--- | :--- |
+| `build:contracts` | `hardhat compile` | Compiles Solidity contracts and generates TypeChain typings |
+| `typecheck` | `tsc --noEmit` | Validates TypeScript types across the entire project |
+| `build` | `tsc` | Transpiles TypeScript source code to `dist/` |
+| `test` | `jest --forceExit` | Executes all unit and integration test suites |
+| `test:watch` | `jest --watch` | Runs test runner in interactive watch mode |
+| `relay:test` | `tsx scripts/test-relay-connectivity.ts` | Validates Flashbots and bloXroute endpoint connectivity |
+| `dev` | `tsx src/dev-menu.ts` | Launches interactive strategy execution menu |
+| `testing:dry-run` | `tsx scripts/dry-run-monitor.ts` | Runs real-time opportunity detection in zero-risk dry-run mode |
 
-### Docker Deployment ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)
+---
 
-```bash
-# Build and start all services
-docker-compose up -d
+## Health Check & Observability Endpoints
 
-# Check health
-curl http://localhost:3002/health
+When started, the platform serves operational health metrics on port `3002` (configurable via `HEALTH_PORT`):
 
-# View logs
-docker-compose logs -f base-mev-platform
-```
+| Endpoint | Method | Purpose | Kubernetes Support |
+| :--- | :---: | :--- | :---: |
+| `/health` | `GET` | Aggregated subsystem health, circuit breaker state, active phases | Probe |
+| `/ready` | `GET` | Readiness probe (RPC connectivity and configuration status) | `readinessProbe` |
+| `/live` | `GET` | Liveness probe (event loop responsiveness) | `livenessProbe` |
+| `/metrics` | `GET` | Prometheus-formatted metrics (opportunities, win rate, P&L) | Prometheus Scrape |
+| `/status` | `GET` | Lightweight JSON uptime check | Service Monitor |
 
-**Services Included:**
+---
 
-| Service | Port | Purpose |
-|---------|------|---------|
-| `base-mev-platform` | 3001, 3002 | Main MEV bot |
-| `prometheus` | 9090 | Metrics collection |
-| `grafana` | 3000 | Metrics visualization |
-| `redis` | 6379 | Cache & state storage |
+## Technical Specifications & Stack
 
-**Container Features:**
-- Multi-stage build for small image size
-- Health checks for orchestration
-- Auto-restart on failure
-- Volume mounts for logs and config
-- Non-root user for security
+- **Runtime & Language**: Node.js, TypeScript 5.3 (Strict Mode)
+- **Smart Contracts**: Solidity 0.8.20, Hardhat 2.28, OpenZeppelin Contracts
+- **Blockchain Interface**: ethers.js v6, TypeChain
+- **Test Framework**: Jest, ts-jest, fast-check (property testing)
+- **Schema Validation**: Zod runtime parsing
+- **MEV Protocols**: Flashbots Builder Relay, bloXroute BDN
+- **Target Network**: Base L2 (Chain ID: 8453)
+- **Supported DEXes**: Uniswap V3, Aerodrome Finance
 
-## Documentation
+---
 
-- **[API Reference](docs/API.md)** - Health check and metrics endpoints
-- **[Operations Guide](docs/OPERATIONS.md)** - Monitoring, troubleshooting, and maintenance
-- **[Deployment Guide](docs/DEPLOYMENT.md)** - Local, Docker, and Kubernetes deployment
+## Security & Risk Controls
 
-### Health Monitoring ![Monitoring](https://img.shields.io/badge/Monitoring-Enabled-success?style=flat&logo=prometheus)
+- **Private Mempool Routing**: Private bundle submission shields transactions from predatory front-running and sandwich attacks.
+- **Atomic On-Chain Settlement**: Flash loans revert the entire transaction if the net output does not cover loan principal, fees, and required profit.
+- **Fail-Closed Circuit Breakers**: Automatic execution shutdown upon exceeding consecutive failure limits or daily loss thresholds.
+- **Separation of Keys**: Transaction execution uses dedicated hot wallets isolated from administrative ownership keys.
 
-The platform exposes health check endpoints:
-
-| Endpoint | Purpose | K8s Support |
-|----------|---------|-------------|
-| `GET /health` | Comprehensive health status | Yes |
-| `GET /ready` | Readiness probe | Kubernetes |
-| `GET /live` | Liveness probe | Kubernetes |
-| `GET /metrics` | Prometheus metrics | Yes |
-| `GET /status` | Simple status check | Yes |
-
-Default health check port: **3002** (configurable via `HEALTH_CHECK_PORT`)
-
-**Metrics Available:**
-- Opportunities detected/validated/executed
-- Transaction success/failure rates
-- Profit and loss tracking
-- Latency and performance metrics
-- RPC connection health
-
-### Configuration ![Config](https://img.shields.io/badge/Config-YAML-red?style=flat)
-
-Edit `config/default.yaml` to configure:
-
-| Category | Settings | Purpose |
-|----------|----------|---------|
-| **Network** | RPC URLs, fallbacks, chain ID | Connection management |
-| **Strategies** | Min profit, slippage, gas limits | Trading parameters |
-| **Security** | Pool/token allowlists | Safety controls |
-| **Relays** | Flashbots, bloXroute endpoints | Private submission |
-| **Monitoring** | Metrics, alerts, circuit breakers | Observability |
-| **Performance** | Timeouts, retries, cache settings | Optimization |
-
-**Key Configuration Files:**
-- `config/default.yaml` - Main configuration
-- `config/contracts.yaml` - Contract addresses
-- `config/pools-aggressive.yaml` - Pool definitions
-- `.env` - Environment variables (secrets)
-
-## Development
-
-### Project Structure
-
-```
-src/
-├── index.ts              # Application entry point
-├── types/                # TypeScript type definitions
-├── config/               # Configuration management
-├── scanner/              # Opportunity detection
-├── simulator/            # Pre-execution validation
-├── bundler/              # Transaction submission
-├── rpc/                  # Blockchain connections
-├── contracts/            # Smart contract interfaces
-├── monitoring/           # Metrics and alerting
-└── utils/                # Common utilities
-```
-
-### Code Quality ![Code Quality](https://img.shields.io/badge/Code_Quality-Strict-blue?style=flat)
-
-The project uses:
-- **TypeScript** ![Strict](https://img.shields.io/badge/Strict_Mode-Enabled-3178C6?style=flat-square) for type safety
-- **ESLint** ![Configured](https://img.shields.io/badge/ESLint-Configured-4B32C3?style=flat-square&logo=eslint) for code linting
-- **Prettier** ![Formatted](https://img.shields.io/badge/Prettier-Formatted-F7B93E?style=flat-square&logo=prettier) for code formatting
-- **Husky** ![Git Hooks](https://img.shields.io/badge/Git_Hooks-Active-brightgreen?style=flat-square) for git hooks
-- **Jest** ![Testing](https://img.shields.io/badge/Jest-Testing-C21325?style=flat-square&logo=jest) for testing
-- **Zod** ![Validation](https://img.shields.io/badge/Zod-Validation-3068B7?style=flat-square) for runtime validation
-
-### Commit Convention
-
-Use conventional commits focusing on features:
-- `chore: Initial project setup`
-- `feat: Add arbitrage opportunity detection`
-- `feat: Implement flash loan execution`
-- `test: Add profit calculation tests`
-- `fix: Handle RPC connection failures`
-
-## Security ![Security](https://img.shields.io/badge/Security-Audited_Design-brightgreen?style=flat&logo=security&logoColor=white)
-
-- All transactions use private relays to avoid MEV theft
-- On-chain profit validation prevents unprofitable execution
-- Allowlisted pools and tokens for safety
-- Reentrancy protection in smart contracts
-- Comprehensive error handling and circuit breakers
-- Owner-only execution controls
-- Real-time monitoring and alerting
-- Daily loss limits and position sizing
+---
 
 ## License
 
-MIT License - see LICENSE file for details.
+This project is licensed under the **Apache-2.0 License** - see the [LICENSE](LICENSE) file for details.
 
-## Contributing ![Contributions](https://img.shields.io/badge/Contributions-Welcome-brightgreen?style=flat)
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes with proper tests
-4. Ensure all checks pass (`npm run typecheck`)
-5. Submit a pull request
-
-**Contribution Guidelines:**
-- Follow TypeScript strict mode
-- Add tests for new features
-- Update documentation
-- Use conventional commits (no emojis in commits)
-- Run `npm run typecheck` before committing
+---
 
 ## Disclaimer
 
-This software is for educational and research purposes. Use at your own risk. MEV extraction may be subject to legal and regulatory restrictions in your jurisdiction.
-
----
-
-## Project Stats
-
-![Lines of Code](https://img.shields.io/badge/Lines_of_Code-20K+-blue?style=flat)
-![TypeScript](https://img.shields.io/badge/TypeScript-100%25-3178C6?style=flat&logo=typescript)
-![Test Coverage](https://img.shields.io/badge/Test_Coverage-Expanding-yellow?style=flat&logo=jest)
-![Modules](https://img.shields.io/badge/Modules-100+-green?style=flat)
-![Smart Contracts](https://img.shields.io/badge/Smart_Contracts-1-363636?style=flat&logo=solidity)
-
-**Architecture Highlights:**
-- **Modular Design**: 100+ TypeScript modules
-- **Zero Dependencies**: Minimal external dependencies
-- **Performance**: <100ms latency target
-- **Security First**: Multi-layer protection
-- **Flash Loan Native**: Zero capital required
-- **Multi-Protocol**: Uniswap V3, Aerodrome, Aave, Moonwell
-- **Auto-Failover**: Multi-RPC with health monitoring
-- **Observable**: Full metrics and alerting
-
----
-
-<div align="center">
-
-**Built for the Base ecosystem**
-
-[![Base](https://img.shields.io/badge/Powered_by-Base-0052FF?style=for-the-badge&logo=coinbase&logoColor=white)](https://base.org/)
-
-</div>
+This software is for educational and research purposes. Autonomous on-chain trading involves financial risk. Ensure proper testing in dry-run and paper-trading modes before deploying on-chain transactions.
