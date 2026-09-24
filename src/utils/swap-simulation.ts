@@ -48,20 +48,22 @@ export function simulateUniswapV3Swap(
       };
     }
 
-    // Simplified V3 swap math - in production, use exact V3 math library
-    const Q96 = 2n ** 96n;
-    const currentPrice = (sqrtPriceX96 * sqrtPriceX96) / (Q96 * Q96);
+    // Accurate V3 swap math using Q192 scaling without premature integer division
+    const Q192 = 2n ** 192n;
+    const priceX192 = sqrtPriceX96 * sqrtPriceX96;
 
     // Estimate price impact based on liquidity depth
     const liquidityRatio = (amountIn * 10000n) / liquidity;
     const priceImpactBps = Math.min(Number(liquidityRatio), 1000); // Cap at 10%
 
-    // Calculate amount out with price impact
-    const priceImpactMultiplier = 10000n - BigInt(priceImpactBps);
+    // Calculate amount out before price impact
+    // For zeroForOne (token0 -> token1): idealAmountOut = (amountIn * priceX192) / Q192
+    // For !zeroForOne (token1 -> token0): idealAmountOut = (amountIn * Q192) / priceX192
     const idealAmountOut = zeroForOne
-      ? (amountIn * currentPrice) / 10n ** 18n
-      : (amountIn * 10n ** 18n) / currentPrice;
+      ? (amountIn * priceX192) / Q192
+      : (amountIn * Q192) / priceX192;
 
+    const priceImpactMultiplier = 10000n - BigInt(priceImpactBps);
     const amountOut = (idealAmountOut * priceImpactMultiplier) / 10000n;
 
     // Apply fee (0.05%, 0.3%, or 1% depending on pool)

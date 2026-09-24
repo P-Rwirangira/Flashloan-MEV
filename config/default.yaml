@@ -1,4 +1,4 @@
-﻿# Base MEV Platform Configuration
+# Base MEV Platform Configuration
 # This is the default configuration for the Base MEV platform
 
 # Phase Configuration
@@ -237,7 +237,7 @@ allowedPools:
       tags: ["weth", "usdc", "tier1", "verified"]
     
     # USDC/USDbC - $907K liquidity (stablecoin arb)
-    - address: "0xa0ab20a64f46b5676fe1542cb87b454e5104007689e0eef4212aa0cbe34933a1"
+    - address: "0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C"
       dex: "uniswap-v3"
       enabled: true
       priority: 1
@@ -458,7 +458,7 @@ relays:
       name: "Flashbots Protect"
       url: "https://rpc.flashbots.net"
       enabled: false  # NOT AVAILABLE ON BASE
-      priority: 99
+      priority: 10
       maxLatencyMs: 500
       rateLimit: 100
     bloxroute:

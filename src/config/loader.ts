@@ -85,7 +85,10 @@ export class ConfigLoader extends EventEmitter {
    */
   private substituteEnvironmentVariables(content: string): string {
     return content.replace(/\$\{([^}]+)\}/g, (_, varExpression) => {
-      const [varName, defaultValue] = varExpression.split(':');
+      const colonIndex = varExpression.indexOf(':');
+      const varName = colonIndex === -1 ? varExpression : varExpression.slice(0, colonIndex);
+      const defaultValue = colonIndex === -1 ? undefined : varExpression.slice(colonIndex + 1);
+
       const fullVarName = varName.startsWith(this.envPrefix)
         ? varName
         : `${this.envPrefix}${varName}`;
